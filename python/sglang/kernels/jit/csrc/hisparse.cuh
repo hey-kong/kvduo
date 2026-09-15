@@ -206,6 +206,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int32_t* __restrict__ num_real_reqs,
     const int64_t* __restrict__ req_to_logical_token,
     const int64_t* __restrict__ full_to_device_loc,
+    int64_t* __restrict__ full_last_touch,
+    const int64_t* __restrict__ touch_clock,
     int64_t req_to_logical_stride,
     bool enable_full_lookup,
     int64_t buffer_stride_0,
@@ -315,11 +317,12 @@ __global__ void load_cache_to_device_buffer_kernel(
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
     int64_t full_loc = 0;
+    int64_t logical_loc = -1;
     if (token_idx < 0 || token_idx >= seq_len) {
       s_top_k_tokens[i] = TOKEN_INVALID;
       req_top_k_device_locs[i] = -1;
     } else if (enable_full_lookup) {
-      const int64_t logical_loc = req_to_logical_token[rid * req_to_logical_stride + token_idx];
+      logical_loc = req_to_logical_token[rid * req_to_logical_stride + token_idx];
       if (logical_loc >= 0) {
         full_loc = full_to_device_loc[logical_loc];
       }
@@ -327,6 +330,9 @@ __global__ void load_cache_to_device_buffer_kernel(
     if (token_idx < 0 || token_idx >= seq_len) {
       // Invalid/padded selections never participate in hashing or miss loading.
     } else if (full_loc > 0) {
+      atomicMax(
+          reinterpret_cast<unsigned long long*>(&full_last_touch[logical_loc]),
+          static_cast<unsigned long long>(touch_clock[0]));
       s_top_k_tokens[i] = TOKEN_HIT;
       req_top_k_device_locs[i] = static_cast<int32_t>(full_loc);
       atomicAdd(&s_full_hits, 1);
@@ -600,6 +606,8 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView num_real_reqs,
     tvm::ffi::TensorView req_to_logical_token,
     tvm::ffi::TensorView full_to_device_loc,
+    tvm::ffi::TensorView full_last_touch,
+    tvm::ffi::TensorView touch_clock,
     bool enable_full_lookup,
     int64_t page_size,
     int64_t item_size_bytes) {
@@ -640,6 +648,8 @@ void load_cache_to_device_buffer(
         static_cast<const int32_t*>(num_real_reqs.data_ptr()),
         enable_full_lookup ? static_cast<const int64_t*>(req_to_logical_token.data_ptr()) : nullptr,
         enable_full_lookup ? static_cast<const int64_t*>(full_to_device_loc.data_ptr()) : nullptr,
+        enable_full_lookup ? static_cast<int64_t*>(full_last_touch.data_ptr()) : nullptr,
+        enable_full_lookup ? static_cast<const int64_t*>(touch_clock.data_ptr()) : nullptr,
         req_to_logical_stride,
         enable_full_lookup,
         buffer_stride_0,

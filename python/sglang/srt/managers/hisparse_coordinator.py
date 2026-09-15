@@ -150,9 +150,20 @@ class HiSparseCoordinator:
             self.req_reserved_logical = torch.full(
                 (max_num_req_slots,), -1, dtype=torch.int64, device=device
             )
+            mapping_size = (
+                self.mem_pool_device.full_to_hisparse_device_index_mapping.numel()
+            )
+            self.full_last_touch = torch.zeros(
+                mapping_size, dtype=torch.int64, device=device
+            )
+            self.full_touch_clock = torch.zeros(1, dtype=torch.int64, device=device)
+            self._active_kvduo_reqs = {}
         else:
             self.req_to_full_lookup = None
             self.req_reserved_logical = None
+            self.full_last_touch = None
+            self.full_touch_clock = None
+            self._active_kvduo_reqs = None
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
@@ -352,6 +363,16 @@ class HiSparseCoordinator:
             self.req_to_full_lookup[req.req_pool_idx, :compressed_len] = (
                 compressed_logical_indices
             )
+            written_pages = (compressed_len + self.page_size - 1) // self.page_size
+            self.full_touch_clock.add_(written_pages)
+            page_ordinals = (
+                torch.arange(compressed_len, dtype=torch.int64, device=self.device)
+                // self.page_size
+            )
+            self.full_last_touch[compressed_logical_indices] = (
+                self.full_touch_clock - written_pages + page_ordinals + 1
+            )
+            self._active_kvduo_reqs[req.req_pool_idx] = req
 
         preserve_indices = None
         if self.enable_mixed_residency:
@@ -827,6 +848,8 @@ class HiSparseCoordinator:
             self.req_to_full_lookup[req.req_pool_idx, :] = -1
             self.req_reserved_logical[req.req_pool_idx] = -1
         self._mixed_slots[req.req_pool_idx] = False
+        if self.enable_mixed_residency:
+            self._active_kvduo_reqs.pop(req.req_pool_idx, None)
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
 
@@ -922,6 +945,70 @@ class HiSparseCoordinator:
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
         self._mixed_slots[req.req_pool_idx] = False
+        if self.enable_mixed_residency:
+            self._active_kvduo_reqs.pop(req.req_pool_idx, None)
+
+    def reclaim_kvduo_full_pages(self, num_tokens: int) -> int:
+        """Demote cold request-owned full pages to satisfy decode pressure.
+
+        The host copy is complete before requests leave staging. This control
+        path may synchronize only when allocation pressure occurs; steady-state
+        full/hot/host resolution remains entirely device-driven and graph-safe.
+        """
+        if not self.enable_mixed_residency or num_tokens <= 0:
+            return 0
+        if self.decode_producer_stream is not None:
+            device_module.current_stream().wait_stream(self.decode_producer_stream)
+        self.wait_for_pending_backup()
+        candidates = []
+        for req_idx, req in tuple(self._active_kvduo_reqs.items()):
+            allocated_len = req.kv.kv_allocated_len
+            compressed = self.mem_pool_device.translate_loc_from_full_to_compressed(
+                self.req_to_token_pool.req_to_token[req_idx, :allocated_len]
+            )
+            prefix_len = len(
+                self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    self.req_to_token_pool.req_to_token[
+                        req_idx, : req.cache_protected_len
+                    ]
+                )
+            )
+            num_pages = (len(compressed) + self.page_size - 1) // self.page_size
+            tail_first = max(0, num_pages - self.tail_protected_pages)
+            first_owned_page = (prefix_len + self.page_size - 1) // self.page_size
+            for page_no in range(first_owned_page, tail_first):
+                start = page_no * self.page_size
+                logical = compressed[start : start + self.page_size]
+                physical = self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                    logical
+                ]
+                if logical.numel() != self.page_size or not torch.all(physical > 0):
+                    continue
+                touch = int(self.full_last_touch[logical].max().item())
+                candidates.append((touch, req_idx, start, logical, physical))
+
+        reclaimed = 0
+        for _, req_idx, start, logical, physical in sorted(
+            candidates, key=lambda item: (item[0], item[1], item[2])
+        ):
+            if reclaimed >= num_tokens:
+                break
+            # A prior candidate cannot overlap because candidates are page aligned.
+            if not torch.all(
+                self.mem_pool_device.full_to_hisparse_device_index_mapping[logical]
+                == physical
+            ):
+                continue
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[logical] = 0
+            self.token_to_kv_pool_allocator.free_hisparse_indices(physical)
+            req = self._active_kvduo_reqs[req_idx]
+            req.kvduo_mixed_residency = True
+            req.kvduo_radix_insert_len = min(
+                req.kvduo_radix_insert_len, start * self.compress_ratio
+            )
+            self._mixed_slots[req_idx] = True
+            reclaimed += self.page_size
+        return reclaimed
 
     def swap_in_selected_pages(
         self,
@@ -940,6 +1027,8 @@ class HiSparseCoordinator:
             if self.is_dsv4_hisparse
             else load_cache_to_device_buffer_mla
         )
+        if self.enable_mixed_residency:
+            self.full_touch_clock.add_(1)
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -964,6 +1053,12 @@ class HiSparseCoordinator:
                 self.mem_pool_device.full_to_hisparse_device_index_mapping
                 if self.enable_mixed_residency
                 else None
+            ),
+            full_last_touch=(
+                self.full_last_touch if self.enable_mixed_residency else None
+            ),
+            touch_clock=(
+                self.full_touch_clock if self.enable_mixed_residency else None
             ),
         )
         return top_k_indices
