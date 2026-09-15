@@ -150,6 +150,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.req_device_buffer_tokens = torch.full(
             (2, 1, 16), -1, dtype=torch.int32
         )
+        coordinator.lru_slots = (
+            torch.arange(16, dtype=torch.int16).view(1, 1, -1).repeat(2, 1, 1)
+        )
         physical = SimpleNamespace(alloc=MagicMock(return_value=torch.arange(21, 25)))
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
             hisparse_attn_allocator=physical,
@@ -191,6 +194,22 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         # rather than treating one Top-k width as a fixed cache quota.
         coordinator.req_device_buffer_tokens[1, 0, :4] = torch.tensor([2, 3, 6, 7])
         physical.alloc.reset_mock()
+        from sglang.srt.mem_cache.sparsity.core.kvduo_state import (
+            KVDuoPressureAction,
+        )
+
+        coordinator._reclaim_for_physical_allocation.return_value = SimpleNamespace(
+            action=KVDuoPressureAction.ERROR
+        )
+        coordinator._ensure_kvduo_hot_workset(
+            torch.tensor([0]), torch.tensor([[4, 5, -1, -1]]), layer_id=1
+        )
+        physical.alloc.assert_not_called()
+        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
+
+        coordinator._reclaim_for_physical_allocation.return_value = SimpleNamespace(
+            action=KVDuoPressureAction.SUCCESS
+        )
         physical.alloc.return_value = torch.arange(25, 29)
         coordinator._ensure_kvduo_hot_workset(
             torch.tensor([0]), torch.tensor([[4, 5, 6, 7]]), layer_id=1
@@ -200,6 +219,24 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         self.assertEqual(
             coordinator.req_device_buffer_tokens[1, 0, :4].tolist(), [2, 3, 6, 7]
         )
+        self.assertEqual(
+            coordinator.lru_slots[1, 0, :8].tolist(), [4, 5, 6, 7, 0, 1, 2, 3]
+        )
+
+        # Shrink and reuse the released layer page. The reactivated range must
+        # again be a complete permutation, despite stale values outside the
+        # temporarily reduced active capacity.
+        coordinator._evict_kvduo_hot_fragment(1, 0, 1)
+        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
+        physical.alloc.reset_mock()
+        coordinator._ensure_kvduo_hot_workset(
+            torch.tensor([0]), torch.tensor([[4, 5, 6, 7]]), layer_id=1
+        )
+        physical.alloc.assert_not_called()
+        self.assertEqual(
+            coordinator.lru_slots[1, 0, :8].tolist(), [4, 5, 6, 7, 0, 1, 2, 3]
+        )
+        self.assertEqual(len(set(coordinator.lru_slots[1, 0, :8].tolist())), 8)
 
         # Releasing layer 1 does not touch layer 0 metadata.  Once all carrier
         # fragments are free, the carrier coalesces back to the legacy pool.

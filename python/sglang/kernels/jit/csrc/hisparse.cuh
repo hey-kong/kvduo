@@ -406,6 +406,10 @@ __global__ void load_cache_to_device_buffer_kernel(
       }
     }
     bool is_hit = my_found_top_k_idx >= 0;
+    // req_lru_slots maintains empty slots before stale valid slots. Growth and
+    // shrink rebuild that permutation, and the writeback below preserves it.
+    // Consequently the backward scratch layout selects empty slots first and
+    // only then performs entry-LRU replacement.
     bool is_evictable = has_valid_slot && !is_hit;
 
     // Record hits

@@ -1113,13 +1113,13 @@ class HiSparseCoordinator:
             else:
                 new_misses = int(selected.numel())
             required_slots = occupied + new_misses
-            demand.append((req_idx, current, required_slots))
+            demand.append((req_idx, current, required_slots, int(selected.numel())))
             max_required = max(max_required, required_slots)
 
         self._grow_kvduo_hot_metadata(max_required)
         requests = []
         total_grow = 0
-        for req_idx, current, required_slots in demand:
+        for req_idx, current, required_slots, _ in demand:
             target = (
                 (required_slots + page_size - 1) // page_size * page_size
                 if required_slots
@@ -1152,11 +1152,35 @@ class HiSparseCoordinator:
             }
             try:
                 pressure = self._reclaim_for_physical_allocation(carrier_slots)
-                self._require_allocation_ready(pressure)
+                if pressure.action is not KVDuoPressureAction.SUCCESS:
+                    # Retaining old, non-workset entries is an opportunistic
+                    # cache expansion. If it cannot be funded, fall back to
+                    # entry-LRU replacement whenever the existing capacity can
+                    # hold this attention's simultaneous non-full workset.
+                    requests = []
+                    total_grow = 0
+                    for req_idx, current, _, workset_slots in demand:
+                        minimum = (
+                            (workset_slots + page_size - 1) // page_size * page_size
+                        )
+                        if minimum > current:
+                            requests.append(
+                                (req_idx, current, minimum, minimum - current)
+                            )
+                            total_grow += minimum - current
+                    if total_grow == 0:
+                        return
+                    pages_needed = total_grow // page_size
+                    missing_carriers = max(0, pages_needed - len(free_pages))
+                    carrier_slots = missing_carriers * page_size
+                    pressure = self._reclaim_for_physical_allocation(carrier_slots)
+                    self._require_allocation_ready(pressure)
                 physical = (
                     self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
                         carrier_slots
                     )
+                    if carrier_slots
+                    else torch.empty(0, dtype=torch.int64, device=self.device)
                 )
             finally:
                 self._kvduo_pressure_protected = None
@@ -1200,6 +1224,21 @@ class HiSparseCoordinator:
                 page_locs.to(torch.int32)
             )
             self.req_device_buffer_tokens[layer_id, req_idx, current:target] = -1
+            # LRU is a permutation of every active slot. Put newly activated
+            # empty slots at the LRU/front side, before the old permutation, so
+            # the resolver consumes empty capacity before replacing history.
+            old_lru = self.lru_slots[layer_id, req_idx, :current].clone()
+            self.lru_slots[layer_id, req_idx, :target] = torch.cat(
+                [
+                    torch.arange(
+                        current,
+                        target,
+                        dtype=torch.int16,
+                        device=self.device,
+                    ),
+                    old_lru,
+                ]
+            )
             self.kvduo_req_hot_capacity[layer_id, req_idx] = target
             # Publish capacity last so a graph replay cannot observe slots
             # before their addresses and invalid tags are initialized.
@@ -1323,10 +1362,14 @@ class HiSparseCoordinator:
         new_capacity = last_slot
         self.kvduo_req_hot_capacity[layer_id, req_idx] = new_capacity
         self.kvduo_req_hot_capacity_gpu[layer_id, req_idx] = new_capacity
-        # Rebuild a valid deterministic slot permutation after metadata page
-        # removal; payload compaction is deliberately not performed.
-        self.lru_slots[layer_id, req_idx, :new_capacity] = torch.arange(
-            new_capacity, dtype=torch.int16, device=self.device
+        # Rebuild a deterministic permutation after metadata page removal;
+        # payload compaction is deliberately not performed. Empty slots are
+        # kept at the LRU/front side, which is the resolver's empty-first
+        # allocation contract.
+        tokens = self.req_device_buffer_tokens[layer_id, req_idx, :new_capacity]
+        slots = torch.arange(new_capacity, dtype=torch.int16, device=self.device)
+        self.lru_slots[layer_id, req_idx, :new_capacity] = torch.cat(
+            [slots[tokens < 0], slots[tokens >= 0]]
         )
 
     def reclaim_kvduo_hot_pages(self, num_tokens: int) -> int:
