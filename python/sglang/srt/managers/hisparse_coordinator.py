@@ -193,6 +193,7 @@ class HiSparseCoordinator:
             self._active_kvduo_reqs = {}
             self._kvduo_host_valid_len = [0] * max_num_req_slots
             self._pending_kvduo_host_valid = []
+            self._kvduo_pressure_protected = None
             self.host_prefix_cache = KVDuoHostPrefixCache(self.mem_pool_host.size)
             self._req_host_prefix_records = [set() for _ in range(max_num_req_slots)]
         else:
@@ -207,6 +208,7 @@ class HiSparseCoordinator:
             self._active_kvduo_reqs = None
             self._kvduo_host_valid_len = None
             self._pending_kvduo_host_valid = None
+            self._kvduo_pressure_protected = None
             self.host_prefix_cache = None
             self._req_host_prefix_records = None
 
@@ -653,6 +655,19 @@ class HiSparseCoordinator:
             # incomplete final page will lower this boundary to its page start.
             self._kvduo_host_valid_len[req.req_pool_idx] = compressed_len
 
+            # A fully-resident KVDuo request does not own a speculative hot
+            # buffer.  Physical hot pages are acquired by
+            # ``_ensure_kvduo_hot_workset`` only after a real sparse selection
+            # contains entries which cannot be resolved through the full-page
+            # mapping.  In particular, do not demote/copy full KV while merely
+            # admitting the request into decode.
+            self.req_to_device_buffer[req.req_pool_idx, :] = 0
+            self.req_device_buffer_size[req.req_pool_idx] = 0
+            self.req_device_buffer_size_gpu[req.req_pool_idx] = 0
+            self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
+            self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
+            return
+
         preserve_indices = None
         if self.enable_mixed_residency:
             radix_page_size = self.token_to_kv_pool_allocator.page_size
@@ -793,6 +808,90 @@ class HiSparseCoordinator:
         reserved_positions = (seq_lens - 1).clamp(max=self.device_buffer_size)
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
+    def _ensure_kvduo_hot_workset(
+        self,
+        req_pool_indices: torch.Tensor,
+        top_k_result: torch.Tensor,
+    ) -> None:
+        """Materialize hot pages only for a selected non-full workset.
+
+        The backing metadata has a fixed address for CUDA graph replay, but no
+        physical KV slot is owned until this method sees a valid Top-k entry
+        whose full mapping is absent.  Capacity grows by allocator pages and is
+        shared by all managed layers because the current HiSparse pool uses a
+        layer-first layout with one allocator row identity spanning layers.
+
+        This is a control-plane allocation boundary.  It intentionally performs
+        one batched device-to-host copy of the required capacities before a
+        replay; the swap-in kernel itself never consumes an incomplete view.
+        """
+        if not self.enable_mixed_residency or req_pool_indices.numel() == 0:
+            return
+
+        valid = top_k_result >= 0
+        safe_positions = top_k_result.clamp(min=0).to(torch.int64)
+        logical = self.req_to_full_lookup[req_pool_indices[:, None], safe_positions]
+        full_locs = self.mem_pool_device.full_to_hisparse_device_index_mapping[
+            logical.clamp(min=0)
+        ]
+        # Top-k is guaranteed deduplicated.  Therefore the number of valid,
+        # non-full selections is exactly the simultaneous hot workset capacity
+        # required to protect hits before inserting misses.
+        required = torch.sum(valid & (logical >= 0) & (full_locs <= 0), dim=1)
+        required_cpu = required.to(device="cpu", dtype=torch.int64)
+        req_cpu = req_pool_indices.to(device="cpu", dtype=torch.int64)
+
+        page_size = self.page_size
+        requests = []
+        total_grow = 0
+        for req_idx, required_slots in zip(req_cpu.tolist(), required_cpu.tolist()):
+            required_slots = min(int(required_slots), self.device_buffer_size)
+            target = (
+                (required_slots + page_size - 1) // page_size * page_size
+                if required_slots
+                else 0
+            )
+            current = int(self.req_device_buffer_size[req_idx])
+            if target <= current:
+                continue
+            grow = target - current
+            requests.append((req_idx, current, target, grow))
+            total_grow += grow
+
+        if total_grow == 0:
+            return
+
+        # Full pages selected by this attention are pinned across pressure
+        # handling.  Otherwise allocating a hot page could evict a full hit
+        # used to size this very workset and leave the kernel under-capacity.
+        self._kvduo_pressure_protected = logical[valid & (logical >= 0)].unique()
+        try:
+            pressure = self._reclaim_for_physical_allocation(total_grow)
+            self._require_allocation_ready(pressure)
+        finally:
+            self._kvduo_pressure_protected = None
+        physical = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
+            total_grow
+        )
+        if physical is None:
+            raise RuntimeError(
+                "KVDuo hot-page allocation failed after a successful pressure plan"
+            )
+
+        offset = 0
+        for req_idx, current, target, grow in requests:
+            page_locs = physical[offset : offset + grow]
+            offset += grow
+            self.req_to_device_buffer[req_idx, current:target] = page_locs
+            self.req_device_buffer_token_locs[:, req_idx, current:target] = (
+                page_locs.to(torch.int32)
+            )
+            self.req_device_buffer_tokens[:, req_idx, current:target] = -1
+            self.req_device_buffer_size[req_idx] = target
+            # Publish capacity last so a graph replay cannot observe slots
+            # before their addresses and invalid tags are initialized.
+            self.req_device_buffer_size_gpu[req_idx] = target
+
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
 
@@ -843,6 +942,19 @@ class HiSparseCoordinator:
             )
 
         if not self.is_dsv4_hisparse:
+            if self.enable_mixed_residency:
+                # KVDuo appends into the allocator-provided full tail page.
+                # A temporary hot append slot must not be allocated or exposed
+                # as a durable full mapping.
+                compressed_locs = (
+                    self.token_to_kv_pool_allocator.get_last_loc_compressed(
+                        out_cache_loc
+                    )
+                )
+                positions = seq_lens - 1
+                self.req_to_full_lookup[req_pool_indices, positions] = compressed_locs
+                self._publish_kvduo_model_write(compressed_locs)
+                return
             # Grow device buffers if needed and resolve the latest-token slot.
             reserved_buffer_loc = self._grow_device_buffers(
                 seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
@@ -854,13 +966,6 @@ class HiSparseCoordinator:
             compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
                 out_cache_loc
             )
-            if self.enable_mixed_residency:
-                positions = seq_lens - 1
-                self.req_to_full_lookup[req_pool_indices, positions] = compressed_locs
-                self._publish_kvduo_model_write(compressed_locs)
-                # Keep the allocator-provided full mapping. The reserved hot
-                # slot remains separate and must never masquerade as full KV.
-                return
             # ROCm: the decode remap creates a temporary hisparse device slot per
             # new token (via the page_size==1 allocator path). Free the stale
             # slot before pointing the mapping at the reserved device-buffer slot,
@@ -891,6 +996,17 @@ class HiSparseCoordinator:
         active_req_pool_indices = req_pool_indices[active_reqs]
 
         compressed_seq_lens = active_seq_lens // self.compress_ratio
+        if self.enable_mixed_residency:
+            compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
+                active_out_cache_loc
+            )
+            positions = compressed_seq_lens - 1
+            self.req_to_full_lookup[active_req_pool_indices, positions] = (
+                compressed_locs
+            )
+            self._publish_kvduo_model_write(compressed_locs)
+            return
+
         reserved_positions = (compressed_seq_lens - 1).clamp(
             max=self.device_buffer_size
         )
@@ -905,13 +1021,6 @@ class HiSparseCoordinator:
         compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
             active_out_cache_loc
         )
-        if self.enable_mixed_residency:
-            positions = compressed_seq_lens - 1
-            self.req_to_full_lookup[active_req_pool_indices, positions] = (
-                compressed_locs
-            )
-            self._publish_kvduo_model_write(compressed_locs)
-            return
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
             reserved_buffer_loc
         )
@@ -1431,6 +1540,9 @@ class HiSparseCoordinator:
             logical_pages
         ]
         valid = torch.all(physical_pages > 0, dim=1)
+        pressure_protected = getattr(self, "_kvduo_pressure_protected", None)
+        if pressure_protected is not None:
+            valid &= ~torch.any(torch.isin(logical_pages, pressure_protected), dim=1)
         host_current = torch.all(
             self.full_host_version[logical_pages]
             == self.full_data_version[logical_pages],
@@ -1490,6 +1602,9 @@ class HiSparseCoordinator:
         num_reqs = req_pool_indices.size(0)
 
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
+
+        if self.enable_mixed_residency:
+            self._ensure_kvduo_hot_workset(req_pool_indices, top_k_result)
 
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
