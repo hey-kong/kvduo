@@ -137,6 +137,18 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len = torch.zeros(
             max_num_req_slots, dtype=torch.int64, device="cpu"
         )
+        # Capture-stable logical-address rows consumed by KVDuo's fused resolver.
+        # Unlike ReqToTokenPool this is always int64 and, for DSV4, is indexed in
+        # compressed C4 position space rather than original-token space.
+        self.req_to_full_lookup = torch.full(
+            (max_num_req_slots, max_compressed_context_len + self.page_size),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.req_reserved_logical = torch.full(
+            (max_num_req_slots,), -1, dtype=torch.int64, device=device
+        )
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
@@ -188,6 +200,7 @@ class HiSparseCoordinator:
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
+        self._mixed_slots = [False] * max_num_req_slots
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -331,6 +344,10 @@ class HiSparseCoordinator:
             )
         )
         compressed_len = len(compressed_logical_indices)
+        if self.enable_mixed_residency:
+            self.req_to_full_lookup[req.req_pool_idx, :compressed_len] = (
+                compressed_logical_indices
+            )
 
         preserve_indices = None
         if self.enable_mixed_residency:
@@ -343,8 +360,21 @@ class HiSparseCoordinator:
             ):
                 preserve_indices = compressed_logical_indices
             else:
-                protected = self.tail_protected_pages * self.page_size
-                preserve_indices = compressed_logical_indices[-protected:]
+                num_pages = (compressed_len + self.page_size - 1) // self.page_size
+                first_page = max(0, num_pages - self.tail_protected_pages)
+                tail_indices = compressed_logical_indices[first_page * self.page_size :]
+                prefix_full = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : req.cache_protected_len
+                ]
+                prefix_indices = (
+                    self.mem_pool_device.translate_loc_from_full_to_compressed(
+                        prefix_full
+                    )
+                )
+                preserve_indices = torch.cat([prefix_indices, tail_indices])
+                req.kvduo_mixed_residency = True
+                req.skip_radix_cache_insert = True
+                self._mixed_slots[req.req_pool_idx] = True
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
             compressed_logical_indices, alloc_size, preserve_indices=preserve_indices
         )
@@ -505,6 +535,15 @@ class HiSparseCoordinator:
             compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
                 out_cache_loc
             )
+            if self.enable_mixed_residency:
+                for req_idx in req_pool_indices_cpu.tolist():
+                    self._mixed_slots[int(req_idx)] = True
+                old_locs = self.req_reserved_logical[req_pool_indices]
+                valid_old = old_locs >= 0
+                self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                    old_locs[valid_old]
+                ] = 0
+                self.req_reserved_logical[req_pool_indices] = compressed_locs
             # ROCm: the decode remap creates a temporary hisparse device slot per
             # new token (via the page_size==1 allocator path). Free the stale
             # slot before pointing the mapping at the reserved device-buffer slot,
@@ -549,6 +588,16 @@ class HiSparseCoordinator:
         compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
             active_out_cache_loc
         )
+        if self.enable_mixed_residency:
+            active_cpu = req_pool_indices_cpu[active_reqs.to(device="cpu")].tolist()
+            for req_idx in active_cpu:
+                self._mixed_slots[int(req_idx)] = True
+            old_locs = self.req_reserved_logical[active_req_pool_indices]
+            valid_old = old_locs >= 0
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                old_locs[valid_old]
+            ] = 0
+            self.req_reserved_logical[active_req_pool_indices] = compressed_locs
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
             reserved_buffer_loc
         )
@@ -768,6 +817,9 @@ class HiSparseCoordinator:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
+        self.req_to_full_lookup[req.req_pool_idx, :] = -1
+        self.req_reserved_logical[req.req_pool_idx] = -1
+        self._mixed_slots[req.req_pool_idx] = False
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
 
@@ -793,6 +845,7 @@ class HiSparseCoordinator:
 
         # release memory -- only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
+        all_hi = torch.empty(0, dtype=torch.int64, device=self.device)
         if current_cap > 0:
             side_buf_hi = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
             all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
@@ -805,7 +858,35 @@ class HiSparseCoordinator:
         compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
             allocated_locs
         )
-        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
+        is_mixed = self.enable_mixed_residency and self._mixed_slots[req.req_pool_idx]
+        if is_mixed:
+            req.kvduo_mixed_residency = True
+            req.skip_radix_cache_insert = True
+            # Mixed requests are deliberately not inserted into the plain
+            # RadixCache: it cannot represent host-only holes. Free every
+            # surviving full-page fragment before dropping the mapping.
+            owned_full_locs = allocated_locs[req.cache_protected_len :]
+            owned_compressed_locs = (
+                self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    owned_full_locs
+                )
+            )
+            full_hi = self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                owned_compressed_locs
+            ]
+            full_hi = torch.unique(full_hi[full_hi > 0])
+            if all_hi.numel() > 0:
+                full_hi = full_hi[~torch.isin(full_hi, all_hi)]
+            if full_hi.numel() > 0:
+                self.token_to_kv_pool_allocator.free_hisparse_indices(full_hi)
+        if is_mixed:
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                owned_compressed_locs
+            ] = 0
+        elif not self.enable_mixed_residency:
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                compressed_locs
+            ] = 0
 
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
@@ -822,8 +903,11 @@ class HiSparseCoordinator:
         self.req_device_buffer_size[req.req_pool_idx] = 0
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
+        self.req_to_full_lookup[req.req_pool_idx, :] = -1
+        self.req_reserved_logical[req.req_pool_idx] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        self._mixed_slots[req.req_pool_idx] = False
 
     def swap_in_selected_pages(
         self,
@@ -860,9 +944,7 @@ class HiSparseCoordinator:
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
             req_to_logical_token=(
-                self.req_to_token_pool.req_to_token
-                if self.enable_mixed_residency
-                else None
+                self.req_to_full_lookup if self.enable_mixed_residency else None
             ),
             full_to_device_loc=(
                 self.mem_pool_device.full_to_hisparse_device_index_mapping

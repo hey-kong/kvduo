@@ -250,7 +250,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
 
   // Fast path: short sequences have all tokens in the device buffer in order.
-  if (seq_len <= HOT_BUFFER_SIZE) {
+  if (!enable_full_lookup && seq_len <= HOT_BUFFER_SIZE) {
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
     for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
       int32_t device_loc = -1;
@@ -314,7 +314,9 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t full_loc = 0;
     if (enable_full_lookup && token_idx >= 0 && token_idx < seq_len) {
       const int64_t logical_loc = req_to_logical_token[rid * req_to_logical_stride + token_idx];
-      full_loc = full_to_device_loc[logical_loc];
+      if (logical_loc >= 0) {
+        full_loc = full_to_device_loc[logical_loc];
+      }
     }
     if (full_loc > 0) {
       s_top_k_tokens[i] = TOKEN_HIT;

@@ -111,6 +111,11 @@ def _load_cache_to_device_buffer_mla(
     enable_full_lookup = (
         req_to_logical_token is not None and full_to_device_loc is not None
     )
+    if enable_full_lookup:
+        assert req_to_logical_token.dtype == torch.int64
+        assert full_to_device_loc.dtype == torch.int64
+        assert req_to_logical_token.device == top_k_tokens.device
+        assert full_to_device_loc.device == top_k_tokens.device
     req_to_logical_token = req_to_logical_token if enable_full_lookup else empty
     full_to_device_loc = full_to_device_loc if enable_full_lookup else empty
 
