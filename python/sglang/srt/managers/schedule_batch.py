@@ -2729,15 +2729,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         whether the next decode step fits in the KV pool."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
-        available = self.token_to_kv_pool_allocator.available_size()
-        if (
-            available < num_tokens
-            and self.hisparse_coordinator is not None
-            and self.hisparse_coordinator.enable_mixed_residency
-        ):
-            ratio = self.hisparse_coordinator.compress_ratio
-            physical_shortfall = (num_tokens - available + ratio - 1) // ratio
-            self.hisparse_coordinator.reclaim_kvduo_full_pages(physical_shortfall)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_decode(

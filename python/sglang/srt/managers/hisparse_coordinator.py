@@ -380,30 +380,19 @@ class HiSparseCoordinator:
             req.kvduo_radix_insert_len = (
                 allocated_len // radix_page_size * radix_page_size
             )
-            # Keep all full pages when the shared physical pool can also satisfy
-            # the minimum hot-buffer reservation. Under pressure, atomically
-            # demote the non-tail portion and recycle only those physical slots.
-            if (
-                self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
-                >= alloc_size
-            ):
-                preserve_indices = compressed_logical_indices
-            else:
-                num_pages = (compressed_len + self.page_size - 1) // self.page_size
-                first_page = max(0, num_pages - self.tail_protected_pages)
-                tail_indices = compressed_logical_indices[first_page * self.page_size :]
-                prefix_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, : req.cache_protected_len
-                ]
-                prefix_indices = (
-                    self.mem_pool_device.translate_loc_from_full_to_compressed(
-                        prefix_full
-                    )
-                )
-                preserve_indices = torch.cat([prefix_indices, tail_indices])
-                req.kvduo_mixed_residency = True
-                req.kvduo_radix_insert_len = req.cache_protected_len
-                self._mixed_slots[req.req_pool_idx] = True
+            physical_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+            physical_shortfall = max(
+                0, alloc_size - physical_allocator.available_size()
+            )
+            if physical_shortfall:
+                self.reclaim_kvduo_full_pages(physical_shortfall)
+            # Preserve exactly the mappings that survived page-level LRU. The
+            # allocator obtains hot slots from the physical free list; no full
+            # entry is copied into or tagged as hot during this transition.
+            resident = self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                compressed_logical_indices
+            ]
+            preserve_indices = compressed_logical_indices[resident > 0]
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
             compressed_logical_indices, alloc_size, preserve_indices=preserve_indices
         )
@@ -894,7 +883,11 @@ class HiSparseCoordinator:
             # RadixCache cannot represent host-only holes. Free every surviving
             # request-owned fragment beyond kvduo_radix_insert_len; the cache
             # implementations retain only the already-contiguous full prefix.
-            owned_full_locs = allocated_locs[req.cache_protected_len :]
+            release_start = max(
+                req.cache_protected_len,
+                getattr(req, "kvduo_radix_insert_len", req.cache_protected_len),
+            )
+            owned_full_locs = allocated_locs[release_start:]
             owned_compressed_locs = (
                 self.mem_pool_device.translate_loc_from_full_to_compressed(
                     owned_full_locs
@@ -960,7 +953,8 @@ class HiSparseCoordinator:
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
-        candidates = []
+        candidate_pages = []
+        candidate_meta = []
         for req_idx, req in tuple(self._active_kvduo_reqs.items()):
             allocated_len = req.kv.kv_allocated_len
             compressed = self.mem_pool_device.translate_loc_from_full_to_compressed(
@@ -976,38 +970,63 @@ class HiSparseCoordinator:
             num_pages = (len(compressed) + self.page_size - 1) // self.page_size
             tail_first = max(0, num_pages - self.tail_protected_pages)
             first_owned_page = (prefix_len + self.page_size - 1) // self.page_size
-            for page_no in range(first_owned_page, tail_first):
-                start = page_no * self.page_size
-                logical = compressed[start : start + self.page_size]
-                physical = self.mem_pool_device.full_to_hisparse_device_index_mapping[
-                    logical
-                ]
-                if logical.numel() != self.page_size or not torch.all(physical > 0):
-                    continue
-                touch = int(self.full_last_touch[logical].max().item())
-                candidates.append((touch, req_idx, start, logical, physical))
+            start = first_owned_page * self.page_size
+            end = tail_first * self.page_size
+            if end <= start:
+                continue
+            pages = compressed[start:end].view(-1, self.page_size)
+            candidate_pages.append(pages)
+            candidate_meta.extend(
+                (req_idx, offset) for offset in range(start, end, self.page_size)
+            )
+
+        if not candidate_pages:
+            return 0
+        logical_pages = torch.cat(candidate_pages, dim=0)
+        physical_pages = self.mem_pool_device.full_to_hisparse_device_index_mapping[
+            logical_pages
+        ]
+        valid = torch.all(physical_pages > 0, dim=1)
+        page_touch = torch.max(self.full_last_touch[logical_pages], dim=1).values
+        # Pressure handling is a control-plane barrier. Transfer the compact
+        # page summaries once, never one synchronization per candidate page.
+        summaries = torch.stack([page_touch, valid.to(torch.int64)], dim=1).cpu()
+        order = sorted(
+            (i for i in range(len(candidate_meta)) if summaries[i, 1]),
+            key=lambda i: (
+                int(summaries[i, 0]),
+                candidate_meta[i][0],
+                candidate_meta[i][1],
+            ),
+        )
 
         reclaimed = 0
-        for _, req_idx, start, logical, physical in sorted(
-            candidates, key=lambda item: (item[0], item[1], item[2])
-        ):
+        selected = []
+        for i in order:
             if reclaimed >= num_tokens:
                 break
-            # A prior candidate cannot overlap because candidates are page aligned.
-            if not torch.all(
-                self.mem_pool_device.full_to_hisparse_device_index_mapping[logical]
-                == physical
-            ):
-                continue
-            self.mem_pool_device.full_to_hisparse_device_index_mapping[logical] = 0
-            self.token_to_kv_pool_allocator.free_hisparse_indices(physical)
+            selected.append(i)
+            reclaimed += self.page_size
+
+        if not selected:
+            return 0
+        selected_gpu = torch.tensor(selected, dtype=torch.int64, device=self.device)
+        selected_logical = logical_pages[selected_gpu]
+        selected_physical = physical_pages[selected_gpu]
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[
+            selected_logical.flatten()
+        ] = 0
+        self.token_to_kv_pool_allocator.free_hisparse_indices(
+            selected_physical.flatten()
+        )
+        for i in selected:
+            req_idx, start = candidate_meta[i]
             req = self._active_kvduo_reqs[req_idx]
             req.kvduo_mixed_residency = True
             req.kvduo_radix_insert_len = min(
                 req.kvduo_radix_insert_len, start * self.compress_ratio
             )
             self._mixed_slots[req_idx] = True
-            reclaimed += self.page_size
         return reclaimed
 
     def swap_in_selected_pages(
