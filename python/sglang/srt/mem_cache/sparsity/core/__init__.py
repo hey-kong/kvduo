@@ -1,5 +1,6 @@
 from sglang.srt.mem_cache.sparsity.core.kvduo_state import (
     KVDuoAllocationPlan,
+    KVDuoEntryVersionState,
     KVDuoFullPageState,
     KVDuoHotCapacity,
     KVDuoPagePinState,
@@ -14,6 +15,7 @@ from sglang.srt.mem_cache.sparsity.core.kvduo_state import (
     KVDuoResidencyCatalog,
     KVDuoTailRotation,
     KVDuoTailTransition,
+    KVDuoWritebackTicket,
     execute_kvduo_pressure_plan,
     plan_kvduo_allocation,
 )
@@ -26,6 +28,7 @@ from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
 
 __all__ = [
     "KVDuoAllocationPlan",
+    "KVDuoEntryVersionState",
     "KVDuoFullPageState",
     "KVDuoHotCapacity",
     "KVDuoPagePinState",
@@ -40,6 +43,7 @@ __all__ = [
     "KVDuoResidencyCatalog",
     "KVDuoTailRotation",
     "KVDuoTailTransition",
+    "KVDuoWritebackTicket",
     "execute_kvduo_pressure_plan",
     "plan_kvduo_allocation",
     "RequestTrackers",

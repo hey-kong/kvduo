@@ -18,6 +18,7 @@ sys.modules[SPEC.name] = STATE
 SPEC.loader.exec_module(STATE)
 
 KVDuoAllocationPlan = STATE.KVDuoAllocationPlan
+KVDuoEntryVersionState = STATE.KVDuoEntryVersionState
 KVDuoFullPageState = STATE.KVDuoFullPageState
 KVDuoHotCapacity = STATE.KVDuoHotCapacity
 KVDuoPagePinState = STATE.KVDuoPagePinState
@@ -226,3 +227,48 @@ def test_tail_adapter_can_extend_protection_and_reject_holes():
     assert tail.protected_pages == (0, 1, 2)
     with pytest.raises(ValueError, match="contiguously"):
         tail.append(8, ("c4",), clock=8)
+
+
+def test_write_attention_and_version_lifecycle():
+    entry = KVDuoEntryVersionState()
+    entry.initialize_generation(generation=1, clock=3)
+    first_ticket = entry.begin_writeback()
+    entry.model_update(clock=5)
+    assert not entry.host_valid
+    assert not entry.complete_writeback(first_ticket)
+    assert not entry.host_valid
+
+    current_ticket = entry.begin_writeback()
+    assert entry.complete_writeback(current_ticket)
+    before = (entry.last_touch, entry.data_version, entry.host_version)
+    entry.scan_or_score()
+    entry.attach_or_restore()
+    assert (entry.last_touch, entry.data_version, entry.host_version) == before
+    entry.attention_complete(clock=8)
+    assert entry.last_touch == 8
+
+
+def test_address_reuse_does_not_inherit_touch_or_stale_writeback():
+    entry = KVDuoEntryVersionState()
+    entry.initialize_generation(generation=1, clock=100)
+    stale = entry.begin_writeback()
+    entry.initialize_generation(generation=2, clock=2)
+    assert entry.last_touch == 2
+    assert not entry.complete_writeback(stale)
+    assert not entry.host_valid
+
+
+def test_aggregate_touch_matches_per_layer_entry_reference():
+    reference = {
+        "layer0": [(1, 7), (4, 2)],
+        "layer1": [(3, 5), (9, 6)],
+    }
+    per_entry_touch = [
+        max(write, attention)
+        for entries in reference.values()
+        for write, attention in entries
+    ]
+    aggregate = KVDuoFullPageState("p", ("layer0", "layer1"))
+    for touch in sorted(per_entry_touch):
+        aggregate.record_attention_touch(touch)
+    assert aggregate.last_touch == max(per_entry_touch) == 9

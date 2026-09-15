@@ -168,6 +168,18 @@ class HiSparseCoordinator:
             self.full_last_touch = torch.zeros(
                 mapping_size, dtype=torch.int64, device=device
             )
+            # One aggregate timestamp per physical storage identity is enough
+            # for page-LRU (page max of entry max). Version mirrors make async
+            # host completion generation-safe without per-layer duplicates.
+            self.full_generation = torch.zeros(
+                mapping_size, dtype=torch.int64, device=device
+            )
+            self.full_data_version = torch.zeros(
+                mapping_size, dtype=torch.int64, device=device
+            )
+            self.full_host_version = torch.full(
+                (mapping_size,), -1, dtype=torch.int64, device=device
+            )
             self.full_touch_clock = torch.zeros(1, dtype=torch.int64, device=device)
             self._active_kvduo_reqs = {}
             self._kvduo_host_valid_len = [0] * max_num_req_slots
@@ -177,6 +189,9 @@ class HiSparseCoordinator:
             self.req_to_full_lookup = None
             self.req_reserved_logical = None
             self.full_last_touch = None
+            self.full_generation = None
+            self.full_data_version = None
+            self.full_host_version = None
             self.full_touch_clock = None
             self._active_kvduo_reqs = None
             self._kvduo_host_valid_len = None
@@ -476,15 +491,24 @@ class HiSparseCoordinator:
             self.req_to_full_lookup[req.req_pool_idx, :compressed_len] = (
                 compressed_logical_indices
             )
-            written_pages = (compressed_len + self.page_size - 1) // self.page_size
-            self.full_touch_clock.add_(written_pages)
-            page_ordinals = (
-                torch.arange(compressed_len, dtype=torch.int64, device=self.device)
-                // self.page_size
+            prefix_indices = self.mem_pool_device.translate_loc_from_full_to_compressed(
+                self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : req.cache_protected_len
+                ]
             )
-            self.full_last_touch[compressed_logical_indices] = (
-                self.full_touch_clock - written_pages + page_ordinals + 1
-            )
+            new_indices = compressed_logical_indices[len(prefix_indices) :]
+            if len(new_indices):
+                # Prefix attachment leaves historical generation/touch intact.
+                # Only newly generated request-owned positions start a new
+                # generation. Staging has already completed their host copy.
+                self.full_touch_clock.add_(1)
+                clock = self.full_touch_clock[0]
+                self.full_generation[new_indices] += 1
+                self.full_data_version[new_indices] = 1
+                self.full_host_version[new_indices] = self.full_data_version[
+                    new_indices
+                ]
+                self.full_last_touch[new_indices] = clock
             self._active_kvduo_reqs[req.req_pool_idx] = req
             # Staging materializes the complete prefill range. Appending to an
             # incomplete final page will lower this boundary to its page start.
@@ -688,6 +712,7 @@ class HiSparseCoordinator:
             if self.enable_mixed_residency:
                 positions = seq_lens - 1
                 self.req_to_full_lookup[req_pool_indices, positions] = compressed_locs
+                self._publish_kvduo_model_write(compressed_locs)
                 # Keep the allocator-provided full mapping. The reserved hot
                 # slot remains separate and must never masquerade as full KV.
                 return
@@ -740,6 +765,7 @@ class HiSparseCoordinator:
             self.req_to_full_lookup[active_req_pool_indices, positions] = (
                 compressed_locs
             )
+            self._publish_kvduo_model_write(compressed_locs)
             return
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
             reserved_buffer_loc
@@ -824,7 +850,12 @@ class HiSparseCoordinator:
             if device_locs.is_cuda:
                 device_locs.record_stream(self.decode_backup_stream)
         self._pending_kvduo_host_valid.extend(
-            (req_idx, end) for req_idx, _, end in page_jobs
+            (req_idx, end, logical, versions)
+            for (req_idx, _, end), logical, versions in zip(
+                page_jobs,
+                logical_locs.split(self.page_size),
+                self.full_data_version[logical_locs].clone().split(self.page_size),
+            )
         )
         self._has_pending_backup = True
 
@@ -922,11 +953,36 @@ class HiSparseCoordinator:
         self._backup_done_event.wait(device_module.current_stream())
         self._has_pending_backup = False
         if self.enable_mixed_residency:
-            for req_idx, valid_len in self._pending_kvduo_host_valid:
+            for (
+                req_idx,
+                valid_len,
+                logical,
+                copied_versions,
+            ) in self._pending_kvduo_host_valid:
+                # Publish the captured version, not whatever version is current
+                # when the asynchronous transfer completes.
+                self.full_host_version[logical] = copied_versions
                 self._kvduo_host_valid_len[req_idx] = max(
                     self._kvduo_host_valid_len[req_idx], valid_len
                 )
             self._pending_kvduo_host_valid.clear()
+
+    def _publish_kvduo_model_write(self, logical_locs: torch.Tensor) -> None:
+        """Publish a newly generated KV identity in the unified address space."""
+        self.full_touch_clock.add_(1)
+        self.full_generation[logical_locs] += 1
+        self.full_data_version[logical_locs] = 1
+        self.full_host_version[logical_locs] = -1
+        self.full_last_touch[logical_locs] = self.full_touch_clock[0]
+
+    def record_kvduo_model_update(self, logical_locs: torch.Tensor) -> None:
+        """Record an in-place model KV update without changing its generation."""
+        if not self.enable_mixed_residency:
+            return
+        self.full_touch_clock.add_(1)
+        self.full_data_version[logical_locs] += 1
+        self.full_host_version[logical_locs] = -1
+        self.full_last_touch[logical_locs] = self.full_touch_clock[0]
 
     def naive_load_topk(
         self,
@@ -1211,6 +1267,12 @@ class HiSparseCoordinator:
             logical_pages
         ]
         valid = torch.all(physical_pages > 0, dim=1)
+        host_current = torch.all(
+            self.full_host_version[logical_pages]
+            == self.full_data_version[logical_pages],
+            dim=1,
+        )
+        valid &= host_current
         page_touch = torch.max(self.full_last_touch[logical_pages], dim=1).values
         # Pressure handling is a control-plane barrier. Transfer the compact
         # page summaries once, never one synchronization per candidate page.

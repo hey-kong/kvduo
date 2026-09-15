@@ -16,6 +16,74 @@ DomainIdentity = Hashable
 OwnerIdentity = Hashable
 
 
+@dataclass(frozen=True)
+class KVDuoWritebackTicket:
+    """Version captured when an asynchronous host writeback is submitted."""
+
+    generation: int
+    data_version: int
+
+
+@dataclass
+class KVDuoEntryVersionState:
+    """Reference write/touch/version lifecycle for one stored KV identity.
+
+    A single aggregate ``last_touch`` is sufficient for page-LRU because max is
+    associative: ``max(max(write, attention) for entries)`` equals the maximum
+    of this field over the page. It avoids duplicating timestamps per layer when
+    layers share the same physical KV storage identity.
+    """
+
+    generation: int = 0
+    data_version: int = 0
+    host_version: int = -1
+    last_touch: int = 0
+
+    @property
+    def host_valid(self) -> bool:
+        return self.generation > 0 and self.host_version == self.data_version
+
+    def initialize_generation(self, generation: int, clock: int) -> None:
+        if generation <= self.generation or clock < 0:
+            raise ValueError("KVDuo generation must advance with a valid clock")
+        self.generation = generation
+        self.data_version = 1
+        self.host_version = -1
+        self.last_touch = clock
+
+    def model_update(self, clock: int) -> None:
+        if self.generation == 0 or clock < self.last_touch:
+            raise ValueError(
+                "KVDuo update requires a live generation and monotonic clock"
+            )
+        self.data_version += 1
+        self.host_version = -1
+        self.last_touch = clock
+
+    def attention_complete(self, clock: int) -> None:
+        if self.generation == 0 or clock < self.last_touch:
+            raise ValueError("KVDuo attention touch requires a live generation")
+        self.last_touch = clock
+
+    def begin_writeback(self) -> KVDuoWritebackTicket:
+        if self.generation == 0:
+            raise ValueError("Cannot write back an unused KVDuo address")
+        return KVDuoWritebackTicket(self.generation, self.data_version)
+
+    def complete_writeback(self, ticket: KVDuoWritebackTicket) -> bool:
+        """Publish exactly the copied version; return whether it is current."""
+        if ticket.generation != self.generation:
+            return False
+        self.host_version = ticket.data_version
+        return self.host_valid
+
+    def attach_or_restore(self) -> None:
+        """Prefix attachment and physical copies intentionally change nothing."""
+
+    def scan_or_score(self) -> None:
+        """Indexer-only activity intentionally changes no model timestamp."""
+
+
 class KVDuoPageResidency(Enum):
     """Coarse residency of a cross-domain logical page."""
 
