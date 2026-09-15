@@ -2692,9 +2692,7 @@ class ServerArgs:
     ] = False
     kvduo_config: A[
         Optional[str],
-        Arg(
-            help='A JSON object for KVDuo. Example: \'{"top_k": 2048, "min_device_buffer_size": 4096, "N": 2}\''
-        ),
+        Arg(help='A JSON object for KVDuo. Example: \'{"top_k": 2048, "N": 2}\''),
         NS("memory"),
     ] = None
 
@@ -7838,7 +7836,10 @@ class ServerArgs:
         self.hisparse_config = json.dumps(
             {
                 "top_k": kvduo.top_k,
-                "device_buffer_size": kvduo.min_device_buffer_size,
+                # This is the resolver's simultaneous-workset width, not a
+                # resident hot-cache quota or minimum reservation. Physical
+                # layer pages remain demand allocated from the global pool.
+                "device_buffer_size": kvduo.top_k,
                 "host_to_device_ratio": kvduo.host_to_device_ratio,
                 "swap_in_block_size": kvduo.swap_in_block_size,
             }

@@ -14,19 +14,18 @@ class TestKVDuoConfig(unittest.TestCase):
         config = parse_kvduo_config(
             SimpleNamespace(
                 kvduo_config=(
-                    '{"top_k": 8, "min_device_buffer_size": 16, "N": 3, '
+                    '{"top_k": 8, "N": 3, '
                     '"host_to_device_ratio": 4, "swap_in_block_size": 256}'
                 )
             )
         )
         self.assertEqual(config.top_k, 8)
-        self.assertEqual(config.min_device_buffer_size, 16)
         self.assertEqual(config.tail_protected_pages, 3)
         self.assertEqual(config.host_to_device_ratio, 4)
         self.assertEqual(config.swap_in_block_size, 256)
 
-    def test_rejects_too_small_buffer(self):
-        with self.assertRaisesRegex(ValueError, "no smaller than top_k"):
+    def test_rejects_removed_minimum_name(self):
+        with self.assertRaisesRegex(ValueError, "Unknown kvduo_config"):
             parse_kvduo_config(
                 SimpleNamespace(
                     kvduo_config='{"top_k": 8, "min_device_buffer_size": 7}'

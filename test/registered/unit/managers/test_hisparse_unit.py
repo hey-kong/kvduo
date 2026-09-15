@@ -204,12 +204,14 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             available_size=MagicMock(return_value=0),
         )
         coordinator.reclaim_kvduo_full_pages = MagicMock(return_value=5)
+        coordinator.reclaim_kvduo_hot_pages = MagicMock(return_value=0)
 
         coordinator._reclaim_for_physical_allocation(8)
 
         self.assertEqual(physical.available_size.call_count, 2)
         coordinator.token_to_kv_pool_allocator.available_size.assert_not_called()
         coordinator.reclaim_kvduo_full_pages.assert_called_once_with(5)
+        coordinator.reclaim_kvduo_hot_pages.assert_called_once_with(3)
 
     def test_does_not_reclaim_when_physical_pool_fits_reserved_page(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -225,10 +227,12 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             )
         )
         coordinator.reclaim_kvduo_full_pages = MagicMock()
+        coordinator.reclaim_kvduo_hot_pages = MagicMock()
 
         coordinator._reclaim_for_physical_allocation(65)
 
         coordinator.reclaim_kvduo_full_pages.assert_not_called()
+        coordinator.reclaim_kvduo_hot_pages.assert_not_called()
 
 
 def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):

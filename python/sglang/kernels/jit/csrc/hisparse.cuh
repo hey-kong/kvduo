@@ -209,6 +209,9 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int64_t* __restrict__ req_to_logical_token,
     const int64_t* __restrict__ full_to_device_loc,
     int64_t* __restrict__ full_last_touch,
+    const int64_t* __restrict__ full_data_version,
+    const int64_t* __restrict__ full_host_version,
+    int32_t* __restrict__ swap_status,
     const int64_t* __restrict__ touch_clock,
     int64_t req_to_logical_stride,
     bool enable_full_lookup,
@@ -258,6 +261,8 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
   const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
   int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
+  if (tid == 0 && enable_full_lookup) swap_status[rid] = 0;
+  __syncthreads();
 
   // Fast path: short sequences have all tokens in the device buffer in order.
   if (!enable_full_lookup && seq_len <= HOT_BUFFER_SIZE) {
@@ -336,6 +341,18 @@ __global__ void load_cache_to_device_buffer_kernel(
     }
     if (token_idx < 0 || token_idx >= seq_len) {
       // Invalid/padded selections never participate in hashing or miss loading.
+    } else if (
+        enable_full_lookup &&
+        (logical_loc < 0 ||
+         (full_loc <= 0 &&
+          (req_host_cache_locs[token_idx] < 0 ||
+           full_host_version[logical_loc] != full_data_version[logical_loc])))) {
+      // Never let attention consume an address table backed by a missing or
+      // stale host version. The status tensor is capture-stable and can be
+      // checked at the execution boundary without dereferencing an invalid row.
+      s_top_k_tokens[i] = TOKEN_INVALID;
+      req_top_k_device_locs[i] = -1;
+      atomicMax(&swap_status[rid], 1);
     } else if (full_loc > 0) {
       atomicMax(
           reinterpret_cast<unsigned long long*>(&full_last_touch[logical_loc]),
@@ -628,6 +645,9 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView req_to_logical_token,
     tvm::ffi::TensorView full_to_device_loc,
     tvm::ffi::TensorView full_last_touch,
+    tvm::ffi::TensorView full_data_version,
+    tvm::ffi::TensorView full_host_version,
+    tvm::ffi::TensorView swap_status,
     tvm::ffi::TensorView touch_clock,
     bool enable_full_lookup,
     bool enable_dynamic_hot_view,
@@ -674,6 +694,9 @@ void load_cache_to_device_buffer(
         enable_full_lookup ? static_cast<const int64_t*>(req_to_logical_token.data_ptr()) : nullptr,
         enable_full_lookup ? static_cast<const int64_t*>(full_to_device_loc.data_ptr()) : nullptr,
         enable_full_lookup ? static_cast<int64_t*>(full_last_touch.data_ptr()) : nullptr,
+        enable_full_lookup ? static_cast<const int64_t*>(full_data_version.data_ptr()) : nullptr,
+        enable_full_lookup ? static_cast<const int64_t*>(full_host_version.data_ptr()) : nullptr,
+        enable_full_lookup ? static_cast<int32_t*>(swap_status.data_ptr()) : nullptr,
         static_cast<const int64_t*>(touch_clock.data_ptr()),
         req_to_logical_stride,
         enable_full_lookup,

@@ -141,7 +141,6 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
 
     known = {
         "top_k",
-        "min_device_buffer_size",
         "host_to_device_ratio",
         "swap_in_block_size",
         "tail_protected_pages",
@@ -154,13 +153,11 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         raise ValueError("Specify only one of N and tail_protected_pages")
 
     top_k = values.get("top_k", DEFAULT_TOP_K)
-    minimum = values.get("min_device_buffer_size", DEFAULT_DEVICE_BUFFER_SIZE)
     ratio = values.get("host_to_device_ratio", DEFAULT_HOST_TO_DEVICE_RATIO)
     block_size = values.get("swap_in_block_size", DEFAULT_SWAP_IN_BLOCK_SIZE)
     tail_pages = values.get("tail_protected_pages", values.get("N", 2))
     fields = {
         "top_k": top_k,
-        "min_device_buffer_size": minimum,
         "host_to_device_ratio": ratio,
         "swap_in_block_size": block_size,
         "tail_protected_pages": tail_pages,
@@ -170,10 +167,6 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
             raise ValueError(f"{name} must be an integer, got {value!r}")
         if value <= 0:
             raise ValueError(f"{name} must be positive, got {value}")
-    if minimum < top_k:
-        raise ValueError(
-            f"min_device_buffer_size ({minimum}) must be no smaller than top_k ({top_k})"
-        )
     if block_size > 1024:
         raise ValueError(
             f"swap_in_block_size ({block_size}) must be in the range [1, 1024]"
@@ -181,7 +174,6 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
 
     return KVDuoConfig(
         top_k=top_k,
-        min_device_buffer_size=minimum,
         host_to_device_ratio=ratio,
         swap_in_block_size=block_size,
         tail_protected_pages=tail_pages,
