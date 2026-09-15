@@ -1150,6 +1150,26 @@ class HiSparseCoordinator:
                     len(self._kvduo_req_layer_pages.get((layer_id, int(req_idx)), ()))
                 )
             }
+            # Free fragments selected for this layer still share a carrier with
+            # other layers. Pin those co-owners while reclaim runs; otherwise
+            # evicting the final co-owner could coalesce the carrier back into
+            # the global allocator and silently remove our planned fragment.
+            reserved_free_starts = sorted(free_pages)[
+                : min(pages_needed, len(free_pages))
+            ]
+            for start in reserved_free_starts:
+                for owner_layer, owner_req in enumerate(
+                    self._kvduo_hot_carriers[start]
+                ):
+                    if owner_req is None:
+                        continue
+                    owner_pages = self._kvduo_req_layer_pages.get(
+                        (owner_layer, int(owner_req)), ()
+                    )
+                    if start in owner_pages:
+                        self._kvduo_hot_pressure_protected.add(
+                            (owner_layer, int(owner_req), owner_pages.index(start))
+                        )
             try:
                 pressure = self._reclaim_for_physical_allocation(carrier_slots)
                 if pressure.action is not KVDuoPressureAction.SUCCESS:
@@ -1173,6 +1193,15 @@ class HiSparseCoordinator:
                     pages_needed = total_grow // page_size
                     missing_carriers = max(0, pages_needed - len(free_pages))
                     carrier_slots = missing_carriers * page_size
+                    pressure = self._reclaim_for_physical_allocation(carrier_slots)
+                    self._require_allocation_ready(pressure)
+                # Re-read the live set after pressure handling. Pins above make
+                # it stable for the normal path, while this defensive replan
+                # also covers allocator callbacks that coalesce carriers for
+                # unrelated reasons.
+                missing_carriers = max(0, pages_needed - len(free_pages))
+                carrier_slots = missing_carriers * page_size
+                if carrier_slots:
                     pressure = self._reclaim_for_physical_allocation(carrier_slots)
                     self._require_allocation_ready(pressure)
                 physical = (
