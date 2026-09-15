@@ -47,14 +47,18 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.enable_mixed_residency = True
         coordinator.page_size = 4
         coordinator.device_buffer_size = 16
+        coordinator.device = "cpu"
         coordinator.req_to_full_lookup = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
         coordinator.mem_pool_device = SimpleNamespace(
+            layer_num=2,
             full_to_hisparse_device_index_mapping=torch.tensor(
                 [0, 11, 12, 0, 0], dtype=torch.int64
-            )
+            ),
         )
         coordinator.req_device_buffer_size = torch.zeros(1, dtype=torch.int64)
         coordinator.req_device_buffer_size_gpu = torch.zeros(1, dtype=torch.int32)
+        coordinator.kvduo_req_hot_capacity = torch.zeros((2, 1), dtype=torch.int64)
+        coordinator.kvduo_req_hot_capacity_gpu = torch.zeros((2, 1), dtype=torch.int32)
         coordinator.req_to_device_buffer = torch.zeros((1, 16), dtype=torch.int64)
         coordinator.req_device_buffer_token_locs = torch.full(
             (2, 1, 16), -1, dtype=torch.int32
@@ -64,8 +68,12 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         physical = SimpleNamespace(alloc=MagicMock(return_value=torch.arange(21, 25)))
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
-            hisparse_attn_allocator=physical
+            hisparse_attn_allocator=physical,
+            free_hisparse_indices=MagicMock(),
         )
+        coordinator._kvduo_hot_carriers = {}
+        coordinator._kvduo_free_layer_pages = [set(), set()]
+        coordinator._kvduo_req_layer_pages = {}
         coordinator._reclaim_for_physical_allocation = MagicMock(
             return_value=SimpleNamespace(action=object())
         )
@@ -73,20 +81,31 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         # Positions 0 and 1 are full hits, so no hot allocation is needed.
         coordinator._ensure_kvduo_hot_workset(
-            torch.tensor([0]), torch.tensor([[0, 1, -1, -1]])
+            torch.tensor([0]), torch.tensor([[0, 1, -1, -1]]), layer_id=1
         )
         physical.alloc.assert_not_called()
 
         # Positions 2 and 3 have no full mapping.  Two slots round to one page.
         coordinator._ensure_kvduo_hot_workset(
-            torch.tensor([0]), torch.tensor([[0, 2, 3, -1]])
+            torch.tensor([0]), torch.tensor([[0, 2, 3, -1]]), layer_id=1
         )
         physical.alloc.assert_called_once_with(4)
-        self.assertEqual(int(coordinator.req_device_buffer_size[0]), 4)
+        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
         self.assertTrue(
-            torch.equal(coordinator.req_to_device_buffer[0, :4], torch.arange(21, 25))
+            torch.equal(
+                coordinator.req_device_buffer_token_locs[1, 0, :4],
+                torch.arange(21, 25, dtype=torch.int32),
+            )
         )
-        self.assertTrue(torch.all(coordinator.req_device_buffer_tokens[:, 0, :4] == -1))
+        self.assertTrue(torch.all(coordinator.req_device_buffer_tokens[1, 0, :4] == -1))
+        self.assertTrue(
+            torch.all(coordinator.req_device_buffer_token_locs[0, 0, :4] == -1)
+        )
+
+        # Releasing layer 1 does not touch layer 0 metadata.  Once all carrier
+        # fragments are free, the carrier coalesces back to the legacy pool.
+        coordinator._release_kvduo_layer_hot_pages(0)
+        coordinator.token_to_kv_pool_allocator.free_hisparse_indices.assert_called_once()
 
     def test_reclaims_only_dedicated_physical_shortfall(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
