@@ -96,9 +96,12 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
     )
 
-    assert (
-        server_args.disable_radix_cache
-    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+    assert server_args.disable_radix_cache or getattr(
+        server_args, "enable_kvduo", False
+    ), (
+        "Hierarchical sparse attention currently requires --disable-radix-cache; "
+        "KVDuo is the RadixTree-enabled mixed-residency exception."
+    )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

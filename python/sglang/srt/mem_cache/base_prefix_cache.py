@@ -204,6 +204,9 @@ class MatchResult(NamedTuple):
     full_kv_hit_length: int = 0
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
+    # Optional KVDuo classification/restore plan. Legacy caches leave this as
+    # None; KVDuo-aware matchers can distinguish logical hits from HBM hits.
+    kvduo_residency_plan: Any = None
 
 
 def zero_match_result(
@@ -224,6 +227,7 @@ def zero_match_result(
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
+        kvduo_residency_plan=None,
     )
 
 
@@ -357,6 +361,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         Preparing KV cache loading from host to device.
         """
+        coordinator = getattr(self, "kvduo_coordinator", None)
+        if coordinator is not None and params.req is not None:
+            restored = coordinator.init_kvduo_load_back(
+                params.req, params.host_hit_length
+            )
+            return restored, params.best_match_node
         raise NotImplementedError()
 
     def ready_to_load_host_cache(self) -> Any:

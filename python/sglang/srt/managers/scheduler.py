@@ -1110,6 +1110,11 @@ class Scheduler(
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+        if self.hisparse_coordinator.enable_mixed_residency:
+            # Plain RadixTree remains the logical prefix index; KVDuo supplies
+            # host residency matching and synchronous prefill restore through
+            # its existing match/init_load_back extension points.
+            self.tree_cache.kvduo_coordinator = self.hisparse_coordinator
 
     def init_running_status(self):
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.

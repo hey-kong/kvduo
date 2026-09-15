@@ -12,11 +12,17 @@ from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
     FlashAttentionAdaptor,
 )
 from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
+    KVDuoConfig,
     SparseConfig,
     SparseCoordinator,
 )
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_TOP_K = 2048
+DEFAULT_DEVICE_BUFFER_SIZE = 4096
+DEFAULT_HOST_TO_DEVICE_RATIO = 2
+DEFAULT_SWAP_IN_BLOCK_SIZE = 960
 
 _global_sparse_coordinator: Optional[SparseCoordinator] = None
 
@@ -114,6 +120,64 @@ def _parse_sparse_config(server_args) -> SparseConfig:
 def parse_hisparse_config(server_args) -> SparseConfig:
     """Parse hisparse config from server_args, returning defaults if no config provided."""
     return _parse_sparse_config(server_args)
+
+
+def parse_kvduo_config(server_args) -> KVDuoConfig:
+    """Parse KVDuo JSON without mutation.
+
+    ``swap_in_block_size`` is the resolver CUDA thread-block size (threads),
+    not the number of KV entries transferred by one host-to-device operation.
+    """
+    raw = server_args.kvduo_config
+    if raw is None:
+        values = {}
+    else:
+        try:
+            values = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse kvduo_config: {e}") from e
+        if not isinstance(values, dict):
+            raise ValueError("kvduo_config must be a JSON object")
+
+    known = {
+        "top_k",
+        "host_to_device_ratio",
+        "swap_in_block_size",
+        "tail_protected_pages",
+        "N",
+    }
+    unknown = set(values) - known
+    if unknown:
+        raise ValueError(f"Unknown kvduo_config field(s): {sorted(unknown)}")
+    if "N" in values and "tail_protected_pages" in values:
+        raise ValueError("Specify only one of N and tail_protected_pages")
+
+    top_k = values.get("top_k", DEFAULT_TOP_K)
+    ratio = values.get("host_to_device_ratio", DEFAULT_HOST_TO_DEVICE_RATIO)
+    block_size = values.get("swap_in_block_size", DEFAULT_SWAP_IN_BLOCK_SIZE)
+    tail_pages = values.get("tail_protected_pages", values.get("N", 2))
+    fields = {
+        "top_k": top_k,
+        "host_to_device_ratio": ratio,
+        "swap_in_block_size": block_size,
+        "tail_protected_pages": tail_pages,
+    }
+    for name, value in fields.items():
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{name} must be an integer, got {value!r}")
+        if value <= 0:
+            raise ValueError(f"{name} must be positive, got {value}")
+    if block_size > 1024:
+        raise ValueError(
+            f"swap_in_block_size ({block_size}) must be in the range [1, 1024]"
+        )
+
+    return KVDuoConfig(
+        top_k=top_k,
+        host_to_device_ratio=ratio,
+        swap_in_block_size=block_size,
+        tail_protected_pages=tail_pages,
+    )
 
 
 def create_sparse_coordinator(

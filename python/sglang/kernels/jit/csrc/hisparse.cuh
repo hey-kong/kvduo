@@ -24,6 +24,7 @@ using BallotMask = unsigned int;
 constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFu;
 #endif
 constexpr int32_t TOKEN_HIT = 0xFFFFFFFF;
+constexpr int32_t TOKEN_INVALID = -2;
 constexpr int32_t HASH_EMPTY = -1;
 
 // Knuth multiplicative hash for open-addressing table of size hash_size.
@@ -166,8 +167,8 @@ template <int NUM_TOP_K, int HOT_BUFFER_SIZE>
 struct SmemLayout {
   static constexpr int HASH_SIZE = NUM_TOP_K * 2;
   static constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
-  // int32_t region: top_k_tokens + chunk_offset + evict_chunk_offset + hash_keys + total_hits + newest_hit
-  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 2;
+  // int32_t region: top_k_tokens + offsets + hash_keys + hit/miss counters
+  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 4;
   // int16_t region: lru_slots_out + hash_vals
   static constexpr int TOTAL_INT16 = HOT_BUFFER_SIZE + HASH_SIZE;
   static constexpr size_t BYTES = TOTAL_INT32 * sizeof(int32_t) + TOTAL_INT16 * sizeof(int16_t);
@@ -203,9 +204,22 @@ __global__ void load_cache_to_device_buffer_kernel(
     const SeqLensT* __restrict__ seq_lens,
     int16_t* __restrict__ lru_slots,
     const int32_t* __restrict__ num_real_reqs,
+    const int32_t* __restrict__ req_hot_buffer_sizes,
+    int64_t* __restrict__ hot_page_last_touch,
+    const int64_t* __restrict__ req_to_logical_token,
+    const int64_t* __restrict__ full_to_device_loc,
+    int64_t* __restrict__ full_last_touch,
+    const int64_t* __restrict__ full_data_version,
+    const int64_t* __restrict__ full_host_version,
+    int32_t* __restrict__ swap_status,
+    const int64_t* __restrict__ touch_clock,
+    int64_t req_to_logical_stride,
+    bool enable_full_lookup,
+    bool enable_dynamic_hot_view,
     int64_t buffer_stride_0,
     int64_t host_stride,
     int64_t lru_slot_stride_0,
+    int64_t hot_page_stride_0,
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t page_size,
@@ -235,6 +249,9 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   const int64_t rid = req_pool_indices[bid];
   const int64_t seq_len = seq_lens[bid];
+  const int hot_buffer_size = enable_dynamic_hot_view
+      ? min(max(req_hot_buffer_sizes[rid], 0), HOT_BUFFER_SIZE)
+      : HOT_BUFFER_SIZE;
 
   // Calculate offsets for this request
   const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
@@ -244,9 +261,11 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
   const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
   int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
+  if (tid == 0 && enable_full_lookup) swap_status[rid] = 0;
+  __syncthreads();
 
   // Fast path: short sequences have all tokens in the device buffer in order.
-  if (seq_len <= HOT_BUFFER_SIZE) {
+  if (!enable_full_lookup && seq_len <= HOT_BUFFER_SIZE) {
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
     for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
       int32_t device_loc = -1;
@@ -278,6 +297,8 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Scalar counters
   int32_t& s_total_hits = s_hash_keys[HASH_SIZE];
   int32_t& s_newest_hit = s_hash_keys[HASH_SIZE + 1];
+  int32_t& s_full_hits = s_hash_keys[HASH_SIZE + 2];
+  int32_t& s_total_misses = s_hash_keys[HASH_SIZE + 3];
 
   int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
   // Compacted slot ordering: [hits fwd->  ...  <-evictables bwd]
@@ -289,6 +310,8 @@ __global__ void load_cache_to_device_buffer_kernel(
   if (tid == 0) {
     s_total_hits = 0;
     s_newest_hit = 0;
+    s_full_hits = 0;
+    s_total_misses = 0;
   }
   for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
     s_hash_keys[i] = HASH_EMPTY;
@@ -305,7 +328,39 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
-    if (token_idx == newest_token) {
+    int64_t full_loc = 0;
+    int64_t logical_loc = -1;
+    if (token_idx < 0 || token_idx >= seq_len) {
+      s_top_k_tokens[i] = TOKEN_INVALID;
+      req_top_k_device_locs[i] = -1;
+    } else if (enable_full_lookup) {
+      logical_loc = req_to_logical_token[rid * req_to_logical_stride + token_idx];
+      if (logical_loc >= 0) {
+        full_loc = full_to_device_loc[logical_loc];
+      }
+    }
+    if (token_idx < 0 || token_idx >= seq_len) {
+      // Invalid/padded selections never participate in hashing or miss loading.
+    } else if (
+        enable_full_lookup &&
+        (logical_loc < 0 ||
+         (full_loc <= 0 &&
+          (req_host_cache_locs[token_idx] < 0 ||
+           full_host_version[logical_loc] != full_data_version[logical_loc])))) {
+      // Never let attention consume an address table backed by a missing or
+      // stale host version. The status tensor is capture-stable and can be
+      // checked at the execution boundary without dereferencing an invalid row.
+      s_top_k_tokens[i] = TOKEN_INVALID;
+      req_top_k_device_locs[i] = -1;
+      atomicMax(&swap_status[rid], 1);
+    } else if (full_loc > 0) {
+      atomicMax(
+          reinterpret_cast<unsigned long long*>(&full_last_touch[logical_loc]),
+          static_cast<unsigned long long>(touch_clock[0]));
+      s_top_k_tokens[i] = TOKEN_HIT;
+      req_top_k_device_locs[i] = static_cast<int32_t>(full_loc);
+      atomicAdd(&s_full_hits, 1);
+    } else if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
@@ -334,7 +389,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     bool has_valid_chunk = chunk_idx < NUM_BUFFER_CHUNKS;
 
     const int slot_idx = chunk_idx * WARP_SIZE + lane_id;
-    const bool has_valid_slot = has_valid_chunk && (slot_idx < HOT_BUFFER_SIZE);
+    const bool has_valid_slot = has_valid_chunk && (slot_idx < hot_buffer_size);
     const int16_t buf_slot = has_valid_slot ? req_lru_slots[slot_idx] : -1;
     int32_t my_buffer_token = (buf_slot >= 0) ? req_device_buffer_tokens[buf_slot] : -1;
     int my_found_top_k_idx = -1;
@@ -351,12 +406,22 @@ __global__ void load_cache_to_device_buffer_kernel(
       }
     }
     bool is_hit = my_found_top_k_idx >= 0;
+    // req_lru_slots maintains empty slots before stale valid slots. Growth and
+    // shrink rebuild that permutation, and the writeback below preserves it.
+    // Consequently the backward scratch layout selects empty slots first and
+    // only then performs entry-LRU replacement.
     bool is_evictable = has_valid_slot && !is_hit;
 
     // Record hits
     if (is_hit) {
       s_top_k_tokens[my_found_top_k_idx] = TOKEN_HIT;
       req_top_k_device_locs[my_found_top_k_idx] = req_device_buffer_locs[buf_slot];
+      if (enable_dynamic_hot_view) {
+        atomicMax(
+            reinterpret_cast<unsigned long long*>(
+                &hot_page_last_touch[rid * hot_page_stride_0 + buf_slot / page_size]),
+            static_cast<unsigned long long>(touch_clock[0]));
+      }
     }
 
     int local_hit_offset = 0;
@@ -405,7 +470,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     // Evictables grow backward from HOT_BUFFER_SIZE - 1
     if (is_evictable) {
       int evict_offset = s_evict_chunk_offset[chunk_idx] + local_evict_offset;
-      s_lru_slots_out[HOT_BUFFER_SIZE - 1 - evict_offset] = buf_slot;
+      s_lru_slots_out[hot_buffer_size - 1 - evict_offset] = buf_slot;
     }
   }
   __syncthreads();
@@ -432,7 +497,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     int local_miss_offset = 0;
 
     if (has_valid_token) {
-      is_miss = s_top_k_tokens[my_token_idx] != TOKEN_HIT;
+      is_miss = s_top_k_tokens[my_token_idx] >= 0;
       if (is_miss) {
         my_token = s_top_k_tokens[my_token_idx];
       }
@@ -461,31 +526,41 @@ __global__ void load_cache_to_device_buffer_kernel(
 
     if (is_miss) {
       int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
-      int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_offset];
+      int16_t evict_slot = s_lru_slots_out[hot_buffer_size - 1 - miss_offset];
       // Reuse s_top_k_tokens as miss scratch: miss_offset < my_token_idx always
       // holds (hits are skipped), so compacted writes never overrun pending reads.
       s_top_k_tokens[miss_offset] = my_token;
       req_top_k_device_locs[my_token_idx] = req_device_buffer_locs[evict_slot];
       req_device_buffer_tokens[evict_slot] = my_token;
+      if (enable_dynamic_hot_view) {
+        atomicMax(
+            reinterpret_cast<unsigned long long*>(
+                &hot_page_last_touch[rid * hot_page_stride_0 + evict_slot / page_size]),
+            static_cast<unsigned long long>(touch_clock[0]));
+      }
     }
   }
   __syncthreads();
 
-  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  if (tid == 0) {
+    s_total_misses = total_misses;
+  }
+  __syncthreads();
+  total_misses = s_total_misses;
   // Write back LRU order: evictables at front (LRU), hits at back (MRU).
   {
-    const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
+    const int total_evictable = hot_buffer_size - s_total_hits;
 #ifdef USE_ROCM
     // ROCm: cap writeback threads at 512 for large kernels.
     constexpr int LRU_WRITEBACK_THREADS = (BLOCK_SIZE > 512) ? 512 : BLOCK_SIZE;
     if (tid < LRU_WRITEBACK_THREADS) {
-      for (int i = tid; i < HOT_BUFFER_SIZE; i += LRU_WRITEBACK_THREADS) {
+      for (int i = tid; i < hot_buffer_size; i += LRU_WRITEBACK_THREADS) {
         if (i < total_misses) {
           // Misses: just loaded from host, place right before hits
-          req_lru_slots[total_evictable - total_misses + i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+          req_lru_slots[total_evictable - total_misses + i] = s_lru_slots_out[hot_buffer_size - 1 - i];
         } else if (i < total_evictable) {
           // Remaining evictables: truly stale, dest at LRU front
-          req_lru_slots[i - total_misses] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+          req_lru_slots[i - total_misses] = s_lru_slots_out[hot_buffer_size - 1 - i];
         } else {
           // Hits: source at forward end, dest at MRU back
           req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
@@ -493,13 +568,13 @@ __global__ void load_cache_to_device_buffer_kernel(
       }
     }
 #else
-    for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
+    for (int i = tid; i < hot_buffer_size; i += BLOCK_SIZE) {
       if (i < total_misses) {
         // Misses: just loaded from host, place right before hits
-        req_lru_slots[total_evictable - total_misses + i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+        req_lru_slots[total_evictable - total_misses + i] = s_lru_slots_out[hot_buffer_size - 1 - i];
       } else if (i < total_evictable) {
         // Remaining evictables: truly stale, dest at LRU front
-        req_lru_slots[i - total_misses] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+        req_lru_slots[i - total_misses] = s_lru_slots_out[hot_buffer_size - 1 - i];
       } else {
         // Hits: source at forward end, dest at MRU back
         req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
@@ -511,7 +586,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
     const int32_t miss_token = s_top_k_tokens[miss_idx];
-    const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
+    const int16_t evict_slot = s_lru_slots_out[hot_buffer_size - 1 - miss_idx];
 
     const int64_t src_loc = req_host_cache_locs[miss_token];
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
@@ -569,6 +644,17 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView seq_lens,
     tvm::ffi::TensorView lru_slots,
     tvm::ffi::TensorView num_real_reqs,
+    tvm::ffi::TensorView req_hot_buffer_sizes,
+    tvm::ffi::TensorView hot_page_last_touch,
+    tvm::ffi::TensorView req_to_logical_token,
+    tvm::ffi::TensorView full_to_device_loc,
+    tvm::ffi::TensorView full_last_touch,
+    tvm::ffi::TensorView full_data_version,
+    tvm::ffi::TensorView full_host_version,
+    tvm::ffi::TensorView swap_status,
+    tvm::ffi::TensorView touch_clock,
+    bool enable_full_lookup,
+    bool enable_dynamic_hot_view,
     int64_t page_size,
     int64_t item_size_bytes) {
   using namespace host;
@@ -577,8 +663,10 @@ void load_cache_to_device_buffer(
   const int64_t host_stride = host_cache_locs.shape()[1];
   const int64_t buffer_stride_0 = device_buffer_tokens.strides()[0];
   const int64_t lru_slot_stride_0 = lru_slots.strides()[0];
+  const int64_t hot_page_stride_0 = enable_dynamic_hot_view ? hot_page_last_touch.strides()[0] : 0;
   const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
+  const int64_t req_to_logical_stride = enable_full_lookup ? req_to_logical_token.strides()[0] : 0;
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
 
   // Generic lambda: int32/int64 kernel variants are compiled for both
@@ -605,9 +693,22 @@ void load_cache_to_device_buffer(
         seq_lens_ptr,
         static_cast<int16_t*>(lru_slots.data_ptr()),
         static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        enable_dynamic_hot_view ? static_cast<const int32_t*>(req_hot_buffer_sizes.data_ptr()) : nullptr,
+        enable_dynamic_hot_view ? static_cast<int64_t*>(hot_page_last_touch.data_ptr()) : nullptr,
+        enable_full_lookup ? static_cast<const int64_t*>(req_to_logical_token.data_ptr()) : nullptr,
+        enable_full_lookup ? static_cast<const int64_t*>(full_to_device_loc.data_ptr()) : nullptr,
+        enable_full_lookup ? static_cast<int64_t*>(full_last_touch.data_ptr()) : nullptr,
+        enable_full_lookup ? static_cast<const int64_t*>(full_data_version.data_ptr()) : nullptr,
+        enable_full_lookup ? static_cast<const int64_t*>(full_host_version.data_ptr()) : nullptr,
+        enable_full_lookup ? static_cast<int32_t*>(swap_status.data_ptr()) : nullptr,
+        static_cast<const int64_t*>(touch_clock.data_ptr()),
+        req_to_logical_stride,
+        enable_full_lookup,
+        enable_dynamic_hot_view,
         buffer_stride_0,
         host_stride,
         lru_slot_stride_0,
+        hot_page_stride_0,
         top_k_tokens_stride,
         top_k_device_locs_stride,
         page_size,

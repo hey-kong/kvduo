@@ -103,13 +103,17 @@ class RadixCacheCpp(BasePrefixCache):
         device_indices_vec, host_indices_length, node_gpu, node_cpu = (
             self.tree.match_prefix(key.raw_token_ids())
         )
-        return MatchResult(
+        result = MatchResult(
             device_indices=self._merge_tensor(device_indices_vec),
             last_device_node=node_gpu,
             last_host_node=node_cpu,
             best_match_node=node_cpu,
             host_hit_length=host_indices_length,
         )
+        coordinator = getattr(self, "kvduo_coordinator", None)
+        if coordinator is not None and params.req is not None:
+            result = coordinator.augment_kvduo_prefix_match(params.req, result)
+        return result
 
     def _insert(self, key: RadixKey, value: torch.Tensor) -> int:
         """
@@ -174,7 +178,11 @@ class RadixCacheCpp(BasePrefixCache):
     ):
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        insert_len = min(
+            kv_len_to_handle,
+            getattr(req, "kvduo_radix_insert_len", kv_len_to_handle),
+        )
+        token_ids = (req.origin_input_ids + req.output_ids)[:insert_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_len_to_handle
         ].to(dtype=torch.int64, copy=True)
@@ -182,11 +190,11 @@ class RadixCacheCpp(BasePrefixCache):
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        page_aligned_overall_len = kv_len_to_handle // self.page_size * self.page_size
+        page_aligned_insert_len = insert_len // self.page_size * self.page_size
 
         if is_insert:
             new_prefix_len = self._insert(
-                RadixKey(token_ids, req.extra_key), kv_indices
+                RadixKey(token_ids, req.extra_key), kv_indices[:insert_len]
             )
             # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
             assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
@@ -197,13 +205,14 @@ class RadixCacheCpp(BasePrefixCache):
                 )
         else:
             self.token_to_kv_pool_allocator.free(
-                kv_indices[old_prefix_len:page_aligned_overall_len]
+                kv_indices[old_prefix_len:page_aligned_insert_len]
             )
 
-        # need to free the unaligned part, since it cannot be inserted into the radix tree
-        if page_aligned_overall_len < kv_len_to_handle:
+        # Free everything beyond the retained page-aligned prefix, including
+        # KVDuo's transient decode suffix.
+        if page_aligned_insert_len < kv_len_to_handle:
             # NOTE: sglang PagedAllocator support unaligned free (which will automatically align it)
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_overall_len:])
+            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_insert_len:])
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)

@@ -402,12 +402,23 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             value = torch.cat(value)
         else:
             value = self._empty_match_result.device_indices
-        return MatchResult(
+        result = MatchResult(
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
             best_match_node=last_node,
         )
+        coordinator = getattr(self, "kvduo_coordinator", None)
+        if coordinator is not None and params.req is not None:
+            result = coordinator.augment_kvduo_prefix_match(params.req, result)
+        return result
+
+    def init_load_back(self, params):
+        coordinator = getattr(self, "kvduo_coordinator", None)
+        if coordinator is None or params.req is None:
+            return super().init_load_back(params)
+        restored = coordinator.init_kvduo_load_back(params.req, params.host_hit_length)
+        return restored, params.best_match_node
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -449,9 +460,13 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        insert_len = min(
+            kv_len_to_handle,
+            getattr(req, "kvduo_radix_insert_len", kv_len_to_handle),
+        )
+        token_ids = (req.origin_input_ids + req.output_ids)[:insert_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, :kv_len_to_handle
         ]
 
         radix_key = RadixKey(

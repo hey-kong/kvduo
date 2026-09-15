@@ -68,6 +68,16 @@ class SparseConfig:
     )  # Algorithm-specific config, parsed by each algorithm
 
 
+@dataclass(frozen=True)
+class KVDuoConfig:
+    """Configuration for full-page/hot-entry mixed KV residency."""
+
+    top_k: int = 2048
+    host_to_device_ratio: int = 2
+    swap_in_block_size: int = 960
+    tail_protected_pages: int = 2
+
+
 class SparseCoordinator:
     """
     Coordinator for sparse attention with retrievable KV cache compression.

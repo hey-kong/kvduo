@@ -958,6 +958,7 @@ class Req(ReqDllmMixin):
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.best_match_node: Any = None
+        self.kvduo_residency_plan: Any = None
         # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
@@ -1153,6 +1154,10 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        # Host-prefix pins are content-owned and may be acquired before this
+        # request receives a recyclable req_pool_idx.
+        self.kvduo_host_prefix_records = set()
+        self.kvduo_restored_prefix_len = 0
 
     @property
     def seqlen(self) -> int:
@@ -1345,6 +1350,7 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len = match_result.cache_protected_len
             else:
                 self.cache_protected_len = len(self.prefix_indices)
+            self.kvduo_residency_plan = match_result.kvduo_residency_plan
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1842,6 +1848,8 @@ def release_req(
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
 ) -> None:
+    if hisparse_coordinator is not None:
+        hisparse_coordinator.release_kvduo_match_refs(req)
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 
@@ -2729,6 +2737,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         whether the next decode step fits in the KV pool."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
+        if (
+            self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.enable_mixed_residency
+        ):
+            requests = (
+                self.reqs
+                if selected_indices is None
+                else [self.reqs[i] for i in selected_indices]
+            )
+            # Only main sparse-KV physical pressure is handled by KVDuo.  A
+            # logical/SWA/indexer shortage still falls through to the normal
+            # retract decision below.
+            self.hisparse_coordinator.ensure_kvduo_decode_capacity(requests)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_decode(

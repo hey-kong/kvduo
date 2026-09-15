@@ -11,6 +11,7 @@ import os
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
@@ -35,6 +36,257 @@ KV_CACHE_DIM = 576  # MLA dim (DeepSeek-style)
 LAYER_NUM = 2
 MAX_NUM_REQS = 8
 MAX_CONTEXT_LEN = 2048
+
+
+class TestKVDuoPhysicalReclaim(unittest.TestCase):
+    def test_host_only_prefix_is_matched_and_restored_before_prefill(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+        from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
+            HostPrefixRecord,
+            KVDuoHostPrefixCache,
+            KVDuoPrefixResidency,
+        )
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.enable_mixed_residency = True
+        coordinator.page_size = 2
+        coordinator.compress_ratio = 1
+        coordinator.device = "cpu"
+        coordinator.item_size_bytes = 4
+        coordinator.mem_pool_device = SimpleNamespace(layer_num=2)
+        coordinator.full_generation = torch.zeros(32, dtype=torch.int64)
+        coordinator.full_data_version = torch.zeros(32, dtype=torch.int64)
+        coordinator.full_host_version = torch.full((32,), -1, dtype=torch.int64)
+        coordinator.full_last_touch = torch.zeros(32, dtype=torch.int64)
+        coordinator.host_prefix_cache = KVDuoHostPrefixCache(8)
+        for ordinal, (identity, locs, touches) in enumerate(
+            (
+                ((1, (1, 2)), (20, 21), (7, 8)),
+                ((1, (1, 2, 3, 4)), (22, 23), (9, 10)),
+            )
+        ):
+            coordinator.host_prefix_cache.insert(
+                HostPrefixRecord(
+                    identity=identity,
+                    domains=("main_kv",),
+                    host_locations={"main_kv": locs},
+                    data_versions={"main_kv": (ordinal + 1,) * 2},
+                    host_versions={"main_kv": (ordinal + 1,) * 2},
+                    model_touches={"main_kv": touches},
+                    cache_reference=True,
+                )
+            )
+
+        req = SimpleNamespace(
+            rid="restore",
+            prefix_indices=torch.tensor([5, 6], dtype=torch.int64),
+            get_fill_ids=lambda: [1, 2, 3, 4, 5],
+            _compute_max_prefix_len=lambda length: length - 1,
+        )
+        gpu_match = MatchResult(
+            device_indices=req.prefix_indices,
+            last_device_node=object(),
+            last_host_node=object(),
+            best_match_node=object(),
+        )
+        match = coordinator.augment_kvduo_prefix_match(req, gpu_match)
+        self.assertEqual(match.host_hit_length, 2)
+        self.assertEqual(match.full_kv_hit_length, 4)
+        self.assertEqual(
+            match.kvduo_residency_plan.execution_status,
+            KVDuoPrefixResidency.RESTORE_REQUIRED,
+        )
+        req.kvduo_residency_plan = match.kvduo_residency_plan
+
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            alloc_extend=MagicMock(return_value=torch.tensor([10, 11])),
+            free=MagicMock(),
+        )
+        load = MagicMock()
+        coordinator.mem_pool_device = SimpleNamespace(
+            layer_num=2,
+            translate_loc_from_full_to_compressed=lambda value: value,
+            translate_loc_from_full_to_hisparse_device=lambda value: value,
+        )
+        coordinator.mem_pool_host = SimpleNamespace(load_to_device_per_layer=load)
+        restored = coordinator.init_kvduo_load_back(req, match.host_hit_length)
+
+        self.assertTrue(torch.equal(restored, torch.tensor([10, 11])))
+        self.assertEqual(load.call_count, 2)
+        self.assertEqual(coordinator.full_data_version[10:12].tolist(), [2, 2])
+        self.assertEqual(coordinator.full_last_touch[10:12].tolist(), [9, 10])
+        self.assertEqual(
+            coordinator.host_prefix_cache.records[(1, (1, 2, 3, 4))].restore_pins,
+            0,
+        )
+
+    def test_hot_pages_are_allocated_only_for_non_full_topk(self):
+        """A full hit owns no hot page; the first host workset grows by a page."""
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.enable_mixed_residency = True
+        coordinator.page_size = 4
+        coordinator.device_buffer_size = 16
+        coordinator.device = "cpu"
+        coordinator.req_to_full_lookup = torch.tensor(
+            [[1, 2, 3, 4, 5, 6, 7, 8]], dtype=torch.int64
+        )
+        coordinator.mem_pool_device = SimpleNamespace(
+            layer_num=2,
+            full_to_hisparse_device_index_mapping=torch.tensor(
+                [0, 11, 12, 0, 0, 0, 0, 0, 0], dtype=torch.int64
+            ),
+        )
+        coordinator.req_device_buffer_size = torch.zeros(1, dtype=torch.int64)
+        coordinator.req_device_buffer_size_gpu = torch.zeros(1, dtype=torch.int32)
+        coordinator.kvduo_req_hot_capacity = torch.zeros((2, 1), dtype=torch.int64)
+        coordinator.kvduo_req_hot_capacity_gpu = torch.zeros((2, 1), dtype=torch.int32)
+        coordinator.req_to_device_buffer = torch.zeros((1, 16), dtype=torch.int64)
+        coordinator.req_device_buffer_token_locs = torch.full(
+            (2, 1, 16), -1, dtype=torch.int32
+        )
+        coordinator.req_device_buffer_tokens = torch.full(
+            (2, 1, 16), -1, dtype=torch.int32
+        )
+        coordinator.lru_slots = (
+            torch.arange(16, dtype=torch.int16).view(1, 1, -1).repeat(2, 1, 1)
+        )
+        physical = SimpleNamespace(alloc=MagicMock(return_value=torch.arange(21, 25)))
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            hisparse_attn_allocator=physical,
+            free_hisparse_indices=MagicMock(),
+        )
+        coordinator._kvduo_hot_carriers = {}
+        coordinator._kvduo_free_layer_pages = [set(), set()]
+        coordinator._kvduo_req_layer_pages = {}
+        coordinator._reclaim_for_physical_allocation = MagicMock(
+            return_value=SimpleNamespace(action=object())
+        )
+        coordinator._require_allocation_ready = MagicMock()
+
+        # Positions 0 and 1 are full hits, so no hot allocation is needed.
+        coordinator._ensure_kvduo_hot_workset(
+            torch.tensor([0]), torch.tensor([[0, 1, -1, -1]]), layer_id=1
+        )
+        physical.alloc.assert_not_called()
+
+        # Positions 2 and 3 have no full mapping.  Two slots round to one page.
+        coordinator._ensure_kvduo_hot_workset(
+            torch.tensor([0]), torch.tensor([[0, 2, 3, -1]]), layer_id=1
+        )
+        physical.alloc.assert_called_once_with(4)
+        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
+        self.assertTrue(
+            torch.equal(
+                coordinator.req_device_buffer_token_locs[1, 0, :4],
+                torch.arange(21, 25, dtype=torch.int32),
+            )
+        )
+        self.assertTrue(torch.all(coordinator.req_device_buffer_tokens[1, 0, :4] == -1))
+        self.assertTrue(
+            torch.all(coordinator.req_device_buffer_token_locs[0, 0, :4] == -1)
+        )
+
+        # Simulate the resolver publishing the first miss set.  A disjoint
+        # later workset must retain these entries and demand a second page,
+        # rather than treating one Top-k width as a fixed cache quota.
+        coordinator.req_device_buffer_tokens[1, 0, :4] = torch.tensor([2, 3, 6, 7])
+        physical.alloc.reset_mock()
+        from sglang.srt.mem_cache.sparsity.core.kvduo_state import (
+            KVDuoPressureAction,
+        )
+
+        coordinator._reclaim_for_physical_allocation.return_value = SimpleNamespace(
+            action=KVDuoPressureAction.ERROR
+        )
+        coordinator._ensure_kvduo_hot_workset(
+            torch.tensor([0]), torch.tensor([[4, 5, -1, -1]]), layer_id=1
+        )
+        physical.alloc.assert_not_called()
+        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
+
+        coordinator._reclaim_for_physical_allocation.return_value = SimpleNamespace(
+            action=KVDuoPressureAction.SUCCESS
+        )
+        physical.alloc.return_value = torch.arange(25, 29)
+        coordinator._ensure_kvduo_hot_workset(
+            torch.tensor([0]), torch.tensor([[4, 5, 6, 7]]), layer_id=1
+        )
+        physical.alloc.assert_called_once_with(4)
+        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 8)
+        self.assertEqual(
+            coordinator.req_device_buffer_tokens[1, 0, :4].tolist(), [2, 3, 6, 7]
+        )
+        self.assertEqual(
+            coordinator.lru_slots[1, 0, :8].tolist(), [4, 5, 6, 7, 0, 1, 2, 3]
+        )
+
+        # Shrink and reuse the released layer page. The reactivated range must
+        # again be a complete permutation, despite stale values outside the
+        # temporarily reduced active capacity.
+        coordinator._evict_kvduo_hot_fragment(1, 0, 1)
+        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
+        physical.alloc.reset_mock()
+        coordinator._ensure_kvduo_hot_workset(
+            torch.tensor([0]), torch.tensor([[4, 5, 6, 7]]), layer_id=1
+        )
+        physical.alloc.assert_not_called()
+        self.assertEqual(
+            coordinator.lru_slots[1, 0, :8].tolist(), [4, 5, 6, 7, 0, 1, 2, 3]
+        )
+        self.assertEqual(len(set(coordinator.lru_slots[1, 0, :8].tolist())), 8)
+
+        # Releasing layer 1 does not touch layer 0 metadata.  Once all carrier
+        # fragments are free, the carrier coalesces back to the legacy pool.
+        coordinator._release_kvduo_layer_hot_pages(0)
+        coordinator.token_to_kv_pool_allocator.free_hisparse_indices.assert_called_once()
+
+    def test_reclaims_only_dedicated_physical_shortfall(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.enable_mixed_residency = True
+        coordinator.item_size_bytes = 4
+        coordinator.page_size = 1
+        coordinator.mem_pool_device = SimpleNamespace(layer_num=2)
+        physical = SimpleNamespace(available_size=MagicMock(side_effect=(3, 8)))
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            hisparse_attn_allocator=physical,
+            # A deliberately unrelated composite value must never be consulted.
+            available_size=MagicMock(return_value=0),
+        )
+        coordinator.reclaim_kvduo_full_pages = MagicMock(return_value=5)
+        coordinator.reclaim_kvduo_hot_pages = MagicMock(return_value=0)
+
+        coordinator._reclaim_for_physical_allocation(8)
+
+        self.assertEqual(physical.available_size.call_count, 2)
+        coordinator.token_to_kv_pool_allocator.available_size.assert_not_called()
+        coordinator.reclaim_kvduo_full_pages.assert_called_once_with(5)
+        coordinator.reclaim_kvduo_hot_pages.assert_called_once_with(3)
+
+    def test_does_not_reclaim_when_physical_pool_fits_reserved_page(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.enable_mixed_residency = True
+        coordinator.item_size_bytes = 4
+        coordinator.page_size = 1
+        coordinator.mem_pool_device = SimpleNamespace(layer_num=2)
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            hisparse_attn_allocator=SimpleNamespace(
+                available_size=MagicMock(return_value=65)
+            )
+        )
+        coordinator.reclaim_kvduo_full_pages = MagicMock()
+        coordinator.reclaim_kvduo_hot_pages = MagicMock()
+
+        coordinator._reclaim_for_physical_allocation(65)
+
+        coordinator.reclaim_kvduo_full_pages.assert_not_called()
+        coordinator.reclaim_kvduo_hot_pages.assert_not_called()
 
 
 def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
