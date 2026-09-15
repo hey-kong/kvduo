@@ -355,6 +355,10 @@ class HiSparseCoordinator:
 
         preserve_indices = None
         if self.enable_mixed_residency:
+            radix_page_size = self.token_to_kv_pool_allocator.page_size
+            req.kvduo_radix_insert_len = (
+                allocated_len // radix_page_size * radix_page_size
+            )
             # Keep all full pages when the shared physical pool can also satisfy
             # the minimum hot-buffer reservation. Under pressure, atomically
             # demote the non-tail portion and recycle only those physical slots.
@@ -377,7 +381,7 @@ class HiSparseCoordinator:
                 )
                 preserve_indices = torch.cat([prefix_indices, tail_indices])
                 req.kvduo_mixed_residency = True
-                req.skip_radix_cache_insert = True
+                req.kvduo_radix_insert_len = req.cache_protected_len
                 self._mixed_slots[req.req_pool_idx] = True
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
             compressed_logical_indices, alloc_size, preserve_indices=preserve_indices
@@ -540,8 +544,6 @@ class HiSparseCoordinator:
                 out_cache_loc
             )
             if self.enable_mixed_residency:
-                for req_idx in req_pool_indices_cpu.tolist():
-                    self._mixed_slots[int(req_idx)] = True
                 old_locs = self.req_reserved_logical[req_pool_indices]
                 valid_old = old_locs >= 0
                 self.mem_pool_device.full_to_hisparse_device_index_mapping[
@@ -593,9 +595,6 @@ class HiSparseCoordinator:
             active_out_cache_loc
         )
         if self.enable_mixed_residency:
-            active_cpu = req_pool_indices_cpu[active_reqs.to(device="cpu")].tolist()
-            for req_idx in active_cpu:
-                self._mixed_slots[int(req_idx)] = True
             old_locs = self.req_reserved_logical[active_req_pool_indices]
             valid_old = old_locs >= 0
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
@@ -869,10 +868,9 @@ class HiSparseCoordinator:
         is_mixed = self.enable_mixed_residency and self._mixed_slots[req.req_pool_idx]
         if is_mixed:
             req.kvduo_mixed_residency = True
-            req.skip_radix_cache_insert = True
-            # Mixed requests are deliberately not inserted into the plain
-            # RadixCache: it cannot represent host-only holes. Free every
-            # surviving full-page fragment before dropping the mapping.
+            # RadixCache cannot represent host-only holes. Free every surviving
+            # request-owned fragment beyond kvduo_radix_insert_len; the cache
+            # implementations retain only the already-contiguous full prefix.
             owned_full_locs = allocated_locs[req.cache_protected_len :]
             owned_compressed_locs = (
                 self.mem_pool_device.translate_loc_from_full_to_compressed(
@@ -894,6 +892,13 @@ class HiSparseCoordinator:
         elif not self.enable_mixed_residency:
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 compressed_locs
+            ] = 0
+        elif self.req_reserved_logical[req.req_pool_idx] >= 0:
+            # A decode append slot is transient, not a sealed full page. Keep
+            # the prefill full mappings for Radix insertion, but invalidate the
+            # final append owner before its private buffer is returned.
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                self.req_reserved_logical[req.req_pool_idx]
             ] = 0
 
         host_indices = self.mem_pool_host.allocated_host_indices(

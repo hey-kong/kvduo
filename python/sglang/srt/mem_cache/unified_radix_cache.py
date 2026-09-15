@@ -611,7 +611,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        insert_len = min(
+            kv_len_to_handle,
+            getattr(req, "kvduo_radix_insert_len", kv_len_to_handle),
+        )
+        token_ids = (req.origin_input_ids + req.output_ids)[:insert_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_len_to_handle
         ]
