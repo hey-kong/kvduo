@@ -130,11 +130,13 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.page_size = 4
         coordinator.device_buffer_size = 16
         coordinator.device = "cpu"
-        coordinator.req_to_full_lookup = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+        coordinator.req_to_full_lookup = torch.tensor(
+            [[1, 2, 3, 4, 5, 6, 7, 8]], dtype=torch.int64
+        )
         coordinator.mem_pool_device = SimpleNamespace(
             layer_num=2,
             full_to_hisparse_device_index_mapping=torch.tensor(
-                [0, 11, 12, 0, 0], dtype=torch.int64
+                [0, 11, 12, 0, 0, 0, 0, 0, 0], dtype=torch.int64
             ),
         )
         coordinator.req_device_buffer_size = torch.zeros(1, dtype=torch.int64)
@@ -182,6 +184,21 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         self.assertTrue(torch.all(coordinator.req_device_buffer_tokens[1, 0, :4] == -1))
         self.assertTrue(
             torch.all(coordinator.req_device_buffer_token_locs[0, 0, :4] == -1)
+        )
+
+        # Simulate the resolver publishing the first miss set.  A disjoint
+        # later workset must retain these entries and demand a second page,
+        # rather than treating one Top-k width as a fixed cache quota.
+        coordinator.req_device_buffer_tokens[1, 0, :4] = torch.tensor([2, 3, 6, 7])
+        physical.alloc.reset_mock()
+        physical.alloc.return_value = torch.arange(25, 29)
+        coordinator._ensure_kvduo_hot_workset(
+            torch.tensor([0]), torch.tensor([[4, 5, 6, 7]]), layer_id=1
+        )
+        physical.alloc.assert_called_once_with(4)
+        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 8)
+        self.assertEqual(
+            coordinator.req_device_buffer_tokens[1, 0, :4].tolist(), [2, 3, 6, 7]
         )
 
         # Releasing layer 1 does not touch layer 0 metadata.  Once all carrier

@@ -63,6 +63,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.enable_kvduo_full_decode = False
+        self.kvduo_physical_allocation_guard = None
         self.clear()
         self._kvcache.register_mapping(
             weakref.proxy(self.full_to_hisparse_device_index_mapping)
@@ -240,9 +242,38 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,  # last_loc for full layers
     ):
-        return self.logical_attn_allocator.alloc_decode(
+        if not self.enable_kvduo_full_decode:
+            return self.logical_attn_allocator.alloc_decode(
+                seq_lens, seq_lens_cpu, last_loc
+            )
+
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
+        )
+        physical_slots = num_new_pages * self.page_size
+        if self.kvduo_physical_allocation_guard is not None and not (
+            self.kvduo_physical_allocation_guard(physical_slots)
+        ):
+            return None
+        if physical_slots > self.hisparse_attn_allocator.available_size():
+            return None
+
+        logical_indices = self.logical_attn_allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc
         )
+        if logical_indices is None:
+            return None
+        hisparse_indices = self.hisparse_attn_allocator.alloc_decode(
+            seq_lens,
+            seq_lens_cpu,
+            self.get_last_loc_hisparse_device(last_loc),
+        )
+        if hisparse_indices is None:
+            raise RuntimeError(
+                "KVDuo sparse decode allocation failed after successful admission"
+            )
+        self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
+        return logical_indices
 
     def free_hisparse(self, free_indices: torch.Tensor):
         hisparse_indices = self._kvcache._translate_loc_to_hisparse_device(free_indices)
@@ -332,6 +363,8 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.enable_kvduo_full_decode = False
+        self.kvduo_physical_allocation_guard = None
         self.clear()
 
         self.hisparse_kvcache.register_mapping(
@@ -568,9 +601,51 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
     ):
-        return self.logical_attn_allocator.alloc_decode(
+        if not self.enable_kvduo_full_decode:
+            return self.logical_attn_allocator.alloc_decode(
+                seq_lens, seq_lens_cpu, last_loc
+            )
+
+        generated_cpu = seq_lens_cpu % self.compress_ratio == 0
+        compressed_seq_lens_cpu = seq_lens_cpu[generated_cpu] // self.compress_ratio
+        num_new_pages = get_num_new_pages(
+            seq_lens=compressed_seq_lens_cpu,
+            page_size=self.hisparse_page_size,
+            decode=True,
+        )
+        physical_slots = num_new_pages * self.hisparse_page_size
+        if self.kvduo_physical_allocation_guard is not None and not (
+            self.kvduo_physical_allocation_guard(physical_slots)
+        ):
+            return None
+        if physical_slots > self.hisparse_attn_allocator.available_size():
+            return None
+
+        logical_indices = self.logical_attn_allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc
         )
+        if logical_indices is None or not torch.any(generated_cpu):
+            return logical_indices
+
+        generated = generated_cpu.to(device=seq_lens.device)
+        compressed_logical_indices = (
+            self.hisparse_kvcache.translate_loc_from_full_to_compressed(
+                logical_indices[generated]
+            )
+        )
+        hisparse_indices = self.hisparse_attn_allocator.alloc_decode(
+            seq_lens[generated] // self.compress_ratio,
+            compressed_seq_lens_cpu,
+            self.get_last_loc_hisparse_device(last_loc[generated]),
+        )
+        if hisparse_indices is None:
+            raise RuntimeError(
+                "KVDuo C4 decode allocation failed after successful admission"
+            )
+        self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
+            hisparse_indices
+        )
+        return logical_indices
 
     def free_compressed(self, compressed_indices: torch.Tensor):
         hisparse_indices = self.hisparse_kvcache.translate_loc_to_hisparse_device(

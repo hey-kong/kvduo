@@ -312,6 +312,15 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
         self._mixed_slots = [False] * max_num_req_slots
+        if self.enable_mixed_residency:
+            # Decode allocation is owned by the token allocator, but pressure
+            # policy belongs here.  The callback runs immediately before a
+            # real sparse-KV page allocation and therefore cannot confuse a
+            # logical/SWA/indexer shortage with physical main-KV pressure.
+            self.token_to_kv_pool_allocator.enable_kvduo_full_decode = True
+            self.token_to_kv_pool_allocator.kvduo_physical_allocation_guard = (
+                self._guard_kvduo_physical_allocation
+            )
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -817,6 +826,38 @@ class HiSparseCoordinator:
             f"remaining_shortfall_bytes={result.remaining_shortfall_bytes}"
         )
 
+    def _guard_kvduo_physical_allocation(self, physical_slots: int) -> bool:
+        """Make an imminent decode allocation possible without partial state."""
+        if physical_slots == 0:
+            return True
+        result = self._reclaim_for_physical_allocation(physical_slots)
+        return result.action is KVDuoPressureAction.SUCCESS
+
+    def ensure_kvduo_decode_capacity(self, requests) -> KVDuoPressureResult:
+        """Reserve the exact main sparse-KV pages needed by ordinary decode.
+
+        This is deliberately separate from the composite allocator's
+        ``available_size``: logical slots, SWA, indexer, and compression state
+        remain the responsibility of their own admission paths.
+        """
+        if not self.enable_mixed_residency:
+            return self._reclaim_for_physical_allocation(0)
+        pages = 0
+        if self.is_dsv4_hisparse:
+            page = self.page_size
+            for req in requests:
+                next_len = req.kv_committed_len + 1
+                if next_len % self.compress_ratio != 0:
+                    continue
+                compressed_len = next_len // self.compress_ratio
+                pages += int((compressed_len - 1) % page == 0)
+        else:
+            logical_page = self.token_to_kv_pool_allocator.page_size
+            pages = sum(
+                int(req.kv_committed_len % logical_page == 0) for req in requests
+            )
+        return self._reclaim_for_physical_allocation(pages * self.page_size)
+
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
             allocated_len = req.extend_range.end
@@ -870,6 +911,10 @@ class HiSparseCoordinator:
             # Staging materializes the complete prefill range. Appending to an
             # incomplete final page will lower this boundary to its page start.
             self._kvduo_host_valid_len[req.req_pool_idx] = compressed_len
+            radix_page_size = self.token_to_kv_pool_allocator.page_size
+            req.kvduo_radix_insert_len = (
+                allocated_len // radix_page_size * radix_page_size
+            )
 
             # A fully-resident KVDuo request does not own a speculative hot
             # buffer.  Physical hot pages are acquired by
@@ -888,10 +933,6 @@ class HiSparseCoordinator:
 
         preserve_indices = None
         if self.enable_mixed_residency:
-            radix_page_size = self.token_to_kv_pool_allocator.page_size
-            req.kvduo_radix_insert_len = (
-                allocated_len // radix_page_size * radix_page_size
-            )
             turnover_size = (
                 self.page_size if alloc_size == self.padded_buffer_size else 0
             )
@@ -1055,24 +1096,35 @@ class HiSparseCoordinator:
         full_locs = self.mem_pool_device.full_to_hisparse_device_index_mapping[
             logical.clamp(min=0)
         ]
-        # Top-k is guaranteed deduplicated.  Therefore the number of valid,
-        # non-full selections is exactly the simultaneous hot workset capacity
-        # required to protect hits before inserting misses.
-        required = torch.sum(valid & (logical >= 0) & (full_locs <= 0), dim=1)
-        required_cpu = required.to(device="cpu", dtype=torch.int64)
+        non_full = valid & (logical >= 0) & (full_locs <= 0)
         req_cpu = req_pool_indices.to(device="cpu", dtype=torch.int64)
 
         page_size = self.page_size
+        demand = []
+        max_required = self.device_buffer_size
+        for row, req_idx in enumerate(req_cpu.tolist()):
+            current = int(self.kvduo_req_hot_capacity[layer_id, req_idx])
+            hot_tokens = self.req_device_buffer_tokens[layer_id, req_idx, :current]
+            occupied = int(torch.count_nonzero(hot_tokens >= 0).item())
+            selected = top_k_result[row][non_full[row]]
+            if current:
+                cached = hot_tokens[hot_tokens >= 0]
+                new_misses = int((~torch.isin(selected, cached)).sum().item())
+            else:
+                new_misses = int(selected.numel())
+            required_slots = occupied + new_misses
+            demand.append((req_idx, current, required_slots))
+            max_required = max(max_required, required_slots)
+
+        self._grow_kvduo_hot_metadata(max_required)
         requests = []
         total_grow = 0
-        for req_idx, required_slots in zip(req_cpu.tolist(), required_cpu.tolist()):
-            required_slots = min(int(required_slots), self.device_buffer_size)
+        for req_idx, current, required_slots in demand:
             target = (
                 (required_slots + page_size - 1) // page_size * page_size
                 if required_slots
                 else 0
             )
-            current = int(self.kvduo_req_hot_capacity[layer_id, req_idx])
             if target <= current:
                 continue
             grow = target - current
@@ -1152,6 +1204,51 @@ class HiSparseCoordinator:
             # Publish capacity last so a graph replay cannot observe slots
             # before their addresses and invalid tags are initialized.
             self.kvduo_req_hot_capacity_gpu[layer_id, req_idx] = target
+
+    def _grow_kvduo_hot_metadata(self, required_slots: int) -> None:
+        """Grow the resolver view; physical pages remain independently owned.
+
+        KVDuo disables decode graph capture while this host-driven prototype is
+        active, so replacing these metadata tensors is safe.  This avoids a
+        per-request cache quota: the view grows geometrically only when real
+        misses require it, and is ultimately bounded by the global physical
+        sparse-KV pool rather than a configuration field.
+        """
+        if required_slots <= self.device_buffer_size:
+            return
+        old = self.device_buffer_size
+        new = (
+            (max(required_slots, old * 2) + self.page_size - 1) // self.page_size
+        ) * self.page_size
+        self.device_buffer_size = new
+        self.padded_buffer_size = new + self.page_size
+
+        def grow_last(tensor, size, fill):
+            shape = list(tensor.shape)
+            shape[-1] = size
+            result = torch.full(shape, fill, dtype=tensor.dtype, device=tensor.device)
+            result[..., : tensor.shape[-1]] = tensor
+            return result
+
+        self.req_to_device_buffer = grow_last(
+            self.req_to_device_buffer, self.padded_buffer_size, 0
+        )
+        self.req_device_buffer_tokens = grow_last(
+            self.req_device_buffer_tokens, self.padded_buffer_size, -1
+        )
+        self.req_device_buffer_token_locs = grow_last(
+            self.req_device_buffer_token_locs, self.padded_buffer_size, -1
+        )
+        self.lru_slots = grow_last(self.lru_slots, new, 0)
+        self.lru_slots[..., old:new] = torch.arange(
+            old, new, dtype=self.lru_slots.dtype, device=self.device
+        )
+        self._lru_init = torch.arange(new, dtype=torch.int16, device=self.device)
+        self._device_buffer_arange_i32 = torch.arange(
+            new, dtype=torch.int32, device=self.device
+        )
+        new_hot_pages = new // self.page_size
+        self.hot_page_last_touch = grow_last(self.hot_page_last_touch, new_hot_pages, 0)
 
     def _release_kvduo_layer_hot_pages(self, req_idx: int) -> None:
         """Release request-private hot pages at single-layer page granularity."""
