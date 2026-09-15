@@ -137,6 +137,11 @@ class HiSparseCoordinator:
         self.req_device_buffer_size = torch.zeros(
             max_num_req_slots, dtype=torch.int64, device="cpu"
         )
+        # Capture-stable dynamic capacity consumed by the resolver kernel. It
+        # excludes the separate turnover/newest page.
+        self.req_device_buffer_size_gpu = torch.zeros(
+            max_num_req_slots, dtype=torch.int32, device=device
+        )
         self.req_to_host_pool = torch.full(
             (max_num_req_slots, max_compressed_context_len + self.page_size),
             -1,
@@ -209,6 +214,17 @@ class HiSparseCoordinator:
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
+        if self.enable_mixed_residency:
+            max_hot_pages = (
+                self.device_buffer_size + self.page_size - 1
+            ) // self.page_size
+            self.hot_page_last_touch = torch.zeros(
+                (layer_num, max_num_req_slots, max_hot_pages),
+                dtype=torch.int64,
+                device=device,
+            )
+        else:
+            self.hot_page_last_touch = None
         self.req_device_buffer_tokens = torch.full(
             (layer_num, max_num_req_slots, self.padded_buffer_size),
             -1,
@@ -480,6 +496,11 @@ class HiSparseCoordinator:
             )
             if alloc_size == self.device_buffer_size:
                 alloc_size = self.padded_buffer_size
+            if self.enable_mixed_residency:
+                minimum = (self.top_k + page_size - 1) // page_size * page_size
+                alloc_size = max(alloc_size, minimum)
+                if alloc_size == self.device_buffer_size:
+                    alloc_size = self.padded_buffer_size
 
         compressed_logical_indices = (
             self.mem_pool_device.translate_loc_from_full_to_compressed(
@@ -550,6 +571,9 @@ class HiSparseCoordinator:
         buffer_indices = buffer_indices.to(torch.int32)
         self.req_to_device_buffer[req.req_pool_idx, :alloc_size] = buffer_indices
         self.req_device_buffer_size[req.req_pool_idx] = alloc_size
+        self.req_device_buffer_size_gpu[req.req_pool_idx] = min(
+            alloc_size, self.device_buffer_size
+        )
 
         if self.enable_mixed_residency:
             # Demotion never seeds hot entries: all first accesses to a
@@ -644,6 +668,9 @@ class HiSparseCoordinator:
                         :, req_idx, current_cap:new_cap
                     ] = chunk
                     self.req_device_buffer_size[req_idx] = new_cap
+                    self.req_device_buffer_size_gpu[req_idx] = min(
+                        new_cap, self.device_buffer_size
+                    )
 
         reserved_positions = (seq_lens - 1).clamp(max=self.device_buffer_size)
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
@@ -1206,6 +1233,9 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
         self.req_device_buffer_size[req.req_pool_idx] = 0
+        self.req_device_buffer_size_gpu[req.req_pool_idx] = 0
+        if self.enable_mixed_residency:
+            self.hot_page_last_touch[:, req.req_pool_idx, :] = 0
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         if self.enable_mixed_residency:
@@ -1348,9 +1378,15 @@ class HiSparseCoordinator:
             item_size_bytes=self.item_size_bytes,
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
-            page_size=1,
+            page_size=self.page_size if self.enable_mixed_residency else 1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
+            req_hot_buffer_sizes=self.req_device_buffer_size_gpu,
+            hot_page_last_touch=(
+                self.hot_page_last_touch[layer_id]
+                if self.enable_mixed_residency
+                else None
+            ),
             req_to_logical_token=(
                 self.req_to_full_lookup if self.enable_mixed_residency else None
             ),

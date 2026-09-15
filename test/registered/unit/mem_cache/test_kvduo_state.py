@@ -21,6 +21,7 @@ KVDuoAllocationPlan = STATE.KVDuoAllocationPlan
 KVDuoEntryVersionState = STATE.KVDuoEntryVersionState
 KVDuoFullPageState = STATE.KVDuoFullPageState
 KVDuoHotCapacity = STATE.KVDuoHotCapacity
+KVDuoHotPageAllocator = STATE.KVDuoHotPageAllocator
 KVDuoPagePinState = STATE.KVDuoPagePinState
 KVDuoPageResidency = STATE.KVDuoPageResidency
 KVDuoPressureResult = STATE.KVDuoPressureResult
@@ -272,3 +273,53 @@ def test_aggregate_touch_matches_per_layer_entry_reference():
     for touch in sorted(per_entry_touch):
         aggregate.record_attention_touch(touch)
     assert aggregate.last_touch == max(per_entry_touch) == 9
+
+
+def test_hot_pages_are_request_domain_private_and_grow_only_on_host_miss():
+    allocator = KVDuoHotPageAllocator(
+        page_size=2, domain_aliases={"shared-layer-1": "shared-storage"}
+    )
+    physical_pages = iter((10, 11, 12))
+
+    def allocate():
+        return next(physical_pages)
+
+    assert allocator.pages == {}
+    assert allocator.lookup("r1", "shared-layer-1", 7) is None
+    assert allocator.pages == {}  # lookup/full-page demotion allocates nothing
+
+    assert allocator.insert_host_miss(
+        "r1", "shared-layer-1", 7, clock=3, allocate_page=allocate
+    ) == (10, 0)
+    assert allocator.insert_host_miss(
+        "r1", "shared-storage", 99, clock=4, allocate_page=allocate
+    ) == (10, 1)
+    # Entries from different original logical pages may share one hot page.
+    assert allocator.pages[10].last_touch == 4
+
+    assert allocator.insert_host_miss(
+        "r2", "shared-storage", 7, clock=5, allocate_page=allocate
+    ) == (11, 0)
+    assert allocator.insert_host_miss(
+        "r1", "other-layer", 7, clock=6, allocate_page=allocate
+    ) == (12, 0)
+    assert allocator.pages[10].request_id == "r1"
+    assert allocator.pages[11].request_id == "r2"
+    assert allocator.pages[12].domain_id == "other-layer"
+
+
+def test_hot_hit_refreshes_slot_and_page_lru_without_allocating():
+    allocator = KVDuoHotPageAllocator(page_size=4)
+    calls = []
+
+    def allocate():
+        calls.append(True)
+        return 20
+
+    allocator.insert_host_miss("r", "layer", 1, clock=1, allocate_page=allocate)
+    allocator.insert_host_miss(
+        "r", "layer", 1, clock=9, allocate_page=lambda: pytest.fail("allocated")
+    )
+    assert len(calls) == 1
+    assert allocator.pages[20].last_touch == 9
+    assert allocator.pages[20].slots[0].last_touch == 9

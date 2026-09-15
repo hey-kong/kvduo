@@ -273,6 +273,110 @@ class KVDuoHotCapacity:
 
 
 @dataclass
+class KVDuoHotSlotState:
+    logical_position: Optional[int] = None
+    last_touch: int = 0
+    pin_epoch: int = 0
+
+
+@dataclass
+class KVDuoHotPageState:
+    """One request/domain-private hot physical page."""
+
+    physical_page_id: int
+    request_id: OwnerIdentity
+    domain_id: DomainIdentity
+    slots: list[KVDuoHotSlotState]
+    last_touch: int
+    dma_pins: int = 0
+
+
+class KVDuoHotPageAllocator:
+    """Deterministic metadata allocator for request/domain-private hot pages.
+
+    Physical page ids are supplied by the owning KV pool. Pages are created
+    only by :meth:`insert_host_miss`; full-page demotion never calls this API.
+    """
+
+    def __init__(self, page_size: int, domain_aliases: Optional[Mapping] = None):
+        if page_size <= 0:
+            raise ValueError("KVDuo hot page size must be positive")
+        self.page_size = page_size
+        self.domain_aliases = dict(domain_aliases or {})
+        self.pages: Dict[int, KVDuoHotPageState] = {}
+        self.by_owner: Dict[Tuple[OwnerIdentity, DomainIdentity], list[int]] = {}
+        self.locations: Dict[
+            Tuple[OwnerIdentity, DomainIdentity, int], Tuple[int, int]
+        ] = {}
+
+    def storage_domain(self, domain: DomainIdentity) -> DomainIdentity:
+        return self.domain_aliases.get(domain, domain)
+
+    def insert_host_miss(
+        self,
+        request_id: OwnerIdentity,
+        domain_id: DomainIdentity,
+        logical_position: int,
+        *,
+        clock: int,
+        allocate_page: Callable[[], int],
+        protected_epoch: int = 0,
+    ) -> Tuple[int, int]:
+        """Insert a real host miss, allocating a new MRU page if necessary."""
+        domain_id = self.storage_domain(domain_id)
+        key = (request_id, domain_id, logical_position)
+        existing = self.locations.get(key)
+        if existing is not None:
+            page = self.pages[existing[0]]
+            slot = page.slots[existing[1]]
+            slot.last_touch = clock
+            slot.pin_epoch = protected_epoch
+            page.last_touch = max(page.last_touch, clock)
+            return existing
+
+        owner = (request_id, domain_id)
+        target = None
+        for page_id in self.by_owner.get(owner, ()):
+            page = self.pages[page_id]
+            if any(slot.logical_position is None for slot in page.slots):
+                target = page
+                break
+        if target is None:
+            page_id = allocate_page()
+            if page_id in self.pages:
+                raise ValueError("KVDuo physical hot page is already owned")
+            target = KVDuoHotPageState(
+                page_id,
+                request_id,
+                domain_id,
+                [KVDuoHotSlotState() for _ in range(self.page_size)],
+                clock,
+            )
+            self.pages[page_id] = target
+            self.by_owner.setdefault(owner, []).append(page_id)
+
+        slot_index = next(
+            i for i, slot in enumerate(target.slots) if slot.logical_position is None
+        )
+        target.slots[slot_index] = KVDuoHotSlotState(
+            logical_position, clock, protected_epoch
+        )
+        target.last_touch = max(target.last_touch, clock)
+        self.locations[key] = (target.physical_page_id, slot_index)
+        return self.locations[key]
+
+    def lookup(
+        self,
+        request_id: OwnerIdentity,
+        domain_id: DomainIdentity,
+        logical_position: int,
+    ) -> Optional[Tuple[int, int]]:
+        return self.locations.get(
+            (request_id, self.storage_domain(domain_id), logical_position)
+        )
+
+
+@dataclass
 class KVDuoRequestResidency:
     """Request view over ordered full pages and private hot capacities."""
 

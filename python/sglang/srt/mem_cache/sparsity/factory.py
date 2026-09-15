@@ -123,7 +123,11 @@ def parse_hisparse_config(server_args) -> SparseConfig:
 
 
 def parse_kvduo_config(server_args) -> KVDuoConfig:
-    """Parse the KVDuo JSON config without mutating the caller's dictionary."""
+    """Parse KVDuo JSON without mutation.
+
+    ``swap_in_block_size`` is the resolver CUDA thread-block size (threads),
+    not the number of KV entries transferred by one host-to-device operation.
+    """
     raw = server_args.kvduo_config
     if raw is None:
         values = {}
