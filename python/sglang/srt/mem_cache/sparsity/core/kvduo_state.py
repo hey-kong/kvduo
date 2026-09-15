@@ -151,7 +151,6 @@ class KVDuoFullPageState:
             raise ValueError("KVDuo logical clocks must be monotonic")
         self.data_versions[domain] += 1
         self.host_versions.pop(domain, None)
-        self.gpu_full_domains.add(domain)
         self.last_touch = clock
         self.stable = False
 
@@ -223,6 +222,140 @@ class KVDuoRequestResidency:
                 break
             length += 1
         return length
+
+
+@dataclass(frozen=True)
+class KVDuoTailTransition:
+    """Observable result of appending one entry to a logical tail page."""
+
+    page_id: PageIdentity
+    offset: int
+    new_page: bool
+    sealed_page: Optional[PageIdentity]
+    writeback_candidates: Tuple[PageIdentity, ...]
+    protected_pages: Tuple[PageIdentity, ...]
+
+
+class KVDuoTailRotation:
+    """Model-independent append/seal/protect lifecycle for logical full pages.
+
+    Adapters choose the logical position passed to :meth:`append`, so compressed
+    models retain control over when a new KV entry exists. Pages are protected
+    by logical page ordinal, never by slicing the last ``N * page_size`` tokens.
+    """
+
+    def __init__(
+        self,
+        *,
+        page_size: int,
+        tail_protected_pages: int = 2,
+        adapter_extra_protected_pages: int = 0,
+    ) -> None:
+        if page_size <= 0 or tail_protected_pages <= 0:
+            raise ValueError("KVDuo page size and tail protection must be positive")
+        if adapter_extra_protected_pages < 0:
+            raise ValueError("Adapter tail protection cannot be negative")
+        self.page_size = page_size
+        self.protected_count = max(tail_protected_pages, adapter_extra_protected_pages)
+        self.pages: Dict[int, KVDuoFullPageState] = {}
+        self._published: Dict[int, Dict[DomainIdentity, set[int]]] = {}
+        self._writeback_submitted: set[int] = set()
+
+    def append(
+        self,
+        logical_position: int,
+        domains: Iterable[DomainIdentity],
+        *,
+        clock: int,
+    ) -> KVDuoTailTransition:
+        if logical_position < 0:
+            raise ValueError("KVDuo logical positions cannot be negative")
+        ordinal, offset = divmod(logical_position, self.page_size)
+        unique_domains = tuple(dict.fromkeys(domains))
+        new_page = ordinal not in self.pages
+        if new_page:
+            if self.pages and ordinal != max(self.pages) + 1:
+                raise ValueError("KVDuo tail pages must be appended contiguously")
+            self.pages[ordinal] = KVDuoFullPageState(ordinal, unique_domains)
+            self._published[ordinal] = {domain: set() for domain in unique_domains}
+        page = self.pages[ordinal]
+        if page.domains != unique_domains:
+            raise ValueError("KV storage domains cannot change within a tail")
+
+        for domain in page.domains:
+            if offset in self._published[ordinal][domain]:
+                raise ValueError("A KVDuo tail entry cannot be published twice")
+            self._published[ordinal][domain].add(offset)
+            page.record_model_write(domain, clock)
+            if len(self._published[ordinal][domain]) == self.page_size:
+                page.gpu_full_domains.add(domain)
+
+        sealed_page = None
+        if all(
+            len(offsets) == self.page_size
+            for offsets in self._published[ordinal].values()
+        ):
+            page.sealed = True
+            sealed_page = page.page_id
+        self._refresh_protection()
+        return KVDuoTailTransition(
+            page_id=page.page_id,
+            offset=offset,
+            new_page=new_page,
+            sealed_page=sealed_page,
+            writeback_candidates=self.writeback_candidates(),
+            protected_pages=self.protected_pages,
+        )
+
+    def entry_readable(self, page_id: int, domain: DomainIdentity, offset: int) -> bool:
+        """Whether a generated tail entry is valid before the page is full."""
+        return offset in self._published.get(page_id, {}).get(domain, set())
+
+    @property
+    def protected_pages(self) -> Tuple[PageIdentity, ...]:
+        ordinals = sorted(self.pages)
+        return tuple(ordinals[-self.protected_count :])
+
+    def mark_stable(self, page_id: int) -> None:
+        page = self.pages[page_id]
+        if not page.sealed:
+            raise ValueError("An unsealed KVDuo page cannot become stable")
+        page.stable = True
+
+    def writeback_candidates(self) -> Tuple[PageIdentity, ...]:
+        """Stable sealed protected pages older than the current append page."""
+        if not self.pages:
+            return ()
+        newest = max(self.pages)
+        return tuple(
+            ordinal
+            for ordinal in sorted(self.pages)
+            if ordinal != newest
+            and self.pages[ordinal].sealed
+            and self.pages[ordinal].stable
+            and not self.pages[ordinal].host_full_valid
+            and ordinal not in self._writeback_submitted
+        )
+
+    def submit_writeback(self, page_id: int) -> None:
+        if page_id not in self.writeback_candidates():
+            raise ValueError("KVDuo page is not ready for host writeback")
+        self._writeback_submitted.add(page_id)
+        self.pages[page_id].pins.dma += 1
+
+    def complete_writeback(self, page_id: int) -> None:
+        if page_id not in self._writeback_submitted:
+            raise ValueError("KVDuo page writeback was not submitted")
+        page = self.pages[page_id]
+        for domain in page.domains:
+            page.mark_host_copy_complete(domain)
+        page.pins.dma -= 1
+        self._writeback_submitted.remove(page_id)
+
+    def _refresh_protection(self) -> None:
+        protected = set(self.protected_pages)
+        for ordinal, page in self.pages.items():
+            page.tail_protected = ordinal in protected
 
 
 @dataclass(frozen=True)

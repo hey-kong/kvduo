@@ -12,6 +12,8 @@ from sglang.srt.mem_cache.sparsity.core.kvduo_state import (
     KVDuoResourceBudget,
     KVDuoResourceKind,
     KVDuoResidencyCatalog,
+    KVDuoTailRotation,
+    KVDuoTailTransition,
     execute_kvduo_pressure_plan,
     plan_kvduo_allocation,
 )
@@ -36,6 +38,8 @@ __all__ = [
     "KVDuoResourceBudget",
     "KVDuoResourceKind",
     "KVDuoResidencyCatalog",
+    "KVDuoTailRotation",
+    "KVDuoTailTransition",
     "execute_kvduo_pressure_plan",
     "plan_kvduo_allocation",
     "RequestTrackers",

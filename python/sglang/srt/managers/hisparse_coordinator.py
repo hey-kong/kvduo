@@ -170,6 +170,8 @@ class HiSparseCoordinator:
             )
             self.full_touch_clock = torch.zeros(1, dtype=torch.int64, device=device)
             self._active_kvduo_reqs = {}
+            self._kvduo_host_valid_len = [0] * max_num_req_slots
+            self._pending_kvduo_host_valid = []
         else:
             self.kvduo_residency = None
             self.req_to_full_lookup = None
@@ -177,6 +179,8 @@ class HiSparseCoordinator:
             self.full_last_touch = None
             self.full_touch_clock = None
             self._active_kvduo_reqs = None
+            self._kvduo_host_valid_len = None
+            self._pending_kvduo_host_valid = None
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
@@ -482,6 +486,9 @@ class HiSparseCoordinator:
                 self.full_touch_clock - written_pages + page_ordinals + 1
             )
             self._active_kvduo_reqs[req.req_pool_idx] = req
+            # Staging materializes the complete prefill range. Appending to an
+            # incomplete final page will lower this boundary to its page start.
+            self._kvduo_host_valid_len[req.req_pool_idx] = compressed_len
 
         preserve_indices = None
         if self.enable_mixed_residency:
@@ -657,9 +664,14 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        self._eager_backup_previous_token(
-            seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
-        )
+        if self.enable_mixed_residency:
+            self._backup_kvduo_sealed_pages(
+                seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
+            )
+        else:
+            self._eager_backup_previous_token(
+                seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
+            )
 
         if not self.is_dsv4_hisparse:
             # Grow device buffers if needed and resolve the latest-token slot.
@@ -674,12 +686,11 @@ class HiSparseCoordinator:
                 out_cache_loc
             )
             if self.enable_mixed_residency:
-                old_locs = self.req_reserved_logical[req_pool_indices]
-                valid_old = old_locs >= 0
-                self.mem_pool_device.full_to_hisparse_device_index_mapping[
-                    old_locs[valid_old]
-                ] = 0
-                self.req_reserved_logical[req_pool_indices] = compressed_locs
+                positions = seq_lens - 1
+                self.req_to_full_lookup[req_pool_indices, positions] = compressed_locs
+                # Keep the allocator-provided full mapping. The reserved hot
+                # slot remains separate and must never masquerade as full KV.
+                return
             # ROCm: the decode remap creates a temporary hisparse device slot per
             # new token (via the page_size==1 allocator path). Free the stale
             # slot before pointing the mapping at the reserved device-buffer slot,
@@ -725,15 +736,97 @@ class HiSparseCoordinator:
             active_out_cache_loc
         )
         if self.enable_mixed_residency:
-            old_locs = self.req_reserved_logical[active_req_pool_indices]
-            valid_old = old_locs >= 0
-            self.mem_pool_device.full_to_hisparse_device_index_mapping[
-                old_locs[valid_old]
-            ] = 0
-            self.req_reserved_logical[active_req_pool_indices] = compressed_locs
+            positions = compressed_seq_lens - 1
+            self.req_to_full_lookup[active_req_pool_indices, positions] = (
+                compressed_locs
+            )
+            return
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
             reserved_buffer_loc
         )
+
+    def _backup_kvduo_sealed_pages(
+        self,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> None:
+        """Write back a sealed page when the next real tail page starts.
+
+        The compressed-position calculation is the adapter boundary for DSV4.
+        Copying does not update model touch clocks. Tail pages remain resident
+        and protected; completion only makes an older page legally reclaimable.
+        """
+        page_jobs = []
+        for i in range(len(seq_lens_cpu)):
+            req_idx = int(req_pool_indices_cpu[i])
+            compressed_len = self.host_token_len(int(seq_lens_cpu[i]))
+            if compressed_len <= 0:
+                continue
+            current_pos = compressed_len - 1
+            page_start = current_pos // self.page_size * self.page_size
+            # A write to a partial page invalidates the previously staged host
+            # suffix. The page is written back only after it becomes sealed.
+            self._kvduo_host_valid_len[req_idx] = min(
+                self._kvduo_host_valid_len[req_idx], page_start
+            )
+            if current_pos % self.page_size != 0 or page_start == 0:
+                continue
+            sealed_start = page_start - self.page_size
+            sealed_end = page_start
+            if self._kvduo_host_valid_len[req_idx] >= sealed_end:
+                continue
+            page_jobs.append((req_idx, sealed_start, sealed_end))
+
+        if not page_jobs:
+            return
+        self.wait_for_pending_backup()
+        host_locs = []
+        logical_locs = []
+        for req_idx, start, end in page_jobs:
+            host_locs.append(
+                self.mem_pool_host.alloc_paged_token_slots(
+                    self.req_to_host_pool,
+                    self.req_to_host_pool_allocated_len,
+                    req_idx,
+                    start,
+                    end - start,
+                )
+            )
+            logical = self.req_to_full_lookup[req_idx, start:end]
+            logical_locs.append(logical)
+
+        host_locs = torch.cat(host_locs)
+        logical_locs = torch.cat(logical_locs)
+        device_locs = self.mem_pool_device.full_to_hisparse_device_index_mapping[
+            logical_locs
+        ]
+        # Page turnover is a control-plane boundary. Validate the entire batch
+        # with one device synchronization, never one sync per candidate page.
+        valid = torch.all(logical_locs >= 0) & torch.all(device_locs > 0)
+        if not bool(valid.item()):
+            raise RuntimeError("KVDuo sealed page lost full residency before backup")
+        schedule_stream = device_module.current_stream()
+        with device_module.stream(self.decode_backup_stream):
+            self.decode_backup_stream.wait_stream(schedule_stream)
+            if self.decode_producer_stream is not None:
+                self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs,
+                io_backend="kernel",
+            )
+            self._backup_done_event.record()
+            if host_locs.is_cuda:
+                host_locs.record_stream(self.decode_backup_stream)
+            if device_locs.is_cuda:
+                device_locs.record_stream(self.decode_backup_stream)
+        self._pending_kvduo_host_valid.extend(
+            (req_idx, end) for req_idx, _, end in page_jobs
+        )
+        self._has_pending_backup = True
 
     def _eager_backup_previous_token(
         self,
@@ -828,6 +921,12 @@ class HiSparseCoordinator:
             return
         self._backup_done_event.wait(device_module.current_stream())
         self._has_pending_backup = False
+        if self.enable_mixed_residency:
+            for req_idx, valid_len in self._pending_kvduo_host_valid:
+                self._kvduo_host_valid_len[req_idx] = max(
+                    self._kvduo_host_valid_len[req_idx], valid_len
+                )
+            self._pending_kvduo_host_valid.clear()
 
     def naive_load_topk(
         self,
@@ -956,6 +1055,7 @@ class HiSparseCoordinator:
         if self.enable_mixed_residency:
             self.req_to_full_lookup[req.req_pool_idx, :] = -1
             self.req_reserved_logical[req.req_pool_idx] = -1
+            self._kvduo_host_valid_len[req.req_pool_idx] = 0
         self._mixed_slots[req.req_pool_idx] = False
         if self.enable_mixed_residency:
             self._active_kvduo_reqs.pop(req.req_pool_idx, None)
@@ -1055,6 +1155,7 @@ class HiSparseCoordinator:
         if self.enable_mixed_residency:
             self.req_to_full_lookup[req.req_pool_idx, :] = -1
             self.req_reserved_logical[req.req_pool_idx] = -1
+            self._kvduo_host_valid_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
         self._mixed_slots[req.req_pool_idx] = False
@@ -1091,7 +1192,10 @@ class HiSparseCoordinator:
             tail_first = max(0, num_pages - self.tail_protected_pages)
             first_owned_page = (prefix_len + self.page_size - 1) // self.page_size
             start = first_owned_page * self.page_size
-            end = tail_first * self.page_size
+            host_valid_end = (
+                self._kvduo_host_valid_len[req_idx] // self.page_size * self.page_size
+            )
+            end = min(tail_first * self.page_size, host_valid_end)
             if end <= start:
                 continue
             pages = compressed[start:end].view(-1, self.page_size)

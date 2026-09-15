@@ -29,6 +29,7 @@ KVDuoPressureStatus = STATE.KVDuoPressureStatus
 KVDuoResourceBudget = STATE.KVDuoResourceBudget
 KVDuoResourceKind = STATE.KVDuoResourceKind
 KVDuoResidencyCatalog = STATE.KVDuoResidencyCatalog
+KVDuoTailRotation = STATE.KVDuoTailRotation
 execute_kvduo_pressure_plan = STATE.execute_kvduo_pressure_plan
 plan_kvduo_allocation = STATE.plan_kvduo_allocation
 
@@ -184,3 +185,44 @@ def test_planner_rejects_duplicate_or_main_independent_pool_snapshots():
                 KVDuoResourceBudget(KVDuoResourceKind.MAIN_KV_PHYSICAL, 8, 4),
             ),
         )
+
+
+def test_tail_rotation_seals_writes_back_and_protects_by_page():
+    tail = KVDuoTailRotation(page_size=4, tail_protected_pages=2)
+    for position in range(4):
+        transition = tail.append(position, ("shared", "shared", "mla"), clock=position)
+        assert tail.entry_readable(0, "shared", position)
+        if position < 3:
+            assert not tail.pages[0].gpu_full
+    assert transition.sealed_page == 0
+    assert tail.pages[0].gpu_full
+    tail.mark_stable(0)
+
+    transition = tail.append(4, ("shared", "mla"), clock=4)
+    assert transition.new_page
+    assert transition.protected_pages == (0, 1)
+    assert transition.writeback_candidates == (0,)
+    tail.submit_writeback(0)
+    assert tail.pages[0].pins.dma == 1
+    assert not tail.pages[0].reclaimable
+    tail.complete_writeback(0)
+    assert tail.pages[0].host_full_valid
+    # It is still protected as the second newest page.
+    assert not tail.pages[0].reclaimable
+
+    for position in range(5, 9):
+        tail.append(position, ("shared", "mla"), clock=position)
+    assert tail.protected_pages == (1, 2)
+    assert not tail.pages[0].tail_protected
+    assert tail.pages[0].reclaimable
+
+
+def test_tail_adapter_can_extend_protection_and_reject_holes():
+    tail = KVDuoTailRotation(
+        page_size=2, tail_protected_pages=2, adapter_extra_protected_pages=3
+    )
+    for position in range(6):
+        tail.append(position, ("c4",), clock=position)
+    assert tail.protected_pages == (0, 1, 2)
+    with pytest.raises(ValueError, match="contiguously"):
+        tail.append(8, ("c4",), clock=8)
