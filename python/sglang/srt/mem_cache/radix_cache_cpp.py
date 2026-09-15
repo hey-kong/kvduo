@@ -103,13 +103,17 @@ class RadixCacheCpp(BasePrefixCache):
         device_indices_vec, host_indices_length, node_gpu, node_cpu = (
             self.tree.match_prefix(key.raw_token_ids())
         )
-        return MatchResult(
+        result = MatchResult(
             device_indices=self._merge_tensor(device_indices_vec),
             last_device_node=node_gpu,
             last_host_node=node_cpu,
             best_match_node=node_cpu,
             host_hit_length=host_indices_length,
         )
+        coordinator = getattr(self, "kvduo_coordinator", None)
+        if coordinator is not None and params.req is not None:
+            result = coordinator.augment_kvduo_prefix_match(params.req, result)
+        return result
 
     def _insert(self, key: RadixKey, value: torch.Tensor) -> int:
         """

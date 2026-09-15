@@ -361,6 +361,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         Preparing KV cache loading from host to device.
         """
+        coordinator = getattr(self, "kvduo_coordinator", None)
+        if coordinator is not None and params.req is not None:
+            restored = coordinator.init_kvduo_load_back(
+                params.req, params.host_hit_length
+            )
+            return restored, params.best_match_node
         raise NotImplementedError()
 
     def ready_to_load_host_cache(self) -> Any:

@@ -24,6 +24,9 @@ class HostPrefixRecord:
     host_locations: Dict[Hashable, Tuple[int, ...]]
     data_versions: Dict[Hashable, Hashable]
     host_versions: Dict[Hashable, Hashable]
+    # Optional model-event timestamps.  Copies and prefix attachment preserve
+    # these values instead of fabricating a new write/attention touch.
+    model_touches: Dict[Hashable, Hashable] = field(default_factory=dict)
     request_references: set[Hashable] = field(default_factory=set)
     cache_reference: bool = False
     restore_pins: int = 0
@@ -38,6 +41,7 @@ class HostPrefixRecord:
             set(self.host_locations) != known
             or set(self.data_versions) != known
             or not set(self.host_versions) <= known
+            or not set(self.model_touches) <= known
         ):
             raise ValueError(
                 "Host prefix domain metadata is incomplete or inconsistent"

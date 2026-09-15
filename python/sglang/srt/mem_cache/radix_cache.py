@@ -402,12 +402,23 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             value = torch.cat(value)
         else:
             value = self._empty_match_result.device_indices
-        return MatchResult(
+        result = MatchResult(
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
             best_match_node=last_node,
         )
+        coordinator = getattr(self, "kvduo_coordinator", None)
+        if coordinator is not None and params.req is not None:
+            result = coordinator.augment_kvduo_prefix_match(params.req, result)
+        return result
+
+    def init_load_back(self, params):
+        coordinator = getattr(self, "kvduo_coordinator", None)
+        if coordinator is None or params.req is None:
+            return super().init_load_back(params)
+        restored = coordinator.init_kvduo_load_back(params.req, params.host_hit_length)
+        return restored, params.best_match_node
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:

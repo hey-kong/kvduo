@@ -1154,6 +1154,10 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        # Host-prefix pins are content-owned and may be acquired before this
+        # request receives a recyclable req_pool_idx.
+        self.kvduo_host_prefix_records = set()
+        self.kvduo_restored_prefix_len = 0
 
     @property
     def seqlen(self) -> int:
@@ -1844,6 +1848,8 @@ def release_req(
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
 ) -> None:
+    if hisparse_coordinator is not None:
+        hisparse_coordinator.release_kvduo_match_refs(req)
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 

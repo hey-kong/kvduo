@@ -30,6 +30,7 @@ def record(identity, location, *, version=1, host_version=1, clock=0):
         {"shared": (location,)},
         {"shared": version},
         {"shared": host_version},
+        model_touches={"shared": (clock,)},
         cache_reference=True,
         last_access=clock,
         tie_break_key=(identity,),

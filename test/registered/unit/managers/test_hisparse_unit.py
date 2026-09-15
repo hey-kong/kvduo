@@ -39,6 +39,88 @@ MAX_CONTEXT_LEN = 2048
 
 
 class TestKVDuoPhysicalReclaim(unittest.TestCase):
+    def test_host_only_prefix_is_matched_and_restored_before_prefill(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+        from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
+            HostPrefixRecord,
+            KVDuoHostPrefixCache,
+            KVDuoPrefixResidency,
+        )
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.enable_mixed_residency = True
+        coordinator.page_size = 2
+        coordinator.compress_ratio = 1
+        coordinator.device = "cpu"
+        coordinator.item_size_bytes = 4
+        coordinator.mem_pool_device = SimpleNamespace(layer_num=2)
+        coordinator.full_generation = torch.zeros(32, dtype=torch.int64)
+        coordinator.full_data_version = torch.zeros(32, dtype=torch.int64)
+        coordinator.full_host_version = torch.full((32,), -1, dtype=torch.int64)
+        coordinator.full_last_touch = torch.zeros(32, dtype=torch.int64)
+        coordinator.host_prefix_cache = KVDuoHostPrefixCache(8)
+        for ordinal, (identity, locs, touches) in enumerate(
+            (
+                ((1, (1, 2)), (20, 21), (7, 8)),
+                ((1, (1, 2, 3, 4)), (22, 23), (9, 10)),
+            )
+        ):
+            coordinator.host_prefix_cache.insert(
+                HostPrefixRecord(
+                    identity=identity,
+                    domains=("main_kv",),
+                    host_locations={"main_kv": locs},
+                    data_versions={"main_kv": (ordinal + 1,) * 2},
+                    host_versions={"main_kv": (ordinal + 1,) * 2},
+                    model_touches={"main_kv": touches},
+                    cache_reference=True,
+                )
+            )
+
+        req = SimpleNamespace(
+            rid="restore",
+            prefix_indices=torch.tensor([5, 6], dtype=torch.int64),
+            get_fill_ids=lambda: [1, 2, 3, 4, 5],
+            _compute_max_prefix_len=lambda length: length - 1,
+        )
+        gpu_match = MatchResult(
+            device_indices=req.prefix_indices,
+            last_device_node=object(),
+            last_host_node=object(),
+            best_match_node=object(),
+        )
+        match = coordinator.augment_kvduo_prefix_match(req, gpu_match)
+        self.assertEqual(match.host_hit_length, 2)
+        self.assertEqual(match.full_kv_hit_length, 4)
+        self.assertEqual(
+            match.kvduo_residency_plan.execution_status,
+            KVDuoPrefixResidency.RESTORE_REQUIRED,
+        )
+        req.kvduo_residency_plan = match.kvduo_residency_plan
+
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            alloc_extend=MagicMock(return_value=torch.tensor([10, 11])),
+            free=MagicMock(),
+        )
+        load = MagicMock()
+        coordinator.mem_pool_device = SimpleNamespace(
+            layer_num=2,
+            translate_loc_from_full_to_compressed=lambda value: value,
+            translate_loc_from_full_to_hisparse_device=lambda value: value,
+        )
+        coordinator.mem_pool_host = SimpleNamespace(load_to_device_per_layer=load)
+        restored = coordinator.init_kvduo_load_back(req, match.host_hit_length)
+
+        self.assertTrue(torch.equal(restored, torch.tensor([10, 11])))
+        self.assertEqual(load.call_count, 2)
+        self.assertEqual(coordinator.full_data_version[10:12].tolist(), [2, 2])
+        self.assertEqual(coordinator.full_last_touch[10:12].tolist(), [9, 10])
+        self.assertEqual(
+            coordinator.host_prefix_cache.records[(1, (1, 2, 3, 4))].restore_pins,
+            0,
+        )
+
     def test_hot_pages_are_allocated_only_for_non_full_topk(self):
         """A full hit owns no hot page; the first host workset grows by a page."""
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator

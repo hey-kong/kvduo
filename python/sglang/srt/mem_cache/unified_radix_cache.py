@@ -382,6 +382,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:
+            coordinator = getattr(self, "kvduo_coordinator", None)
+            if coordinator is not None and params.req is not None:
+                result = coordinator.augment_kvduo_prefix_match(params.req, result)
             return result
         if self.disable:
             return self.tree_core.empty_match_result
@@ -393,6 +396,9 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        coordinator = getattr(self, "kvduo_coordinator", None)
+        if coordinator is not None and params.req is not None:
+            result = coordinator.augment_kvduo_prefix_match(params.req, result)
         return result
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -1899,6 +1905,12 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> tuple[torch.Tensor, NodeId]:
         """Prepare KV cache loading from host to device.
         Returns (device_indices, last_node) tuple."""
+        coordinator = getattr(self, "kvduo_coordinator", None)
+        if coordinator is not None and params.req is not None:
+            restored = coordinator.init_kvduo_load_back(
+                params.req, params.host_hit_length
+            )
+            return restored, params.best_match_node
         best_match_node_id = params.best_match_node
         mem_quota = params.mem_quota
         req = params.req

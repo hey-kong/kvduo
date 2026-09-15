@@ -32,6 +32,10 @@ from sglang.srt.mem_cache.sparsity.core.kvduo_state import (
 from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
     HostPrefixRecord,
     KVDuoHostPrefixCache,
+    KVDuoPrefixPageView,
+    begin_kvduo_prefix_restore,
+    finish_kvduo_prefix_restore,
+    plan_kvduo_prefix_restore,
 )
 from sglang.srt.utils import get_device_module, is_hip
 
@@ -329,11 +333,162 @@ class HiSparseCoordinator:
         )
 
     def _host_prefix_identity(self, req: Req, page_ordinal: int):
+        fill_ids = req.get_fill_ids()
         token_end = min(
-            len(req.fill_ids),
+            len(fill_ids),
             (page_ordinal + 1) * self.page_size * self.compress_ratio,
         )
-        return (self.compress_ratio, tuple(req.fill_ids[:token_end]))
+        return (self.compress_ratio, tuple(fill_ids[:token_end]))
+
+    def augment_kvduo_prefix_match(self, req: Req, match_result):
+        """Extend a GPU Radix hit with the longest valid host-owned prefix.
+
+        The Radix node remains the lock anchor for its GPU portion.  Host pages
+        use content identities and request references, so they remain pinned
+        even before a recyclable request-pool slot is assigned.
+        """
+        if not self.enable_mixed_residency:
+            return match_result
+        for identity in getattr(req, "kvduo_host_prefix_records", ()):
+            if identity in self.host_prefix_cache.records:
+                self.host_prefix_cache.release(identity, req.rid)
+        req.kvduo_host_prefix_records = set()
+        gpu_len = len(match_result.device_indices)
+        page_tokens = self.page_size * self.compress_ratio
+        max_prefix = req._compute_max_prefix_len(len(req.get_fill_ids()))
+        max_prefix = max_prefix // page_tokens * page_tokens
+        host_end = gpu_len // page_tokens * page_tokens
+        pages = []
+        identities = []
+        for ordinal in range(max_prefix // page_tokens):
+            identity = self._host_prefix_identity(req, ordinal)
+            record = self.host_prefix_cache.records.get(identity)
+            gpu_full = (ordinal + 1) * page_tokens <= gpu_len
+            if not gpu_full and (record is None or not record.fully_valid):
+                break
+            pages.append(
+                KVDuoPrefixPageView(
+                    identity=identity,
+                    domains=("main_kv",),
+                    gpu_full_domains=(
+                        frozenset({"main_kv"}) if gpu_full else frozenset()
+                    ),
+                )
+            )
+            host_end = (ordinal + 1) * page_tokens
+            if not gpu_full:
+                self.host_prefix_cache.acquire(identity, req.rid, 0)
+                identities.append(identity)
+
+        if host_end <= gpu_len:
+            return match_result
+        # Repeated scheduling matches are idempotent because request references
+        # are sets.  Keep the identities on Req rather than a request-slot row.
+        req.kvduo_host_prefix_records = set(identities)
+        plan = plan_kvduo_prefix_restore(
+            pages,
+            self.host_prefix_cache,
+            {"main_kv": self._physical_page_bytes()},
+        )
+        return match_result._replace(
+            last_host_node=match_result.last_device_node,
+            best_match_node=match_result.last_device_node,
+            host_hit_length=host_end - gpu_len,
+            full_kv_hit_length=host_end,
+            cache_protected_len=gpu_len,
+            kvduo_residency_plan=plan,
+        )
+
+    def init_kvduo_load_back(self, req: Req, host_hit_length: int):
+        """Allocate and restore the host-only suffix before prefill executes."""
+        plan = getattr(req, "kvduo_residency_plan", None)
+        if plan is None or host_hit_length <= 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        commitment = begin_kvduo_prefix_restore(plan, self.host_prefix_cache)
+        prefix_len = len(req.prefix_indices)
+        target_len = prefix_len + host_hit_length
+        prefix_cpu = torch.tensor([prefix_len], dtype=torch.int64)
+        target_cpu = torch.tensor([target_len], dtype=torch.int64)
+        prefix_gpu = prefix_cpu.to(self.device)
+        target_gpu = target_cpu.to(self.device)
+        last_loc = (
+            req.prefix_indices[-1:].to(torch.int64)
+            if prefix_len
+            else torch.full((1,), -1, dtype=torch.int64, device=self.device)
+        )
+        restored = None
+        try:
+            restored = self.token_to_kv_pool_allocator.alloc_extend(
+                prefix_gpu,
+                prefix_cpu,
+                target_gpu,
+                target_cpu,
+                last_loc,
+                host_hit_length,
+            )
+            if restored is None:
+                raise RuntimeError("KVDuo host-prefix restore admission became invalid")
+
+            host_locs = []
+            versions = []
+            touches = []
+            first_page = prefix_len // (self.page_size * self.compress_ratio)
+            page_count = host_hit_length // (self.page_size * self.compress_ratio)
+            for ordinal in range(first_page, first_page + page_count):
+                record = self.host_prefix_cache.records[
+                    self._host_prefix_identity(req, ordinal)
+                ]
+                if not record.fully_valid:
+                    raise RuntimeError(
+                        "KVDuo host-prefix version changed during restore"
+                    )
+                host_locs.extend(record.host_locations["main_kv"])
+                versions.extend(record.host_versions["main_kv"])
+                touches.extend(
+                    record.model_touches.get(
+                        "main_kv", (0,) * len(record.host_locations["main_kv"])
+                    )
+                )
+
+            compressed = self.mem_pool_device.translate_loc_from_full_to_compressed(
+                restored
+            )
+            device_locs = (
+                self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
+                    restored
+                )
+            )
+            host_tensor = torch.tensor(host_locs, dtype=torch.int64, device=self.device)
+            if len(host_tensor) != len(device_locs):
+                raise RuntimeError(
+                    "KVDuo restore adapter produced mismatched locations"
+                )
+            for layer_id in range(self.mem_pool_device.layer_num):
+                self.mem_pool_host.load_to_device_per_layer(
+                    self.mem_pool_device,
+                    host_tensor,
+                    device_locs,
+                    layer_id,
+                    io_backend="kernel",
+                )
+            version_tensor = torch.tensor(
+                versions, dtype=torch.int64, device=self.device
+            )
+            self.full_generation[compressed] += 1
+            self.full_data_version[compressed] = version_tensor
+            self.full_host_version[compressed] = version_tensor
+            # Restore is a copy, not a model write or attention touch.
+            self.full_last_touch[compressed] = torch.tensor(
+                touches, dtype=torch.int64, device=self.device
+            )
+            req.kvduo_restored_prefix_len = target_len
+            return restored
+        except Exception:
+            if restored is not None:
+                self.token_to_kv_pool_allocator.free(restored)
+            raise
+        finally:
+            finish_kvduo_prefix_restore(commitment, self.host_prefix_cache)
 
     def _evict_host_prefix_for_slots(self, required_slots: int) -> None:
         if not self.enable_mixed_residency:
@@ -379,10 +534,24 @@ class HiSparseCoordinator:
         if not self.enable_mixed_residency:
             return
         owner = (req.rid, req.req_pool_idx)
-        for identity in self._req_host_prefix_records[req.req_pool_idx]:
+        if req.req_pool_idx is not None:
+            for identity in self._req_host_prefix_records[req.req_pool_idx]:
+                if identity in self.host_prefix_cache.records:
+                    self.host_prefix_cache.release(identity, owner)
+            self._req_host_prefix_records[req.req_pool_idx].clear()
+        for identity in getattr(req, "kvduo_host_prefix_records", ()):
             if identity in self.host_prefix_cache.records:
-                self.host_prefix_cache.release(identity, owner)
-        self._req_host_prefix_records[req.req_pool_idx].clear()
+                self.host_prefix_cache.release(identity, req.rid)
+        req.kvduo_host_prefix_records = set()
+
+    def release_kvduo_match_refs(self, req: Req) -> None:
+        """Drop host match pins for a request that never reached execution."""
+        if not self.enable_mixed_residency:
+            return
+        for identity in getattr(req, "kvduo_host_prefix_records", ()):
+            if identity in self.host_prefix_cache.records:
+                self.host_prefix_cache.release(identity, req.rid)
+        req.kvduo_host_prefix_records = set()
 
     def _host_record_locations_for_request(self, req: Req) -> set[int]:
         locations = set()
@@ -403,14 +572,19 @@ class HiSparseCoordinator:
         versions = self.full_host_version[
             self.req_to_full_lookup[req.req_pool_idx, :valid_len]
         ]
+        touches = self.full_last_touch[
+            self.req_to_full_lookup[req.req_pool_idx, :valid_len]
+        ]
         # One compact transfer, not one synchronization per page.
         host_locs_cpu = host_locs.cpu().tolist()
         versions_cpu = versions.cpu().tolist()
+        touches_cpu = touches.cpu().tolist()
         retained = set()
         for ordinal, start in enumerate(range(0, valid_len, self.page_size)):
             identity = self._host_prefix_identity(req, ordinal)
             locations = tuple(host_locs_cpu[start : start + self.page_size])
             version = tuple(versions_cpu[start : start + self.page_size])
+            touch = tuple(touches_cpu[start : start + self.page_size])
             existing = self.host_prefix_cache.records.get(identity)
             if existing is None:
                 record = HostPrefixRecord(
@@ -419,6 +593,7 @@ class HiSparseCoordinator:
                     host_locations={"main_kv": locations},
                     data_versions={"main_kv": version},
                     host_versions={"main_kv": version},
+                    model_touches={"main_kv": touch},
                     cache_reference=True,
                     last_access=int(self.full_touch_clock[0]),
                     tie_break_key=(ordinal, repr(identity)),
