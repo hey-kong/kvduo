@@ -1,3 +1,14 @@
+from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
+    HostPrefixRecord,
+    KVDuoHostPrefixCache,
+    KVDuoPrefixPageView,
+    KVDuoPrefixResidency,
+    KVDuoPrefixRestorePlan,
+    KVDuoPrefixRestoreCommitment,
+    begin_kvduo_prefix_restore,
+    finish_kvduo_prefix_restore,
+    plan_kvduo_prefix_restore,
+)
 from sglang.srt.mem_cache.sparsity.core.kvduo_state import (
     KVDuoAllocationPlan,
     KVDuoEntryVersionState,
@@ -30,6 +41,15 @@ from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
 )
 
 __all__ = [
+    "HostPrefixRecord",
+    "KVDuoHostPrefixCache",
+    "KVDuoPrefixPageView",
+    "KVDuoPrefixResidency",
+    "KVDuoPrefixRestorePlan",
+    "KVDuoPrefixRestoreCommitment",
+    "begin_kvduo_prefix_restore",
+    "finish_kvduo_prefix_restore",
+    "plan_kvduo_prefix_restore",
     "KVDuoAllocationPlan",
     "KVDuoEntryVersionState",
     "KVDuoFullPageState",

@@ -958,6 +958,7 @@ class Req(ReqDllmMixin):
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.best_match_node: Any = None
+        self.kvduo_residency_plan: Any = None
         # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
@@ -1345,6 +1346,7 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len = match_result.cache_protected_len
             else:
                 self.cache_protected_len = len(self.prefix_indices)
+            self.kvduo_residency_plan = match_result.kvduo_residency_plan
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()

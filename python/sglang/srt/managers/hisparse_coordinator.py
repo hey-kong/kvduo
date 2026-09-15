@@ -29,6 +29,10 @@ from sglang.srt.mem_cache.sparsity.core.kvduo_state import (
     execute_kvduo_pressure_plan,
     plan_kvduo_allocation,
 )
+from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
+    HostPrefixRecord,
+    KVDuoHostPrefixCache,
+)
 from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()
@@ -189,6 +193,8 @@ class HiSparseCoordinator:
             self._active_kvduo_reqs = {}
             self._kvduo_host_valid_len = [0] * max_num_req_slots
             self._pending_kvduo_host_valid = []
+            self.host_prefix_cache = KVDuoHostPrefixCache(self.mem_pool_host.size)
+            self._req_host_prefix_records = [set() for _ in range(max_num_req_slots)]
         else:
             self.kvduo_residency = None
             self.req_to_full_lookup = None
@@ -201,6 +207,8 @@ class HiSparseCoordinator:
             self._active_kvduo_reqs = None
             self._kvduo_host_valid_len = None
             self._pending_kvduo_host_valid = None
+            self.host_prefix_cache = None
+            self._req_host_prefix_records = None
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
@@ -292,6 +300,109 @@ class HiSparseCoordinator:
             ),
         )
 
+    def _host_prefix_identity(self, req: Req, page_ordinal: int):
+        token_end = min(
+            len(req.fill_ids),
+            (page_ordinal + 1) * self.page_size * self.compress_ratio,
+        )
+        return (self.compress_ratio, tuple(req.fill_ids[:token_end]))
+
+    def _evict_host_prefix_for_slots(self, required_slots: int) -> None:
+        if not self.enable_mixed_residency:
+            return
+        shortfall = max(0, required_slots - self.mem_pool_host.available_size())
+        victims = self.host_prefix_cache.evict_lru(shortfall)
+        locations = {
+            location
+            for record in victims
+            for domain in record.domains
+            for location in record.host_locations[domain]
+        }
+        if locations:
+            self.mem_pool_host.free(
+                torch.tensor(sorted(locations), dtype=torch.int64, device=self.device)
+            )
+
+    def _attach_cached_host_prefix(self, req: Req, host_len: int) -> int:
+        """Attach the longest contiguous valid host prefix to this request row."""
+        if not self.enable_mixed_residency:
+            return 0
+        owner = (req.rid, req.req_pool_idx)
+        attached = 0
+        for ordinal in range(host_len // self.page_size):
+            identity = self._host_prefix_identity(req, ordinal)
+            record = self.host_prefix_cache.records.get(identity)
+            if record is None or not record.fully_valid:
+                break
+            locations = record.host_locations["main_kv"]
+            start = ordinal * self.page_size
+            self.req_to_host_pool[req.req_pool_idx, start : start + self.page_size] = (
+                torch.tensor(locations, dtype=torch.int64, device=self.device)
+            )
+            self.host_prefix_cache.acquire(
+                identity, owner, int(self.full_touch_clock[0])
+            )
+            self._req_host_prefix_records[req.req_pool_idx].add(identity)
+            attached += self.page_size
+        self.req_to_host_pool_allocated_len[req.req_pool_idx] = attached
+        return attached
+
+    def _release_host_prefix_refs(self, req: Req) -> None:
+        if not self.enable_mixed_residency:
+            return
+        owner = (req.rid, req.req_pool_idx)
+        for identity in self._req_host_prefix_records[req.req_pool_idx]:
+            if identity in self.host_prefix_cache.records:
+                self.host_prefix_cache.release(identity, owner)
+        self._req_host_prefix_records[req.req_pool_idx].clear()
+
+    def _host_record_locations_for_request(self, req: Req) -> set[int]:
+        locations = set()
+        for identity in self._req_host_prefix_records[req.req_pool_idx]:
+            record = self.host_prefix_cache.records.get(identity)
+            if record is not None:
+                for domain in record.domains:
+                    locations.update(record.host_locations[domain])
+        return locations
+
+    def _retain_request_host_prefix(self, req: Req) -> set[int]:
+        """Transfer complete host pages from request ownership to cache ownership."""
+        valid_len = self._kvduo_host_valid_len[req.req_pool_idx]
+        valid_len = valid_len // self.page_size * self.page_size
+        if valid_len == 0:
+            return set()
+        host_locs = self.req_to_host_pool[req.req_pool_idx, :valid_len]
+        versions = self.full_host_version[
+            self.req_to_full_lookup[req.req_pool_idx, :valid_len]
+        ]
+        # One compact transfer, not one synchronization per page.
+        host_locs_cpu = host_locs.cpu().tolist()
+        versions_cpu = versions.cpu().tolist()
+        retained = set()
+        for ordinal, start in enumerate(range(0, valid_len, self.page_size)):
+            identity = self._host_prefix_identity(req, ordinal)
+            locations = tuple(host_locs_cpu[start : start + self.page_size])
+            version = tuple(versions_cpu[start : start + self.page_size])
+            existing = self.host_prefix_cache.records.get(identity)
+            if existing is None:
+                record = HostPrefixRecord(
+                    identity=identity,
+                    domains=("main_kv",),
+                    host_locations={"main_kv": locations},
+                    data_versions={"main_kv": version},
+                    host_versions={"main_kv": version},
+                    cache_reference=True,
+                    last_access=int(self.full_touch_clock[0]),
+                    tie_break_key=(ordinal, repr(identity)),
+                )
+                self.host_prefix_cache.insert(record)
+                retained.update(locations)
+            else:
+                # Existing shared storage remains authoritative; this request's
+                # duplicate physical page is intentionally not retained.
+                retained.update(existing.host_locations["main_kv"])
+        return retained
+
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True
 
@@ -305,6 +416,13 @@ class HiSparseCoordinator:
         )
 
         prefill_len = len(device_indices)
+        attached = self._attach_cached_host_prefix(req, prefill_len)
+        new_host_slots = max(
+            0,
+            ((prefill_len + self.page_size - 1) // self.page_size * self.page_size)
+            - attached,
+        )
+        self._evict_host_prefix_for_slots(new_host_slots)
         host_indices = self.mem_pool_host.alloc_paged_token_slots(
             self.req_to_host_pool,
             self.req_to_host_pool_allocated_len,
@@ -1131,8 +1249,16 @@ class HiSparseCoordinator:
             req.req_pool_idx,
             self.req_to_host_pool_allocated_len[req.req_pool_idx],
         )
+        if self.enable_mixed_residency and host_indices.numel() > 0:
+            shared = self._host_record_locations_for_request(req)
+            if shared:
+                shared_tensor = torch.tensor(
+                    sorted(shared), dtype=torch.int64, device=host_indices.device
+                )
+                host_indices = host_indices[~torch.isin(host_indices, shared_tensor)]
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
+        self._release_host_prefix_refs(req)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         if self.enable_mixed_residency:
@@ -1225,6 +1351,14 @@ class HiSparseCoordinator:
             req.req_pool_idx,
             self.req_to_host_pool_allocated_len[req.req_pool_idx],
         )
+        if self.enable_mixed_residency:
+            retained = self._retain_request_host_prefix(req)
+            self._release_host_prefix_refs(req)
+            if retained and host_indices.numel() > 0:
+                retained_tensor = torch.tensor(
+                    sorted(retained), dtype=torch.int64, device=host_indices.device
+                )
+                host_indices = host_indices[~torch.isin(host_indices, retained_tensor)]
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
 
