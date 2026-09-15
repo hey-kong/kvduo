@@ -7833,21 +7833,11 @@ class ServerArgs:
                 "page ownership before publishing newly generated pages to RadixTree."
             )
             self.chunked_prefill_size = -1
-        if not self.disable_cuda_graph:
-            logger.warning(
-                "Disabling decode CUDA Graph for KVDuo: demand hot-page growth "
-                "currently performs host-side allocation before each resolver launch. "
-                "Use --disable-cuda-graph for the non-KVDuo baseline as well when "
-                "reporting paper comparisons."
-            )
-            self.disable_cuda_graph = True
         self.hisparse_config = json.dumps(
             {
                 "top_k": kvduo.top_k,
-                # Initial resolver metadata width, not a hot-cache quota or
-                # reservation. With graph capture disabled, KVDuo expands the
-                # view on demand while physical pages remain globally budgeted.
-                "device_buffer_size": kvduo.top_k,
+                # Capture-stable maximum-tier metadata; physical pages remain lazy.
+                "device_buffer_size": 16 * kvduo.top_k,
                 "host_to_device_ratio": kvduo.host_to_device_ratio,
                 "swap_in_block_size": kvduo.swap_in_block_size,
             }
