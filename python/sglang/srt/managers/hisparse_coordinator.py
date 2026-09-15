@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.sparsity.core.kvduo_state import KVDuoResidencyCatalog
 from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()
@@ -141,6 +142,9 @@ class HiSparseCoordinator:
         # Unlike ReqToTokenPool this is always int64 and, for DSV4, is indexed in
         # compressed C4 position space rather than original-token space.
         if self.enable_mixed_residency:
+            # Authoritative control-plane ownership/state catalog. CUDA tensors
+            # below are capture-stable mirrors, not independent ownership data.
+            self.kvduo_residency = KVDuoResidencyCatalog()
             self.req_to_full_lookup = torch.full(
                 (max_num_req_slots, max_compressed_context_len + self.page_size),
                 -1,
@@ -159,6 +163,7 @@ class HiSparseCoordinator:
             self.full_touch_clock = torch.zeros(1, dtype=torch.int64, device=device)
             self._active_kvduo_reqs = {}
         else:
+            self.kvduo_residency = None
             self.req_to_full_lookup = None
             self.req_reserved_logical = None
             self.full_last_touch = None
