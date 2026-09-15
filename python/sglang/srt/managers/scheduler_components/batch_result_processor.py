@@ -275,7 +275,14 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
+                        # KVDuo must keep the incoming shared prefix locked, but
+                        # must not publish the newly generated prefill pages to
+                        # RadixTree before deciding which of them to demote.
+                        # Otherwise cache_protected_len covers the whole prompt
+                        # and there is no request-owned page available for the
+                        # minimum hot buffer.
+                        if not get_memory().enable_kvduo:
+                            maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 

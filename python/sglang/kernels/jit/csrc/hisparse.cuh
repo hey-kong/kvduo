@@ -24,6 +24,7 @@ using BallotMask = unsigned int;
 constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFu;
 #endif
 constexpr int32_t TOKEN_HIT = 0xFFFFFFFF;
+constexpr int32_t TOKEN_INVALID = -2;
 constexpr int32_t HASH_EMPTY = -1;
 
 // Knuth multiplicative hash for open-addressing table of size hash_size.
@@ -166,8 +167,8 @@ template <int NUM_TOP_K, int HOT_BUFFER_SIZE>
 struct SmemLayout {
   static constexpr int HASH_SIZE = NUM_TOP_K * 2;
   static constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
-  // int32_t region: top_k_tokens + offsets + hash_keys + hit counters
-  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 3;
+  // int32_t region: top_k_tokens + offsets + hash_keys + hit/miss counters
+  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 4;
   // int16_t region: lru_slots_out + hash_vals
   static constexpr int TOTAL_INT16 = HOT_BUFFER_SIZE + HASH_SIZE;
   static constexpr size_t BYTES = TOTAL_INT32 * sizeof(int32_t) + TOTAL_INT16 * sizeof(int16_t);
@@ -283,6 +284,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   int32_t& s_total_hits = s_hash_keys[HASH_SIZE];
   int32_t& s_newest_hit = s_hash_keys[HASH_SIZE + 1];
   int32_t& s_full_hits = s_hash_keys[HASH_SIZE + 2];
+  int32_t& s_total_misses = s_hash_keys[HASH_SIZE + 3];
 
   int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
   // Compacted slot ordering: [hits fwd->  ...  <-evictables bwd]
@@ -295,6 +297,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     s_total_hits = 0;
     s_newest_hit = 0;
     s_full_hits = 0;
+    s_total_misses = 0;
   }
   for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
     s_hash_keys[i] = HASH_EMPTY;
@@ -312,13 +315,18 @@ __global__ void load_cache_to_device_buffer_kernel(
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
     int64_t full_loc = 0;
-    if (enable_full_lookup && token_idx >= 0 && token_idx < seq_len) {
+    if (token_idx < 0 || token_idx >= seq_len) {
+      s_top_k_tokens[i] = TOKEN_INVALID;
+      req_top_k_device_locs[i] = -1;
+    } else if (enable_full_lookup) {
       const int64_t logical_loc = req_to_logical_token[rid * req_to_logical_stride + token_idx];
       if (logical_loc >= 0) {
         full_loc = full_to_device_loc[logical_loc];
       }
     }
-    if (full_loc > 0) {
+    if (token_idx < 0 || token_idx >= seq_len) {
+      // Invalid/padded selections never participate in hashing or miss loading.
+    } else if (full_loc > 0) {
       s_top_k_tokens[i] = TOKEN_HIT;
       req_top_k_device_locs[i] = static_cast<int32_t>(full_loc);
       atomicAdd(&s_full_hits, 1);
@@ -449,7 +457,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     int local_miss_offset = 0;
 
     if (has_valid_token) {
-      is_miss = s_top_k_tokens[my_token_idx] != TOKEN_HIT;
+      is_miss = s_top_k_tokens[my_token_idx] >= 0;
       if (is_miss) {
         my_token = s_top_k_tokens[my_token_idx];
       }
@@ -488,7 +496,11 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit - s_full_hits;
+  if (tid == 0) {
+    s_total_misses = total_misses;
+  }
+  __syncthreads();
+  total_misses = s_total_misses;
   // Write back LRU order: evictables at front (LRU), hits at back (MRU).
   {
     const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;

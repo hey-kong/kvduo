@@ -7829,6 +7829,12 @@ class ServerArgs:
         from sglang.srt.mem_cache.sparsity import parse_kvduo_config
 
         kvduo = parse_kvduo_config(self)
+        if self.chunked_prefill_size != -1:
+            logger.warning(
+                "Disabling chunked prefill for KVDuo: mixed residency must decide "
+                "page ownership before publishing newly generated pages to RadixTree."
+            )
+            self.chunked_prefill_size = -1
         self.hisparse_config = json.dumps(
             {
                 "top_k": kvduo.top_k,

@@ -140,15 +140,19 @@ class HiSparseCoordinator:
         # Capture-stable logical-address rows consumed by KVDuo's fused resolver.
         # Unlike ReqToTokenPool this is always int64 and, for DSV4, is indexed in
         # compressed C4 position space rather than original-token space.
-        self.req_to_full_lookup = torch.full(
-            (max_num_req_slots, max_compressed_context_len + self.page_size),
-            -1,
-            dtype=torch.int64,
-            device=device,
-        )
-        self.req_reserved_logical = torch.full(
-            (max_num_req_slots,), -1, dtype=torch.int64, device=device
-        )
+        if self.enable_mixed_residency:
+            self.req_to_full_lookup = torch.full(
+                (max_num_req_slots, max_compressed_context_len + self.page_size),
+                -1,
+                dtype=torch.int64,
+                device=device,
+            )
+            self.req_reserved_logical = torch.full(
+                (max_num_req_slots,), -1, dtype=torch.int64, device=device
+            )
+        else:
+            self.req_to_full_lookup = None
+            self.req_reserved_logical = None
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
@@ -805,7 +809,10 @@ class HiSparseCoordinator:
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefill_len
         ]
-        self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
+        # The incoming prefix is owned by RadixTree (and may be shared by other
+        # active requests). Only the request-private suffix may be returned here.
+        owned_locs = allocated_locs[req.cache_protected_len :]
+        self.token_to_kv_pool_allocator.free_hisparse(owned_locs)
 
         # Free host memory that was allocated during admit_request_into_staging
         host_indices = self.mem_pool_host.allocated_host_indices(
@@ -817,8 +824,9 @@ class HiSparseCoordinator:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
-        self.req_to_full_lookup[req.req_pool_idx, :] = -1
-        self.req_reserved_logical[req.req_pool_idx] = -1
+        if self.enable_mixed_residency:
+            self.req_to_full_lookup[req.req_pool_idx, :] = -1
+            self.req_reserved_logical[req.req_pool_idx] = -1
         self._mixed_slots[req.req_pool_idx] = False
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
@@ -903,8 +911,9 @@ class HiSparseCoordinator:
         self.req_device_buffer_size[req.req_pool_idx] = 0
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
-        self.req_to_full_lookup[req.req_pool_idx, :] = -1
-        self.req_reserved_logical[req.req_pool_idx] = -1
+        if self.enable_mixed_residency:
+            self.req_to_full_lookup[req.req_pool_idx, :] = -1
+            self.req_reserved_logical[req.req_pool_idx] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
         self._mixed_slots[req.req_pool_idx] = False
