@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, Hashable, Iterable, Mapping, Optional, Tuple
+from typing import Callable, Dict, Hashable, Iterable, Mapping, Optional, Tuple
 
 PageIdentity = Hashable
 DomainIdentity = Hashable
@@ -33,6 +33,36 @@ class KVDuoPressureStatus(Enum):
     WAIT_FOR_IO = auto()
     WAIT_FOR_MEMORY = auto()
     RETRACT_REQUIRED = auto()
+
+
+class KVDuoPressureAction(Enum):
+    """Action the allocation caller must take."""
+
+    SUCCESS = auto()
+    WAIT = auto()
+    RETRACT_REQUIRED = auto()
+    ERROR = auto()
+
+
+class KVDuoPressureReason(Enum):
+    """Cause of a pressure action, kept separate from the action itself."""
+
+    NONE = auto()
+    DMA_PENDING = auto()
+    MEMORY_SHORTAGE = auto()
+    INSUFFICIENT_RECLAIMABLE_PAGES = auto()
+    INVALID_STATE = auto()
+
+
+class KVDuoResourceKind(Enum):
+    """Independently accounted resource pools relevant to KVDuo admission."""
+
+    MAIN_KV_PHYSICAL = auto()
+    LOGICAL_SLOTS = auto()
+    SWA = auto()
+    INDEXER = auto()
+    COMPRESSION_STATE = auto()
+    HOST_KV = auto()
 
 
 @dataclass
@@ -204,6 +234,11 @@ class KVDuoAllocationPlan:
     new_hot_bytes: int = 0
     reserved_bytes: int = 0
     turnover_bytes: int = 0
+    # Commitments not already reflected in ``available_bytes``. Allocated or
+    # allocator-reserved memory must not be listed here a second time.
+    pending_commitment_bytes: int = 0
+    resource_kind: KVDuoResourceKind = KVDuoResourceKind.MAIN_KV_PHYSICAL
+    independent_budgets: Tuple["KVDuoResourceBudget", ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -213,6 +248,7 @@ class KVDuoAllocationPlan:
                 self.new_hot_bytes,
                 self.reserved_bytes,
                 self.turnover_bytes,
+                self.pending_commitment_bytes,
             )
             < 0
         ):
@@ -225,6 +261,7 @@ class KVDuoAllocationPlan:
             + self.new_hot_bytes
             + self.reserved_bytes
             + self.turnover_bytes
+            + self.pending_commitment_bytes
         )
 
     @property
@@ -233,9 +270,16 @@ class KVDuoAllocationPlan:
 
     @property
     def status(self) -> KVDuoPressureStatus:
-        if self.shortfall_bytes:
+        if self.shortfall_bytes or self.blocking_resources:
             return KVDuoPressureStatus.RECLAIM_REQUIRED
         return KVDuoPressureStatus.READY
+
+    @property
+    def blocking_resources(self) -> Tuple[KVDuoResourceKind, ...]:
+        """Non-main pools that must be handled by their own managers."""
+        return tuple(
+            budget.kind for budget in self.independent_budgets if budget.shortfall_bytes
+        )
 
 
 @dataclass(frozen=True)
@@ -247,6 +291,8 @@ class KVDuoPressureResult:
     reclaimed_bytes: int = 0
     remaining_shortfall_bytes: int = 0
     detail: Optional[str] = None
+    action: Optional[KVDuoPressureAction] = None
+    reason: Optional[KVDuoPressureReason] = None
 
     def __post_init__(self) -> None:
         if (
@@ -260,6 +306,155 @@ class KVDuoPressureResult:
             raise ValueError("KVDuo pressure-result byte counts cannot be negative")
         if self.status is KVDuoPressureStatus.READY and self.remaining_shortfall_bytes:
             raise ValueError("A READY KVDuo pressure result cannot have a shortfall")
+
+        expected_action = {
+            KVDuoPressureStatus.READY: KVDuoPressureAction.SUCCESS,
+            KVDuoPressureStatus.RECLAIM_REQUIRED: KVDuoPressureAction.ERROR,
+            KVDuoPressureStatus.WAIT_FOR_IO: KVDuoPressureAction.WAIT,
+            KVDuoPressureStatus.WAIT_FOR_MEMORY: KVDuoPressureAction.WAIT,
+            KVDuoPressureStatus.RETRACT_REQUIRED: KVDuoPressureAction.RETRACT_REQUIRED,
+        }[self.status]
+        if self.action is None:
+            object.__setattr__(self, "action", expected_action)
+        if self.reason is None:
+            object.__setattr__(
+                self,
+                "reason",
+                (
+                    KVDuoPressureReason.NONE
+                    if self.status is KVDuoPressureStatus.READY
+                    else KVDuoPressureReason.MEMORY_SHORTAGE
+                ),
+            )
+
+
+@dataclass(frozen=True)
+class KVDuoResourceBudget:
+    """Snapshot of one independently managed resource pool."""
+
+    kind: KVDuoResourceKind
+    available_bytes: int
+    requested_bytes: int
+    pending_commitment_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            min(
+                self.available_bytes,
+                self.requested_bytes,
+                self.pending_commitment_bytes,
+            )
+            < 0
+        ):
+            raise ValueError("KVDuo resource-budget byte counts cannot be negative")
+
+    @property
+    def shortfall_bytes(self) -> int:
+        return max(
+            0,
+            self.requested_bytes + self.pending_commitment_bytes - self.available_bytes,
+        )
+
+
+def plan_kvduo_allocation(
+    *,
+    available_main_kv_bytes: int,
+    requested_full_bytes: int = 0,
+    requested_hot_bytes: int = 0,
+    incremental_reserved_bytes: int = 0,
+    incremental_turnover_bytes: int = 0,
+    pending_commitment_bytes: int = 0,
+    independent_budgets: Iterable[KVDuoResourceBudget] = (),
+) -> KVDuoAllocationPlan:
+    """Build a physical-byte plan without double-counting existing allocations.
+
+    ``pending_commitment_bytes`` is intentionally limited to promises not yet
+    reflected by the allocator's available count. Other pools are snapshots
+    used only to report blockers; they never contribute to main-KV reclamation.
+    """
+    budgets = tuple(independent_budgets)
+    if any(budget.kind is KVDuoResourceKind.MAIN_KV_PHYSICAL for budget in budgets):
+        raise ValueError("Main KV must be described by the plan's main-pool fields")
+    kinds = [budget.kind for budget in budgets]
+    if len(kinds) != len(set(kinds)):
+        raise ValueError("Each independent resource pool may appear only once")
+    return KVDuoAllocationPlan(
+        available_bytes=available_main_kv_bytes,
+        new_full_bytes=requested_full_bytes,
+        new_hot_bytes=requested_hot_bytes,
+        reserved_bytes=incremental_reserved_bytes,
+        turnover_bytes=incremental_turnover_bytes,
+        pending_commitment_bytes=pending_commitment_bytes,
+        independent_budgets=budgets,
+    )
+
+
+def execute_kvduo_pressure_plan(
+    plan: KVDuoAllocationPlan,
+    reclaim_full_pages: Callable[[int], int],
+    available_bytes: Callable[[], int],
+    *,
+    dma_can_make_progress: bool = False,
+) -> KVDuoPressureResult:
+    """Execute and recheck a plan against the main sparse-KV physical pool.
+
+    The callback boundary keeps selection/mutation in the coordinator while
+    making the budgeting rules independently testable.  No other resource pool
+    can accidentally trigger full-page eviction.
+    """
+    if (
+        plan.resource_kind is not KVDuoResourceKind.MAIN_KV_PHYSICAL
+        or plan.blocking_resources
+    ):
+        blocked = ", ".join(kind.name for kind in plan.blocking_resources)
+        return KVDuoPressureResult(
+            KVDuoPressureStatus.RECLAIM_REQUIRED,
+            plan.required_bytes,
+            remaining_shortfall_bytes=plan.shortfall_bytes,
+            action=KVDuoPressureAction.ERROR,
+            reason=KVDuoPressureReason.INVALID_STATE,
+            detail=(
+                "Full-page reclaim is only valid for the main KV physical pool"
+                if not blocked
+                else f"Independent resource shortage: {blocked}"
+            ),
+        )
+
+    initial_shortfall = plan.shortfall_bytes
+    if initial_shortfall == 0:
+        return KVDuoPressureResult(
+            KVDuoPressureStatus.READY,
+            plan.required_bytes,
+            action=KVDuoPressureAction.SUCCESS,
+            reason=KVDuoPressureReason.NONE,
+        )
+    reclaimed = reclaim_full_pages(initial_shortfall)
+    remaining = max(0, plan.required_bytes - available_bytes())
+    if remaining == 0:
+        return KVDuoPressureResult(
+            KVDuoPressureStatus.READY,
+            plan.required_bytes,
+            reclaimed_bytes=reclaimed,
+            action=KVDuoPressureAction.SUCCESS,
+            reason=KVDuoPressureReason.NONE,
+        )
+    if dma_can_make_progress:
+        return KVDuoPressureResult(
+            KVDuoPressureStatus.WAIT_FOR_IO,
+            plan.required_bytes,
+            reclaimed_bytes=reclaimed,
+            remaining_shortfall_bytes=remaining,
+            action=KVDuoPressureAction.WAIT,
+            reason=KVDuoPressureReason.DMA_PENDING,
+        )
+    return KVDuoPressureResult(
+        KVDuoPressureStatus.RECLAIM_REQUIRED,
+        plan.required_bytes,
+        reclaimed_bytes=reclaimed,
+        remaining_shortfall_bytes=remaining,
+        action=KVDuoPressureAction.ERROR,
+        reason=KVDuoPressureReason.INSUFFICIENT_RECLAIMABLE_PAGES,
+    )
 
 
 class KVDuoResidencyCatalog:

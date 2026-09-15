@@ -20,7 +20,15 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.mem_cache.sparsity.core.kvduo_state import KVDuoResidencyCatalog
+from sglang.srt.mem_cache.sparsity.core.kvduo_state import (
+    KVDuoPressureAction,
+    KVDuoPressureReason,
+    KVDuoPressureResult,
+    KVDuoPressureStatus,
+    KVDuoResidencyCatalog,
+    execute_kvduo_pressure_plan,
+    plan_kvduo_allocation,
+)
 from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()
@@ -342,19 +350,101 @@ class HiSparseCoordinator:
                 io_backend="kernel",
             )
 
-    def _reclaim_for_physical_allocation(self, need_size: int) -> None:
+    def _physical_page_bytes(self) -> int:
+        """Actual cross-layer bytes represented by one allocator page."""
+        per_layer = getattr(
+            self.mem_pool_device,
+            "bytes_per_page_padded",
+            self.item_size_bytes * self.page_size,
+        )
+        return per_layer * self.mem_pool_device.layer_num
+
+    def _physical_bytes(self, num_slots: int) -> int:
+        """Convert an aligned allocator request to actual physical bytes."""
+        if num_slots % self.page_size:
+            raise ValueError(
+                f"KVDuo physical allocation must be page aligned: {num_slots=}"
+            )
+        return num_slots // self.page_size * self._physical_page_bytes()
+
+    def _reclaim_for_physical_allocation(
+        self, need_size: int, *, turnover_size: int = 0
+    ) -> KVDuoPressureResult:
         """Reclaim full pages for an imminent sparse-pool allocation only.
 
         This intentionally consults the dedicated physical allocator rather
         than ``available_size()`` on the composite allocator, whose minimum may
         instead reflect logical KV, SWA, indexer, or compression-state pressure.
         """
-        if not self.enable_mixed_residency or need_size <= 0:
-            return
+        if need_size < 0 or turnover_size < 0 or turnover_size > need_size:
+            return KVDuoPressureResult(
+                KVDuoPressureStatus.RECLAIM_REQUIRED,
+                0,
+                action=KVDuoPressureAction.ERROR,
+                reason=KVDuoPressureReason.INVALID_STATE,
+                detail=(
+                    "invalid sparse-KV allocation sizes: "
+                    f"{need_size=}, {turnover_size=}"
+                ),
+            )
         physical_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
-        shortfall = max(0, need_size - physical_allocator.available_size())
-        if shortfall:
-            self.reclaim_kvduo_full_pages(shortfall)
+        available_slots = (
+            physical_allocator.available_size() // self.page_size * self.page_size
+        )
+        plan = plan_kvduo_allocation(
+            available_main_kv_bytes=self._physical_bytes(available_slots),
+            requested_hot_bytes=self._physical_bytes(need_size - turnover_size),
+            incremental_turnover_bytes=self._physical_bytes(turnover_size),
+        )
+        if not self.enable_mixed_residency:
+            remaining = plan.shortfall_bytes
+            return KVDuoPressureResult(
+                (
+                    KVDuoPressureStatus.READY
+                    if remaining == 0
+                    else KVDuoPressureStatus.RECLAIM_REQUIRED
+                ),
+                plan.required_bytes,
+                remaining_shortfall_bytes=remaining,
+                action=(
+                    KVDuoPressureAction.SUCCESS
+                    if remaining == 0
+                    else KVDuoPressureAction.ERROR
+                ),
+                reason=(
+                    KVDuoPressureReason.NONE
+                    if remaining == 0
+                    else KVDuoPressureReason.MEMORY_SHORTAGE
+                ),
+            )
+
+        def reclaim_bytes(shortfall_bytes: int) -> int:
+            pages = (
+                shortfall_bytes + self._physical_page_bytes() - 1
+            ) // self._physical_page_bytes()
+            reclaimed_slots = self.reclaim_kvduo_full_pages(pages * self.page_size)
+            return reclaimed_slots // self.page_size * self._physical_page_bytes()
+
+        return execute_kvduo_pressure_plan(
+            plan,
+            reclaim_full_pages=reclaim_bytes,
+            available_bytes=lambda: self._physical_bytes(
+                physical_allocator.available_size() // self.page_size * self.page_size
+            ),
+            # This path waits for outstanding backup before page selection, so
+            # no pending DMA can independently make a failed plan progress.
+            dma_can_make_progress=False,
+        )
+
+    @staticmethod
+    def _require_allocation_ready(result: KVDuoPressureResult) -> None:
+        if result.action is KVDuoPressureAction.SUCCESS:
+            return
+        raise RuntimeError(
+            "KVDuo physical allocation cannot proceed: "
+            f"action={result.action.name}, reason={result.reason.name}, "
+            f"remaining_shortfall_bytes={result.remaining_shortfall_bytes}"
+        )
 
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
@@ -399,7 +489,13 @@ class HiSparseCoordinator:
             req.kvduo_radix_insert_len = (
                 allocated_len // radix_page_size * radix_page_size
             )
-            self._reclaim_for_physical_allocation(alloc_size)
+            turnover_size = (
+                self.page_size if alloc_size == self.padded_buffer_size else 0
+            )
+            pressure = self._reclaim_for_physical_allocation(
+                alloc_size, turnover_size=turnover_size
+            )
+            self._require_allocation_ready(pressure)
             # Preserve exactly the mappings that survived page-level LRU. The
             # allocator obtains hot slots from the physical free list; no full
             # entry is copied into or tagged as hot during this transition.
@@ -460,6 +556,7 @@ class HiSparseCoordinator:
             new_caps = []
             grow_sizes = []
             total_grow = 0
+            turnover_grow = 0
             for i in grow_indices.tolist():
                 req_idx = int(req_pool_indices_cpu[i])
                 current_cap = int(current_caps[i])
@@ -479,12 +576,17 @@ class HiSparseCoordinator:
                 new_caps.append(new_cap)
                 grow_sizes.append(grow_size)
                 total_grow += grow_size
+                if current_cap <= self.device_buffer_size < new_cap:
+                    turnover_grow += self.page_size
 
             if total_grow > 0:
                 # ``new_cap`` includes the extra reserved append page when a
                 # request reaches the configured hot-buffer capacity, so the
                 # real allocation amount below is also the admission amount.
-                self._reclaim_for_physical_allocation(total_grow)
+                pressure = self._reclaim_for_physical_allocation(
+                    total_grow, turnover_size=turnover_grow
+                )
+                self._require_allocation_ready(pressure)
                 all_new_indices = (
                     self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
                         total_grow

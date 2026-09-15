@@ -44,7 +44,10 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
-        physical = SimpleNamespace(available_size=MagicMock(return_value=3))
+        coordinator.item_size_bytes = 4
+        coordinator.page_size = 1
+        coordinator.mem_pool_device = SimpleNamespace(layer_num=2)
+        physical = SimpleNamespace(available_size=MagicMock(side_effect=(3, 8)))
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
             hisparse_attn_allocator=physical,
             # A deliberately unrelated composite value must never be consulted.
@@ -54,7 +57,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator._reclaim_for_physical_allocation(8)
 
-        physical.available_size.assert_called_once_with()
+        self.assertEqual(physical.available_size.call_count, 2)
         coordinator.token_to_kv_pool_allocator.available_size.assert_not_called()
         coordinator.reclaim_kvduo_full_pages.assert_called_once_with(5)
 
@@ -63,6 +66,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
+        coordinator.item_size_bytes = 4
+        coordinator.page_size = 1
+        coordinator.mem_pool_device = SimpleNamespace(layer_num=2)
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
             hisparse_attn_allocator=SimpleNamespace(
                 available_size=MagicMock(return_value=65)

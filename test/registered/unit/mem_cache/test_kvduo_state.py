@@ -23,8 +23,14 @@ KVDuoHotCapacity = STATE.KVDuoHotCapacity
 KVDuoPagePinState = STATE.KVDuoPagePinState
 KVDuoPageResidency = STATE.KVDuoPageResidency
 KVDuoPressureResult = STATE.KVDuoPressureResult
+KVDuoPressureAction = STATE.KVDuoPressureAction
+KVDuoPressureReason = STATE.KVDuoPressureReason
 KVDuoPressureStatus = STATE.KVDuoPressureStatus
+KVDuoResourceBudget = STATE.KVDuoResourceBudget
+KVDuoResourceKind = STATE.KVDuoResourceKind
 KVDuoResidencyCatalog = STATE.KVDuoResidencyCatalog
+execute_kvduo_pressure_plan = STATE.execute_kvduo_pressure_plan
+plan_kvduo_allocation = STATE.plan_kvduo_allocation
 
 
 def make_page(page_id, *, gpu=True, host=True):
@@ -113,3 +119,68 @@ def test_state_objects_reject_invalid_invariants():
         KVDuoPagePinState(attention=-1).validate()
     with pytest.raises(ValueError, match="READY"):
         KVDuoPressureResult(KVDuoPressureStatus.READY, 8, 0, 1)
+
+
+def test_pressure_plan_reclaims_exact_main_pool_shortfall_and_rechecks():
+    available = [4096]
+    reclaim_calls = []
+
+    def reclaim(shortfall):
+        reclaim_calls.append(shortfall)
+        available[0] += shortfall
+        return shortfall
+
+    plan = KVDuoAllocationPlan(
+        available_bytes=available[0],
+        new_hot_bytes=4096,
+        reserved_bytes=1024,
+        turnover_bytes=2048,
+        pending_commitment_bytes=1024,
+    )
+    result = execute_kvduo_pressure_plan(plan, reclaim, lambda: available[0])
+
+    assert reclaim_calls == [4096]
+    assert result.action is KVDuoPressureAction.SUCCESS
+    assert result.reason is KVDuoPressureReason.NONE
+    assert result.reclaimed_bytes == 4096
+
+
+def test_independent_resource_shortage_never_reclaims_main_kv():
+    reclaim_calls = []
+    plan = KVDuoAllocationPlan(
+        available_bytes=8192,
+        new_hot_bytes=4096,
+        independent_budgets=(KVDuoResourceBudget(KVDuoResourceKind.SWA, 1024, 2048),),
+    )
+    result = execute_kvduo_pressure_plan(plan, reclaim_calls.append, lambda: 8192)
+
+    assert reclaim_calls == []
+    assert result.action is KVDuoPressureAction.ERROR
+    assert result.reason is KVDuoPressureReason.INVALID_STATE
+    assert "SWA" in result.detail
+
+
+def test_pressure_result_waits_only_with_explicit_dma_progress_source():
+    plan = KVDuoAllocationPlan(available_bytes=0, new_hot_bytes=4096)
+    without_progress = execute_kvduo_pressure_plan(plan, lambda _: 0, lambda: 0)
+    with_progress = execute_kvduo_pressure_plan(
+        plan, lambda _: 0, lambda: 0, dma_can_make_progress=True
+    )
+
+    assert without_progress.action is KVDuoPressureAction.ERROR
+    assert without_progress.reason is KVDuoPressureReason.INSUFFICIENT_RECLAIMABLE_PAGES
+    assert with_progress.action is KVDuoPressureAction.WAIT
+    assert with_progress.reason is KVDuoPressureReason.DMA_PENDING
+
+
+def test_planner_rejects_duplicate_or_main_independent_pool_snapshots():
+    swa = KVDuoResourceBudget(KVDuoResourceKind.SWA, 8, 4)
+    with pytest.raises(ValueError, match="only once"):
+        plan_kvduo_allocation(available_main_kv_bytes=8, independent_budgets=(swa, swa))
+    with pytest.raises(ValueError, match="Main KV"):
+        plan_kvduo_allocation(
+            available_main_kv_bytes=8,
+            independent_budgets=(
+                KVDuoResourceBudget(KVDuoResourceKind.MAIN_KV_PHYSICAL, 8, 4),
+            ),
+        )
