@@ -11,6 +11,7 @@ import os
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
@@ -35,6 +36,43 @@ KV_CACHE_DIM = 576  # MLA dim (DeepSeek-style)
 LAYER_NUM = 2
 MAX_NUM_REQS = 8
 MAX_CONTEXT_LEN = 2048
+
+
+class TestKVDuoPhysicalReclaim(unittest.TestCase):
+    def test_reclaims_only_dedicated_physical_shortfall(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.enable_mixed_residency = True
+        physical = SimpleNamespace(available_size=MagicMock(return_value=3))
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            hisparse_attn_allocator=physical,
+            # A deliberately unrelated composite value must never be consulted.
+            available_size=MagicMock(return_value=0),
+        )
+        coordinator.reclaim_kvduo_full_pages = MagicMock(return_value=5)
+
+        coordinator._reclaim_for_physical_allocation(8)
+
+        physical.available_size.assert_called_once_with()
+        coordinator.token_to_kv_pool_allocator.available_size.assert_not_called()
+        coordinator.reclaim_kvduo_full_pages.assert_called_once_with(5)
+
+    def test_does_not_reclaim_when_physical_pool_fits_reserved_page(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.enable_mixed_residency = True
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            hisparse_attn_allocator=SimpleNamespace(
+                available_size=MagicMock(return_value=65)
+            )
+        )
+        coordinator.reclaim_kvduo_full_pages = MagicMock()
+
+        coordinator._reclaim_for_physical_allocation(65)
+
+        coordinator.reclaim_kvduo_full_pages.assert_not_called()
 
 
 def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):

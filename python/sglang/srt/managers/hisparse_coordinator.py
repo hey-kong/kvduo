@@ -337,6 +337,20 @@ class HiSparseCoordinator:
                 io_backend="kernel",
             )
 
+    def _reclaim_for_physical_allocation(self, need_size: int) -> None:
+        """Reclaim full pages for an imminent sparse-pool allocation only.
+
+        This intentionally consults the dedicated physical allocator rather
+        than ``available_size()`` on the composite allocator, whose minimum may
+        instead reflect logical KV, SWA, indexer, or compression-state pressure.
+        """
+        if not self.enable_mixed_residency or need_size <= 0:
+            return
+        physical_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        shortfall = max(0, need_size - physical_allocator.available_size())
+        if shortfall:
+            self.reclaim_kvduo_full_pages(shortfall)
+
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
             allocated_len = req.extend_range.end
@@ -380,12 +394,7 @@ class HiSparseCoordinator:
             req.kvduo_radix_insert_len = (
                 allocated_len // radix_page_size * radix_page_size
             )
-            physical_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
-            physical_shortfall = max(
-                0, alloc_size - physical_allocator.available_size()
-            )
-            if physical_shortfall:
-                self.reclaim_kvduo_full_pages(physical_shortfall)
+            self._reclaim_for_physical_allocation(alloc_size)
             # Preserve exactly the mappings that survived page-level LRU. The
             # allocator obtains hot slots from the physical free list; no full
             # entry is copied into or tagged as hot during this transition.
@@ -467,6 +476,10 @@ class HiSparseCoordinator:
                 total_grow += grow_size
 
             if total_grow > 0:
+                # ``new_cap`` includes the extra reserved append page when a
+                # request reaches the configured hot-buffer capacity, so the
+                # real allocation amount below is also the admission amount.
+                self._reclaim_for_physical_allocation(total_grow)
                 all_new_indices = (
                     self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
                         total_grow
