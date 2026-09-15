@@ -91,6 +91,8 @@ def _load_cache_to_device_buffer_mla(
     page_size: int,
     block_size: int,
     num_real_reqs: torch.Tensor | None,
+    req_to_logical_token: torch.Tensor | None = None,
+    full_to_device_loc: torch.Tensor | None = None,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
@@ -106,6 +108,11 @@ def _load_cache_to_device_buffer_mla(
     )
 
     empty = torch.empty(0)
+    enable_full_lookup = (
+        req_to_logical_token is not None and full_to_device_loc is not None
+    )
+    req_to_logical_token = req_to_logical_token if enable_full_lookup else empty
+    full_to_device_loc = full_to_device_loc if enable_full_lookup else empty
 
     if num_real_reqs is None:
         num_real_reqs = torch.tensor(
@@ -126,6 +133,9 @@ def _load_cache_to_device_buffer_mla(
         seq_lens,
         lru_slots,
         num_real_reqs,
+        req_to_logical_token,
+        full_to_device_loc,
+        enable_full_lookup,
         page_size,
         item_size_bytes,
     )
@@ -148,6 +158,8 @@ def load_cache_to_device_buffer_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    req_to_logical_token: torch.Tensor | None = None,
+    full_to_device_loc: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
     _load_cache_to_device_buffer_mla(
@@ -168,6 +180,8 @@ def load_cache_to_device_buffer_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+        req_to_logical_token=req_to_logical_token,
+        full_to_device_loc=full_to_device_loc,
     )
 
 
@@ -188,6 +202,8 @@ def load_cache_to_device_buffer_dsv4_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    req_to_logical_token: torch.Tensor | None = None,
+    full_to_device_loc: torch.Tensor | None = None,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -208,4 +224,6 @@ def load_cache_to_device_buffer_dsv4_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+        req_to_logical_token=req_to_logical_token,
+        full_to_device_loc=full_to_device_loc,
     )

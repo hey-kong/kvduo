@@ -166,8 +166,8 @@ template <int NUM_TOP_K, int HOT_BUFFER_SIZE>
 struct SmemLayout {
   static constexpr int HASH_SIZE = NUM_TOP_K * 2;
   static constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
-  // int32_t region: top_k_tokens + chunk_offset + evict_chunk_offset + hash_keys + total_hits + newest_hit
-  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 2;
+  // int32_t region: top_k_tokens + offsets + hash_keys + hit counters
+  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 3;
   // int16_t region: lru_slots_out + hash_vals
   static constexpr int TOTAL_INT16 = HOT_BUFFER_SIZE + HASH_SIZE;
   static constexpr size_t BYTES = TOTAL_INT32 * sizeof(int32_t) + TOTAL_INT16 * sizeof(int16_t);
@@ -203,6 +203,10 @@ __global__ void load_cache_to_device_buffer_kernel(
     const SeqLensT* __restrict__ seq_lens,
     int16_t* __restrict__ lru_slots,
     const int32_t* __restrict__ num_real_reqs,
+    const int64_t* __restrict__ req_to_logical_token,
+    const int64_t* __restrict__ full_to_device_loc,
+    int64_t req_to_logical_stride,
+    bool enable_full_lookup,
     int64_t buffer_stride_0,
     int64_t host_stride,
     int64_t lru_slot_stride_0,
@@ -278,6 +282,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Scalar counters
   int32_t& s_total_hits = s_hash_keys[HASH_SIZE];
   int32_t& s_newest_hit = s_hash_keys[HASH_SIZE + 1];
+  int32_t& s_full_hits = s_hash_keys[HASH_SIZE + 2];
 
   int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
   // Compacted slot ordering: [hits fwd->  ...  <-evictables bwd]
@@ -289,6 +294,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   if (tid == 0) {
     s_total_hits = 0;
     s_newest_hit = 0;
+    s_full_hits = 0;
   }
   for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
     s_hash_keys[i] = HASH_EMPTY;
@@ -305,7 +311,16 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
-    if (token_idx == newest_token) {
+    int64_t full_loc = 0;
+    if (enable_full_lookup && token_idx >= 0 && token_idx < seq_len) {
+      const int64_t logical_loc = req_to_logical_token[rid * req_to_logical_stride + token_idx];
+      full_loc = full_to_device_loc[logical_loc];
+    }
+    if (full_loc > 0) {
+      s_top_k_tokens[i] = TOKEN_HIT;
+      req_top_k_device_locs[i] = static_cast<int32_t>(full_loc);
+      atomicAdd(&s_full_hits, 1);
+    } else if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
@@ -471,7 +486,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit - s_full_hits;
   // Write back LRU order: evictables at front (LRU), hits at back (MRU).
   {
     const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
@@ -569,6 +584,9 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView seq_lens,
     tvm::ffi::TensorView lru_slots,
     tvm::ffi::TensorView num_real_reqs,
+    tvm::ffi::TensorView req_to_logical_token,
+    tvm::ffi::TensorView full_to_device_loc,
+    bool enable_full_lookup,
     int64_t page_size,
     int64_t item_size_bytes) {
   using namespace host;
@@ -579,6 +597,7 @@ void load_cache_to_device_buffer(
   const int64_t lru_slot_stride_0 = lru_slots.strides()[0];
   const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
+  const int64_t req_to_logical_stride = enable_full_lookup ? req_to_logical_token.strides()[0] : 0;
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
 
   // Generic lambda: int32/int64 kernel variants are compiled for both
@@ -605,6 +624,10 @@ void load_cache_to_device_buffer(
         seq_lens_ptr,
         static_cast<int16_t*>(lru_slots.data_ptr()),
         static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        enable_full_lookup ? static_cast<const int64_t*>(req_to_logical_token.data_ptr()) : nullptr,
+        enable_full_lookup ? static_cast<const int64_t*>(full_to_device_loc.data_ptr()) : nullptr,
+        req_to_logical_stride,
+        enable_full_lookup,
         buffer_stride_0,
         host_stride,
         lru_slot_stride_0,

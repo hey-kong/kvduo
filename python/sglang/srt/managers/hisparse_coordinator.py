@@ -56,6 +56,7 @@ class HiSparseCoordinator:
         tp_group,
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
+        tail_protected_pages: int = 0,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -63,6 +64,8 @@ class HiSparseCoordinator:
         self.device_buffer_size = device_buffer_size
         self.device = device
         self.swap_in_block_size = swap_in_block_size
+        self.tail_protected_pages = tail_protected_pages
+        self.enable_mixed_residency = tail_protected_pages > 0
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -329,8 +332,21 @@ class HiSparseCoordinator:
         )
         compressed_len = len(compressed_logical_indices)
 
+        preserve_indices = None
+        if self.enable_mixed_residency:
+            # Keep all full pages when the shared physical pool can also satisfy
+            # the minimum hot-buffer reservation. Under pressure, atomically
+            # demote the non-tail portion and recycle only those physical slots.
+            if (
+                self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+                >= alloc_size
+            ):
+                preserve_indices = compressed_logical_indices
+            else:
+                protected = self.tail_protected_pages * self.page_size
+                preserve_indices = compressed_logical_indices[-protected:]
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
-            compressed_logical_indices, alloc_size
+            compressed_logical_indices, alloc_size, preserve_indices=preserve_indices
         )
         if buffer_indices is None:
             logger.error(
@@ -346,9 +362,16 @@ class HiSparseCoordinator:
         self.req_to_device_buffer[req.req_pool_idx, :alloc_size] = buffer_indices
         self.req_device_buffer_size[req.req_pool_idx] = alloc_size
 
-        self.req_device_buffer_tokens[
-            :, req.req_pool_idx, : self.device_buffer_size
-        ] = self._device_buffer_arange_i32
+        if self.enable_mixed_residency:
+            # Demotion never seeds hot entries: all first accesses to a
+            # non-resident full page are real misses.
+            self.req_device_buffer_tokens[
+                :, req.req_pool_idx, : self.device_buffer_size
+            ] = -1
+        else:
+            self.req_device_buffer_tokens[
+                :, req.req_pool_idx, : self.device_buffer_size
+            ] = self._device_buffer_arange_i32
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
@@ -836,5 +859,15 @@ class HiSparseCoordinator:
             page_size=1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
+            req_to_logical_token=(
+                self.req_to_token_pool.req_to_token
+                if self.enable_mixed_residency
+                else None
+            ),
+            full_to_device_loc=(
+                self.mem_pool_device.full_to_hisparse_device_index_mapping
+                if self.enable_mixed_residency
+                else None
+            ),
         )
         return top_k_indices

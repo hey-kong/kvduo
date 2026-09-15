@@ -127,11 +127,20 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extend_num_tokens,
         )
 
-    def alloc_device_buffer(self, allocated_indices, need_size: int):
+    def alloc_device_buffer(
+        self, allocated_indices, need_size: int, preserve_indices=None
+    ):
         assert need_size % self.page_size == 0
-        # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
+        # KVDuo keeps protected full pages in the unified physical address space.
+        # Only demoted locations may be recycled as private hot-buffer slots.
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        if preserve_indices is None:
+            demote_mask = torch.ones_like(allocated_indices, dtype=torch.bool)
+        else:
+            preserve_mask = torch.isin(allocated_indices, preserve_indices)
+            demote_mask = ~preserve_mask
+        self.full_to_hisparse_device_index_mapping[allocated_indices[demote_mask]] = 0
+        hisparse_indices = hisparse_indices[demote_mask]
         # Filter valid (non-zero) hisparse indices.
         # In the direct-to-host path, mapping is all zeros since no hisparse
         # device indices were pre-allocated.
@@ -422,10 +431,17 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_tail_len=swa_tail_len,
         )
 
-    def alloc_device_buffer(self, allocated_indices, need_size: int):
+    def alloc_device_buffer(
+        self, allocated_indices, need_size: int, preserve_indices=None
+    ):
         assert need_size % self.hisparse_page_size == 0
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        if preserve_indices is None:
+            demote_mask = torch.ones_like(allocated_indices, dtype=torch.bool)
+        else:
+            demote_mask = ~torch.isin(allocated_indices, preserve_indices)
+        self.full_to_hisparse_device_index_mapping[allocated_indices[demote_mask]] = 0
+        hisparse_indices = hisparse_indices[demote_mask]
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
 
         device_buffer_size = need_size - self.hisparse_page_size

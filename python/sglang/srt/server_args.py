@@ -2685,6 +2685,19 @@ class ServerArgs:
         NS("memory"),
     ] = None
 
+    enable_kvduo: A[
+        bool,
+        "Enable mixed full-page and per-layer hot-entry KV residency.",
+        NS("memory"),
+    ] = False
+    kvduo_config: A[
+        Optional[str],
+        Arg(
+            help='A JSON object for KVDuo. Example: \'{"top_k": 2048, "min_device_buffer_size": 4096, "N": 2}\''
+        ),
+        NS("memory"),
+    ] = None
+
     # -------------------------------------------------------------------------
     # Multi-modal optimization configs
     # -------------------------------------------------------------------------
@@ -3490,6 +3503,7 @@ class ServerArgs:
 
         # Set missing default values.
         self._handle_missing_default_values()
+        self._handle_kvduo_aliases()
 
         # Validate PD disaggregation flags before CUDA graph config.
         self._handle_pd_disaggregation()
@@ -7764,6 +7778,24 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
+        if self.kvduo_config is not None and not self.enable_kvduo:
+            raise ValueError("--kvduo-config requires --enable-kvduo")
+        if self.enable_kvduo:
+            if self.enable_hierarchical_cache:
+                raise ValueError(
+                    "--enable-kvduo owns its host backing store; do not also pass "
+                    "--enable-hierarchical-cache"
+                )
+            if self.disable_radix_cache:
+                raise ValueError("--enable-kvduo requires RadixTree prefix caching")
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "--enable-kvduo does not support speculative decoding yet"
+                )
+            from sglang.srt.mem_cache.sparsity import parse_kvduo_config
+
+            parse_kvduo_config(self)
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
@@ -7785,6 +7817,27 @@ class ServerArgs:
         # the user input before it ever takes effect.
         if not (0 < self._resolved().swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+
+    def _handle_kvduo_aliases(self):
+        """Resolve KVDuo onto shared HiSparse pool/backend configuration."""
+        if not self.enable_kvduo:
+            return
+        if self.enable_hisparse:
+            raise ValueError(
+                "--enable-kvduo and --enable-hisparse are mutually exclusive"
+            )
+        from sglang.srt.mem_cache.sparsity import parse_kvduo_config
+
+        kvduo = parse_kvduo_config(self)
+        self.hisparse_config = json.dumps(
+            {
+                "top_k": kvduo.top_k,
+                "device_buffer_size": kvduo.min_device_buffer_size,
+                "host_to_device_ratio": kvduo.host_to_device_ratio,
+                "swap_in_block_size": kvduo.swap_in_block_size,
+            }
+        )
+        self.enable_hisparse = True
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:

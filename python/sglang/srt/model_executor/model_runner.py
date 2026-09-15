@@ -818,6 +818,13 @@ class ModelRunner:
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
         hisparse_cfg = parse_hisparse_config(self.server_args)
+        tail_protected_pages = 0
+        if self.server_args.enable_kvduo:
+            from sglang.srt.mem_cache.sparsity import parse_kvduo_config
+
+            tail_protected_pages = parse_kvduo_config(
+                self.server_args
+            ).tail_protected_pages
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
@@ -834,6 +841,7 @@ class ModelRunner:
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
+            tail_protected_pages=tail_protected_pages,
         )
 
     def post_capture_resize_kv_pool(self):
