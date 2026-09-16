@@ -63,11 +63,21 @@ class SWAComponent(TreeComponent):
     """
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        )
         from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
         assert isinstance(
-            params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
-        ), f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(params.token_to_kv_pool_allocator)}"
+            params.token_to_kv_pool_allocator,
+            (
+                SWATokenToKVPoolAllocator,
+                DeepSeekV4HiSparseTokenToKVPoolAllocator,
+            ),
+        ), (
+            "SWAComponent requires an SWA-compatible allocator, got "
+            f"{type(params.token_to_kv_pool_allocator)}"
+        )
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         self.sliding_window_size = params.sliding_window_size
