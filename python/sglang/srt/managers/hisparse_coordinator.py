@@ -210,6 +210,13 @@ class HiSparseCoordinator:
                 dtype=torch.int32,
                 device=device,
             )
+            # Fixed-address [host_misses, valid_accesses] counters. The resolver
+            # only performs atomic updates; graph-external policy consumes them.
+            self.kvduo_resolver_stats = torch.zeros(
+                (self.mem_pool_device.layer_num, max_num_req_slots, 2),
+                dtype=torch.int32,
+                device=device,
+            )
             self._active_kvduo_reqs = {}
             self._kvduo_host_valid_len = [0] * max_num_req_slots
             self._pending_kvduo_host_valid = []
@@ -248,6 +255,7 @@ class HiSparseCoordinator:
             self.full_host_version = None
             self.full_touch_clock = None
             self.kvduo_swap_status = None
+            self.kvduo_resolver_stats = None
             self._active_kvduo_reqs = None
             self._kvduo_host_valid_len = None
             self._pending_kvduo_host_valid = None
@@ -1084,6 +1092,7 @@ class HiSparseCoordinator:
         top_k_result: torch.Tensor,
         layer_id: int,
         allocate_mixed_minimum: bool = False,
+        requested_capacities: dict[int, int] | None = None,
     ) -> None:
         """Materialize hot pages only for a selected non-full workset.
 
@@ -1127,7 +1136,16 @@ class HiSparseCoordinator:
             required_slots = occupied + new_misses
             if allocate_mixed_minimum and self._mixed_slots[req_idx]:
                 required_slots = max(required_slots, 2 * self.top_k)
-            demand.append((req_idx, current, required_slots, int(selected.numel())))
+            required_slots = max(
+                required_slots,
+                (requested_capacities or {}).get(req_idx, 0),
+            )
+            mandatory_slots = (
+                2 * self.top_k
+                if self._mixed_slots[req_idx] and current == 0
+                else int(selected.numel())
+            )
+            demand.append((req_idx, current, required_slots, mandatory_slots))
             max_required = max(max_required, required_slots)
 
         if max_required > self.device_buffer_size:
@@ -1217,6 +1235,8 @@ class HiSparseCoordinator:
                     missing_carriers = max(0, pages_needed - len(free_pages))
                     carrier_slots = missing_carriers * page_size
                     pressure = self._reclaim_for_physical_allocation(carrier_slots)
+                    # A first 2K allocation is admission, not opportunistic
+                    # growth. Failure must abort before replay.
                     self._require_allocation_ready(pressure)
                 # Re-read the live set after pressure handling. Pins above make
                 # it stable for the normal path, while this defensive replan
@@ -1308,19 +1328,59 @@ class HiSparseCoordinator:
             return
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
-        empty_selection = torch.full(
-            (req_pool_indices.numel(), self.top_k),
-            -1,
-            dtype=torch.int32,
-            device=self.device,
+        # One synchronization transfers the previous period's fixed counters.
+        # Resetting the same tensor preserves its address across every replay.
+        stats_cpu = self.kvduo_resolver_stats.cpu()
+        self.kvduo_resolver_stats.zero_()
+        requested = set(req_pool_indices.to(device="cpu", dtype=torch.int64).tolist())
+        requested.update(
+            req_idx
+            for req_idx in self._active_kvduo_reqs
+            if self._mixed_slots[req_idx]
         )
-        for layer_id in range(self.mem_pool_device.layer_num):
-            self._ensure_kvduo_hot_workset(
-                req_pool_indices,
-                empty_selection,
-                layer_id,
-                allocate_mixed_minimum=True,
+
+        # Pressure reclamation can demote another active request. Iterate to a
+        # fixed point so every mixed request has 2K in every storage group.
+        while True:
+            mixed = sorted(req_idx for req_idx in requested if self._mixed_slots[req_idx])
+            if not mixed:
+                return
+            mixed_gpu = torch.tensor(mixed, dtype=torch.int64, device=self.device)
+            empty_selection = torch.full(
+                (len(mixed), self.top_k), -1, dtype=torch.int32, device=self.device
             )
+            for layer_id in range(self.mem_pool_device.layer_num):
+                targets = {}
+                for req_idx in mixed:
+                    current = int(self.kvduo_req_hot_capacity[layer_id, req_idx])
+                    if current == 0:
+                        targets[req_idx] = 2 * self.top_k
+                    elif int(stats_cpu[layer_id, req_idx, 0]) > 0:
+                        targets[req_idx] = min(current * 2, 16 * self.top_k)
+                self._ensure_kvduo_hot_workset(
+                    mixed_gpu,
+                    empty_selection,
+                    layer_id,
+                    allocate_mixed_minimum=True,
+                    requested_capacities=targets,
+                )
+            newly_mixed = {
+                req_idx
+                for req_idx in self._active_kvduo_reqs
+                if self._mixed_slots[req_idx]
+            }
+            if newly_mixed.issubset(requested):
+                break
+            requested.update(newly_mixed)
+
+        for req_idx in requested:
+            if not self._mixed_slots[req_idx]:
+                continue
+            for layer_id in range(self.mem_pool_device.layer_num):
+                if int(self.kvduo_req_hot_capacity[layer_id, req_idx]) < 2 * self.top_k:
+                    raise RuntimeError(
+                        "KVDuo mixed request lacks mandatory 2K capacity before replay"
+                    )
 
     def _grow_kvduo_hot_metadata(self, required_slots: int) -> None:
         """Validate against the immutable, capture-stable resolver metadata."""
@@ -1419,7 +1479,10 @@ class HiSparseCoordinator:
         protected = getattr(self, "_kvduo_hot_pressure_protected", set())
         candidates = []
         for (layer_id, req_idx), pages in self._kvduo_req_layer_pages.items():
+            minimum_pages = (2 * self.top_k + self.page_size - 1) // self.page_size
             for page_index, start in enumerate(pages):
+                if len(pages) <= minimum_pages:
+                    continue
                 if (layer_id, req_idx, page_index) in protected:
                     continue
                 candidates.append(
@@ -1438,6 +1501,9 @@ class HiSparseCoordinator:
         for _, layer_id, req_idx, _, start in candidates:
             pages = self._kvduo_req_layer_pages.get((layer_id, req_idx))
             if pages is None or start not in pages:
+                continue
+            minimum_pages = (2 * self.top_k + self.page_size - 1) // self.page_size
+            if len(pages) <= minimum_pages:
                 continue
             self._evict_kvduo_hot_fragment(layer_id, req_idx, pages.index(start))
             owners = self._kvduo_hot_carriers[start]
@@ -2224,6 +2290,11 @@ class HiSparseCoordinator:
             ),
             swap_status=(
                 self.kvduo_swap_status[layer_id]
+                if self.enable_mixed_residency
+                else None
+            ),
+            resolver_stats=(
+                self.kvduo_resolver_stats[layer_id]
                 if self.enable_mixed_residency
                 else None
             ),

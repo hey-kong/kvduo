@@ -50,6 +50,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
+        coordinator.top_k = 2
         coordinator.page_size = 2
         coordinator.compress_ratio = 1
         coordinator.device = "cpu"
@@ -242,6 +243,36 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         # fragments are free, the carrier coalesces back to the legacy pool.
         coordinator._release_kvduo_layer_hot_pages(0)
         coordinator.token_to_kv_pool_allocator.free_hisparse_indices.assert_called_once()
+
+    def test_graph_prepare_uses_miss_history_and_rejects_zero_capacity(self):
+        """Replay preparation grows from counters and never admits mixed/zero."""
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.enable_mixed_residency = True
+        coordinator.decode_producer_stream = None
+        coordinator.device = "cpu"
+        coordinator.top_k = 2
+        coordinator.mem_pool_device = SimpleNamespace(layer_num=1)
+        coordinator._active_kvduo_reqs = {0: object()}
+        coordinator._mixed_slots = [True]
+        coordinator.kvduo_resolver_stats = torch.tensor([[[3, 4]]], dtype=torch.int32)
+        coordinator.kvduo_req_hot_capacity = torch.tensor([[4]], dtype=torch.int64)
+        coordinator._ensure_kvduo_hot_workset = MagicMock()
+
+        coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
+
+        self.assertEqual(
+            coordinator._ensure_kvduo_hot_workset.call_args.kwargs[
+                "requested_capacities"
+            ],
+            {0: 8},
+        )
+        self.assertTrue(torch.all(coordinator.kvduo_resolver_stats == 0))
+
+        coordinator.kvduo_req_hot_capacity.zero_()
+        with self.assertRaisesRegex(RuntimeError, "mandatory 2K"):
+            coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
 
     def test_reclaims_only_dedicated_physical_shortfall(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
