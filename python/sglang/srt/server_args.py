@@ -2692,7 +2692,12 @@ class ServerArgs:
     ] = False
     kvduo_config: A[
         Optional[str],
-        Arg(help='A JSON object for KVDuo. Example: \'{"top_k": 2048, "N": 2}\''),
+        Arg(
+            help=(
+                "A JSON object for KVDuo. Example: "
+                '\'{"top_k": 2048, "tail_protected_pages": 2}\''
+            )
+        ),
         NS("memory"),
     ] = None
 

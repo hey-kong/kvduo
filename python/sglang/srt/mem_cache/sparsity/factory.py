@@ -23,6 +23,7 @@ DEFAULT_TOP_K = 2048
 DEFAULT_DEVICE_BUFFER_SIZE = 4096
 DEFAULT_HOST_TO_DEVICE_RATIO = 2
 DEFAULT_SWAP_IN_BLOCK_SIZE = 960
+DEFAULT_TAIL_PROTECTED_PAGES = 2
 
 _global_sparse_coordinator: Optional[SparseCoordinator] = None
 
@@ -144,18 +145,15 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         "host_to_device_ratio",
         "swap_in_block_size",
         "tail_protected_pages",
-        "N",
     }
     unknown = set(values) - known
     if unknown:
         raise ValueError(f"Unknown kvduo_config field(s): {sorted(unknown)}")
-    if "N" in values and "tail_protected_pages" in values:
-        raise ValueError("Specify only one of N and tail_protected_pages")
 
     top_k = values.get("top_k", DEFAULT_TOP_K)
     ratio = values.get("host_to_device_ratio", DEFAULT_HOST_TO_DEVICE_RATIO)
     block_size = values.get("swap_in_block_size", DEFAULT_SWAP_IN_BLOCK_SIZE)
-    tail_pages = values.get("tail_protected_pages", values.get("N", 2))
+    tail_pages = values.get("tail_protected_pages", DEFAULT_TAIL_PROTECTED_PAGES)
     fields = {
         "top_k": top_k,
         "host_to_device_ratio": ratio,
