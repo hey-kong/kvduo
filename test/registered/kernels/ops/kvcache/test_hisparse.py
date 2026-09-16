@@ -57,7 +57,9 @@ def test_mla_ffi_arguments_do_not_include_tensors(monkeypatch) -> None:
             self.args = args
 
     module = FakeModule()
-    monkeypatch.setattr(hisparse_ops, "_jit_sparse_module", lambda *args: module)
+    monkeypatch.setattr(
+        hisparse_ops, "_jit_sparse_module", lambda *args, **kwargs: module
+    )
 
     top_k_tokens = torch.zeros((1, 1), dtype=torch.int32, device=DEVICE)
     load_cache_to_device_buffer_mla(
