@@ -115,7 +115,12 @@ def _load_cache_to_device_buffer_mla(
         is_dsv4_layout=is_dsv4_layout,
     )
 
-    empty = torch.empty(0)
+    # TVM FFI converts every TensorView argument before entering the wrapper,
+    # including placeholders for inputs that the selected MLA path does not
+    # use.  Keep those placeholders on the launch device: a CPU placeholder
+    # mixed into a CUDA-graph capture can fail conversion with "tensor does
+    # not have a device" before the kernel wrapper gets a chance to ignore it.
+    empty = torch.empty(0, device=top_k_tokens.device)
     enable_full_lookup = (
         req_to_logical_token is not None
         and full_to_device_loc is not None
