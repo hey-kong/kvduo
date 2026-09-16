@@ -115,11 +115,11 @@ def _load_cache_to_device_buffer_mla(
         is_dsv4_layout=is_dsv4_layout,
     )
 
-    # TVM FFI converts every TensorView argument before entering the wrapper,
-    # including placeholders for inputs that the selected MLA path does not
-    # use.  Use a device-backed scalar instead of a zero-element tensor: empty
-    # tensors have a null data pointer, so the Torch fallback cannot recover a
-    # CUDA device from them while a CUDA graph is being captured.
+    # TVM FFI converts every TensorView argument before entering the wrapper.
+    # Use a device-backed scalar for unused device tensors so that conversion
+    # can still recover their CUDA device during CUDA graph capture.  Host KV
+    # memory is passed separately as an integer pointer below; converting that
+    # CPU tensor through the Torch fallback during capture is not supported.
     placeholder = torch.empty((), device=top_k_tokens.device)
     enable_full_lookup = (
         req_to_logical_token is not None
@@ -185,8 +185,8 @@ def _load_cache_to_device_buffer_mla(
         device_buffer_tokens,
         host_cache_locs,
         device_buffer_locs,
-        host_cache,
-        placeholder,
+        host_cache.data_ptr(),
+        0,
         device_buffer,
         placeholder,
         top_k_device_locs,
