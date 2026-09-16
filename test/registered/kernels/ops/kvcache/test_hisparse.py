@@ -3,6 +3,7 @@ import sys
 import pytest
 import torch
 
+import sglang.kernels.ops.kvcache.hisparse as hisparse_ops
 from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
@@ -44,6 +45,44 @@ def _host_cache() -> torch.Tensor:
     )
     host_cache.copy_(torch.arange(host_cache.numel(), dtype=DTYPE).view_as(host_cache))
     return host_cache
+
+
+def test_mla_ffi_arguments_do_not_include_tensors(monkeypatch) -> None:
+    """CUDA graph capture must not ask TVM FFI to convert Torch tensors."""
+
+    class FakeModule:
+        args = None
+
+        def load_cache_to_device_buffer(self, *args) -> None:
+            self.args = args
+
+    module = FakeModule()
+    monkeypatch.setattr(
+        hisparse_ops, "_jit_sparse_module", lambda *args, **kwargs: module
+    )
+
+    top_k_tokens = torch.zeros((1, 1), dtype=torch.int32, device=DEVICE)
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=torch.zeros((1, 2), dtype=torch.int32, device=DEVICE),
+        host_cache_locs=torch.zeros((1, 1), dtype=torch.int64, device=DEVICE),
+        device_buffer_locs=torch.zeros((1, 2), dtype=torch.int32, device=DEVICE),
+        host_cache=_host_cache(),
+        device_buffer=torch.zeros((1, 1, KV_DIM), dtype=DTYPE, device=DEVICE),
+        top_k_device_locs=torch.zeros_like(top_k_tokens),
+        req_pool_indices=torch.zeros(1, dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.ones(1, dtype=torch.int32, device=DEVICE),
+        lru_slots=torch.zeros((1, 1), dtype=torch.int16, device=DEVICE),
+        item_size_bytes=ITEM_SIZE_BYTES,
+        num_top_k=1,
+        hot_buffer_size=1,
+        num_real_reqs=torch.ones(1, dtype=torch.int32, device=DEVICE),
+    )
+
+    assert module.args is not None
+    assert module.args[4] != 0
+    assert isinstance(module.args[4], int)
+    assert not any(isinstance(arg, torch.Tensor) for arg in module.args)
 
 
 def _dsv4_token_pattern(seed: int) -> tuple[torch.Tensor, torch.Tensor]:

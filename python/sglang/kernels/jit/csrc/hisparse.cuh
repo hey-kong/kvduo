@@ -641,45 +641,46 @@ __global__ void load_cache_to_device_buffer_kernel(
 
 template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsDsv4Layout>
 void load_cache_to_device_buffer(
-    tvm::ffi::TensorView top_k_tokens,
-    tvm::ffi::TensorView device_buffer_tokens,
-    tvm::ffi::TensorView host_cache_locs,
-    tvm::ffi::TensorView device_buffer_locs,
-    tvm::ffi::TensorView host_cache_k,
-    tvm::ffi::TensorView host_cache_v,
-    tvm::ffi::TensorView device_buffer_k,
-    tvm::ffi::TensorView device_buffer_v,
-    tvm::ffi::TensorView top_k_device_locs,
-    tvm::ffi::TensorView req_pool_indices,
-    tvm::ffi::TensorView seq_lens,
-    tvm::ffi::TensorView lru_slots,
-    tvm::ffi::TensorView num_real_reqs,
-    tvm::ffi::TensorView req_hot_buffer_sizes,
-    tvm::ffi::TensorView hot_page_last_touch,
-    tvm::ffi::TensorView req_to_logical_token,
-    tvm::ffi::TensorView full_to_device_loc,
-    tvm::ffi::TensorView full_last_touch,
-    tvm::ffi::TensorView full_data_version,
-    tvm::ffi::TensorView full_host_version,
-    tvm::ffi::TensorView swap_status,
-    tvm::ffi::TensorView resolver_stats,
-    tvm::ffi::TensorView touch_clock,
+    uint64_t top_k_tokens_ptr,
+    uint64_t device_buffer_tokens_ptr,
+    uint64_t host_cache_locs_ptr,
+    uint64_t device_buffer_locs_ptr,
+    uint64_t host_cache_k_ptr,
+    uint64_t device_buffer_k_ptr,
+    uint64_t top_k_device_locs_ptr,
+    uint64_t req_pool_indices_ptr,
+    uint64_t seq_lens_ptr,
+    uint64_t lru_slots_ptr,
+    uint64_t num_real_reqs_ptr,
+    uint64_t req_hot_buffer_sizes_ptr,
+    uint64_t hot_page_last_touch_ptr,
+    uint64_t req_to_logical_token_ptr,
+    uint64_t full_to_device_loc_ptr,
+    uint64_t full_last_touch_ptr,
+    uint64_t full_data_version_ptr,
+    uint64_t full_host_version_ptr,
+    uint64_t swap_status_ptr,
+    uint64_t resolver_stats_ptr,
+    uint64_t touch_clock_ptr,
+    uint64_t stream_ptr,
+    int64_t bs,
+    int64_t host_stride,
+    int64_t buffer_stride_0,
+    int64_t lru_slot_stride_0,
+    int64_t hot_page_stride_0,
+    int64_t top_k_tokens_stride,
+    int64_t top_k_device_locs_stride,
+    int64_t req_to_logical_stride,
+    int64_t resolver_stats_stride,
+    bool seq_is_i64,
+    bool rpi_is_i64,
     bool enable_full_lookup,
     bool enable_dynamic_hot_view,
     int64_t page_size,
     int64_t item_size_bytes) {
   using namespace host;
 
-  const int64_t bs = top_k_tokens.shape()[0];
-  const int64_t host_stride = host_cache_locs.shape()[1];
-  const int64_t buffer_stride_0 = device_buffer_tokens.strides()[0];
-  const int64_t lru_slot_stride_0 = lru_slots.strides()[0];
-  const int64_t hot_page_stride_0 = enable_dynamic_hot_view ? hot_page_last_touch.strides()[0] : 0;
-  const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
-  const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
-  const int64_t req_to_logical_stride = enable_full_lookup ? req_to_logical_token.strides()[0] : 0;
-  const int64_t resolver_stats_stride = enable_full_lookup ? resolver_stats.strides()[0] : 0;
-  const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
+  const auto stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(stream_ptr));
 
   // Generic lambda: int32/int64 kernel variants are compiled for both
   // seq_lens and req_pool_indices; the correct combo is selected at runtime.
@@ -690,31 +691,31 @@ void load_cache_to_device_buffer(
       cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     }
 #endif
-    LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
+    LaunchKernel(bs, BLOCK_SIZE, stream, smem_bytes)(
         kernel_fn,
-        static_cast<const int32_t*>(top_k_tokens.data_ptr()),
-        static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
-        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
-        static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
-        host_cache_k.data_ptr(),
-        (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
-        device_buffer_k.data_ptr(),
-        (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
-        static_cast<int32_t*>(top_k_device_locs.data_ptr()),
+        reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(top_k_tokens_ptr)),
+        reinterpret_cast<int32_t*>(static_cast<uintptr_t>(device_buffer_tokens_ptr)),
+        reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(host_cache_locs_ptr)),
+        reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(device_buffer_locs_ptr)),
+        reinterpret_cast<const void*>(static_cast<uintptr_t>(host_cache_k_ptr)),
+        (const void*)nullptr,
+        reinterpret_cast<void*>(static_cast<uintptr_t>(device_buffer_k_ptr)),
+        (void*)nullptr,
+        reinterpret_cast<int32_t*>(static_cast<uintptr_t>(top_k_device_locs_ptr)),
         req_pool_indices_ptr,
         seq_lens_ptr,
-        static_cast<int16_t*>(lru_slots.data_ptr()),
-        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
-        enable_dynamic_hot_view ? static_cast<const int32_t*>(req_hot_buffer_sizes.data_ptr()) : nullptr,
-        enable_dynamic_hot_view ? static_cast<int64_t*>(hot_page_last_touch.data_ptr()) : nullptr,
-        enable_full_lookup ? static_cast<const int64_t*>(req_to_logical_token.data_ptr()) : nullptr,
-        enable_full_lookup ? static_cast<const int64_t*>(full_to_device_loc.data_ptr()) : nullptr,
-        enable_full_lookup ? static_cast<int64_t*>(full_last_touch.data_ptr()) : nullptr,
-        enable_full_lookup ? static_cast<const int64_t*>(full_data_version.data_ptr()) : nullptr,
-        enable_full_lookup ? static_cast<const int64_t*>(full_host_version.data_ptr()) : nullptr,
-        enable_full_lookup ? static_cast<int32_t*>(swap_status.data_ptr()) : nullptr,
-        enable_full_lookup ? static_cast<int32_t*>(resolver_stats.data_ptr()) : nullptr,
-        static_cast<const int64_t*>(touch_clock.data_ptr()),
+        reinterpret_cast<int16_t*>(static_cast<uintptr_t>(lru_slots_ptr)),
+        reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(num_real_reqs_ptr)),
+        reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(req_hot_buffer_sizes_ptr)),
+        reinterpret_cast<int64_t*>(static_cast<uintptr_t>(hot_page_last_touch_ptr)),
+        reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(req_to_logical_token_ptr)),
+        reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(full_to_device_loc_ptr)),
+        reinterpret_cast<int64_t*>(static_cast<uintptr_t>(full_last_touch_ptr)),
+        reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(full_data_version_ptr)),
+        reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(full_host_version_ptr)),
+        reinterpret_cast<int32_t*>(static_cast<uintptr_t>(swap_status_ptr)),
+        reinterpret_cast<int32_t*>(static_cast<uintptr_t>(resolver_stats_ptr)),
+        reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(touch_clock_ptr)),
         req_to_logical_stride,
         resolver_stats_stride,
         enable_full_lookup,
@@ -729,11 +730,6 @@ void load_cache_to_device_buffer(
         item_size_bytes);
   };
 
-  const auto seq_dtype = seq_lens.dtype();
-  const auto rpi_dtype = req_pool_indices.dtype();
-  const bool seq_is_i64 = (seq_dtype.code == kDLInt && seq_dtype.bits == 64);
-  const bool rpi_is_i64 = (rpi_dtype.code == kDLInt && rpi_dtype.bits == 64);
-
   if (seq_is_i64 && rpi_is_i64) {
     launch(
         load_cache_to_device_buffer_kernel<
@@ -744,8 +740,8 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             int64_t,
             int64_t>,
-        static_cast<const int64_t*>(seq_lens.data_ptr()),
-        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
+        reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
+        reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(req_pool_indices_ptr)));
   } else if (seq_is_i64 && !rpi_is_i64) {
     launch(
         load_cache_to_device_buffer_kernel<
@@ -756,8 +752,8 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             int64_t,
             int32_t>,
-        static_cast<const int64_t*>(seq_lens.data_ptr()),
-        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+        reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
+        reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(req_pool_indices_ptr)));
   } else if (!seq_is_i64 && rpi_is_i64) {
     launch(
         load_cache_to_device_buffer_kernel<
@@ -768,8 +764,8 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             int32_t,
             int64_t>,
-        static_cast<const int32_t*>(seq_lens.data_ptr()),
-        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
+        reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
+        reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(req_pool_indices_ptr)));
   } else {
     launch(
         load_cache_to_device_buffer_kernel<
@@ -780,8 +776,8 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             int32_t,
             int32_t>,
-        static_cast<const int32_t*>(seq_lens.data_ptr()),
-        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+        reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
+        reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(req_pool_indices_ptr)));
   }
 }
 

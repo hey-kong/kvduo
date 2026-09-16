@@ -102,9 +102,9 @@ def _load_cache_to_device_buffer_mla(
     resolver_stats: torch.Tensor | None = None,
     touch_clock: torch.Tensor | None = None,
 ) -> None:
-    assert (
-        hot_buffer_size >= num_top_k
-    ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    assert hot_buffer_size >= num_top_k, (
+        f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    )
 
     module = _jit_sparse_module(
         item_size_bytes,
@@ -115,12 +115,10 @@ def _load_cache_to_device_buffer_mla(
         is_dsv4_layout=is_dsv4_layout,
     )
 
-    # TVM FFI converts every TensorView argument before entering the wrapper,
-    # including placeholders for inputs that the selected MLA path does not
-    # use.  Keep those placeholders on the launch device: a CPU placeholder
-    # mixed into a CUDA-graph capture can fail conversion with "tensor does
-    # not have a device" before the kernel wrapper gets a chance to ignore it.
-    empty = torch.empty(0, device=top_k_tokens.device)
+    # Pass only scalars through TVM FFI.  Its PyTorch fallback can reject tensor
+    # arguments while CUDA graph capture is active, before the C++ wrapper is
+    # entered.  All allocations below outlive the captured graph, so passing
+    # their stable addresses is safe and also avoids allocations during capture.
     enable_full_lookup = (
         req_to_logical_token is not None
         and full_to_device_loc is not None
@@ -149,13 +147,6 @@ def _load_cache_to_device_buffer_mla(
         assert full_host_version.device == top_k_tokens.device
         assert swap_status.device == top_k_tokens.device
         assert resolver_stats.device == top_k_tokens.device
-    req_to_logical_token = req_to_logical_token if enable_full_lookup else empty
-    full_to_device_loc = full_to_device_loc if enable_full_lookup else empty
-    full_last_touch = full_last_touch if enable_full_lookup else empty
-    full_data_version = full_data_version if enable_full_lookup else empty
-    full_host_version = full_host_version if enable_full_lookup else empty
-    swap_status = swap_status if enable_full_lookup else empty
-    resolver_stats = resolver_stats if enable_full_lookup else empty
     if touch_clock is None:
         touch_clock = torch.zeros(1, dtype=torch.int64, device=top_k_tokens.device)
     assert touch_clock.dtype == torch.int64
@@ -173,33 +164,40 @@ def _load_cache_to_device_buffer_mla(
         assert req_hot_buffer_sizes.device == top_k_tokens.device
         assert hot_page_last_touch.dtype == torch.int64
         assert hot_page_last_touch.device == top_k_tokens.device
-    req_hot_buffer_sizes = req_hot_buffer_sizes if enable_dynamic_hot_view else empty
-    hot_page_last_touch = hot_page_last_touch if enable_dynamic_hot_view else empty
-
     module.load_cache_to_device_buffer(
-        top_k_tokens,
-        device_buffer_tokens,
-        host_cache_locs,
-        device_buffer_locs,
-        host_cache,
-        empty,
-        device_buffer,
-        empty,
-        top_k_device_locs,
-        req_pool_indices,
-        seq_lens,
-        lru_slots,
-        num_real_reqs,
-        req_hot_buffer_sizes,
-        hot_page_last_touch,
-        req_to_logical_token,
-        full_to_device_loc,
-        full_last_touch,
-        full_data_version,
-        full_host_version,
-        swap_status,
-        resolver_stats,
-        touch_clock,
+        top_k_tokens.data_ptr(),
+        device_buffer_tokens.data_ptr(),
+        host_cache_locs.data_ptr(),
+        device_buffer_locs.data_ptr(),
+        host_cache.data_ptr(),
+        device_buffer.data_ptr(),
+        top_k_device_locs.data_ptr(),
+        req_pool_indices.data_ptr(),
+        seq_lens.data_ptr(),
+        lru_slots.data_ptr(),
+        num_real_reqs.data_ptr(),
+        req_hot_buffer_sizes.data_ptr() if enable_dynamic_hot_view else 0,
+        hot_page_last_touch.data_ptr() if enable_dynamic_hot_view else 0,
+        req_to_logical_token.data_ptr() if enable_full_lookup else 0,
+        full_to_device_loc.data_ptr() if enable_full_lookup else 0,
+        full_last_touch.data_ptr() if enable_full_lookup else 0,
+        full_data_version.data_ptr() if enable_full_lookup else 0,
+        full_host_version.data_ptr() if enable_full_lookup else 0,
+        swap_status.data_ptr() if enable_full_lookup else 0,
+        resolver_stats.data_ptr() if enable_full_lookup else 0,
+        touch_clock.data_ptr(),
+        torch.cuda.current_stream(top_k_tokens.device).cuda_stream,
+        top_k_tokens.size(0),
+        host_cache_locs.size(1),
+        device_buffer_tokens.stride(0),
+        lru_slots.stride(0),
+        hot_page_last_touch.stride(0) if enable_dynamic_hot_view else 0,
+        top_k_tokens.stride(0),
+        top_k_device_locs.stride(0),
+        req_to_logical_token.stride(0) if enable_full_lookup else 0,
+        resolver_stats.stride(0) if enable_full_lookup else 0,
+        seq_lens.dtype == torch.int64,
+        req_pool_indices.dtype == torch.int64,
         enable_full_lookup,
         enable_dynamic_hot_view,
         page_size,
