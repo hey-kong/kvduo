@@ -552,8 +552,14 @@ def get_mhc_pre_token_count_representatives(
 ) -> Tuple[int, ...]:
     """One representative token count per distinct mhc_pre n_splits bucket over
     [1, max_num_tokens] (the kernel is specialized only by n_splits)."""
+    # ``chunked_prefill_size == -1`` means chunked prefill is disabled.  There
+    # is no bounded token range to prewarm in that mode, and passing the
+    # sentinel through ``min`` below would produce a negative tensor shape.
+    if max_num_tokens <= 0:
+        return ()
+
     reps = {}
-    for grid in range(1, (max(1, max_num_tokens) + 63) // 64 + 1):
+    for grid in range(1, (max_num_tokens + 63) // 64 + 1):
         num_tokens = min(grid * 64, max_num_tokens)
         reps[_compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)] = num_tokens
     return tuple(sorted(reps.values()))
