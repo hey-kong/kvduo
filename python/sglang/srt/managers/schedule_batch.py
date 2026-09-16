@@ -1228,7 +1228,16 @@ class Req(ReqDllmMixin):
         self.extend_range = Range(start, end)
 
     def get_fill_ids(self) -> array:
-        return self.full_untruncated_fill_ids[: self.extend_range.end]
+        # Prefix matching runs before the prefill adder establishes this
+        # round's extend range.  Consumers such as KVDuo still need the full
+        # prompt at that point, while later scheduling stages need the
+        # potentially chunk-truncated view.
+        end = (
+            self.extend_range.end
+            if self.extend_range is not None
+            else len(self.full_untruncated_fill_ids)
+        )
+        return self.full_untruncated_fill_ids[:end]
 
     def _refresh_fill_ids(self) -> None:
         """Keep full_untruncated_fill_ids == origin_input_ids + output_ids by
