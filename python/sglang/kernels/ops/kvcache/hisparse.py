@@ -99,6 +99,7 @@ def _load_cache_to_device_buffer_mla(
     full_data_version: torch.Tensor | None = None,
     full_host_version: torch.Tensor | None = None,
     swap_status: torch.Tensor | None = None,
+    resolver_stats: torch.Tensor | None = None,
     touch_clock: torch.Tensor | None = None,
 ) -> None:
     assert (
@@ -122,6 +123,7 @@ def _load_cache_to_device_buffer_mla(
         and full_data_version is not None
         and full_host_version is not None
         and swap_status is not None
+        and resolver_stats is not None
         and touch_clock is not None
     )
     if enable_full_lookup:
@@ -132,6 +134,8 @@ def _load_cache_to_device_buffer_mla(
         assert full_data_version.dtype == torch.int64
         assert full_host_version.dtype == torch.int64
         assert swap_status.dtype == torch.int32
+        assert resolver_stats.dtype == torch.int32
+        assert resolver_stats.ndim == 2 and resolver_stats.size(1) == 2
         assert req_to_logical_token.device == top_k_tokens.device
         assert full_to_device_loc.device == top_k_tokens.device
         assert full_last_touch.device == top_k_tokens.device
@@ -139,12 +143,14 @@ def _load_cache_to_device_buffer_mla(
         assert full_data_version.device == top_k_tokens.device
         assert full_host_version.device == top_k_tokens.device
         assert swap_status.device == top_k_tokens.device
+        assert resolver_stats.device == top_k_tokens.device
     req_to_logical_token = req_to_logical_token if enable_full_lookup else empty
     full_to_device_loc = full_to_device_loc if enable_full_lookup else empty
     full_last_touch = full_last_touch if enable_full_lookup else empty
     full_data_version = full_data_version if enable_full_lookup else empty
     full_host_version = full_host_version if enable_full_lookup else empty
     swap_status = swap_status if enable_full_lookup else empty
+    resolver_stats = resolver_stats if enable_full_lookup else empty
     if touch_clock is None:
         touch_clock = torch.zeros(1, dtype=torch.int64, device=top_k_tokens.device)
     assert touch_clock.dtype == torch.int64
@@ -187,6 +193,7 @@ def _load_cache_to_device_buffer_mla(
         full_data_version,
         full_host_version,
         swap_status,
+        resolver_stats,
         touch_clock,
         enable_full_lookup,
         enable_dynamic_hot_view,
@@ -220,6 +227,7 @@ def load_cache_to_device_buffer_mla(
     full_data_version: torch.Tensor | None = None,
     full_host_version: torch.Tensor | None = None,
     swap_status: torch.Tensor | None = None,
+    resolver_stats: torch.Tensor | None = None,
     touch_clock: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
@@ -249,6 +257,7 @@ def load_cache_to_device_buffer_mla(
         full_data_version=full_data_version,
         full_host_version=full_host_version,
         swap_status=swap_status,
+        resolver_stats=resolver_stats,
         touch_clock=touch_clock,
     )
 
@@ -278,6 +287,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     full_data_version: torch.Tensor | None = None,
     full_host_version: torch.Tensor | None = None,
     swap_status: torch.Tensor | None = None,
+    resolver_stats: torch.Tensor | None = None,
     touch_clock: torch.Tensor | None = None,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
@@ -307,5 +317,6 @@ def load_cache_to_device_buffer_dsv4_mla(
         full_data_version=full_data_version,
         full_host_version=full_host_version,
         swap_status=swap_status,
+        resolver_stats=resolver_stats,
         touch_clock=touch_clock,
     )

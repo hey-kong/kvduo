@@ -212,8 +212,10 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int64_t* __restrict__ full_data_version,
     const int64_t* __restrict__ full_host_version,
     int32_t* __restrict__ swap_status,
+    int32_t* __restrict__ resolver_stats,
     const int64_t* __restrict__ touch_clock,
     int64_t req_to_logical_stride,
+    int64_t resolver_stats_stride,
     bool enable_full_lookup,
     bool enable_dynamic_hot_view,
     int64_t buffer_stride_0,
@@ -544,6 +546,14 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   if (tid == 0) {
     s_total_misses = total_misses;
+    if (enable_full_lookup) {
+      // Fixed-address counters are consumed and reset by the control plane
+      // between replays. Column 0 is host misses; column 1 is valid accesses.
+      atomicAdd(&resolver_stats[rid * resolver_stats_stride], total_misses);
+      atomicAdd(
+          &resolver_stats[rid * resolver_stats_stride + 1],
+          total_misses + s_total_hits + s_full_hits + s_newest_hit);
+    }
   }
   __syncthreads();
   total_misses = s_total_misses;
@@ -652,6 +662,7 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView full_data_version,
     tvm::ffi::TensorView full_host_version,
     tvm::ffi::TensorView swap_status,
+    tvm::ffi::TensorView resolver_stats,
     tvm::ffi::TensorView touch_clock,
     bool enable_full_lookup,
     bool enable_dynamic_hot_view,
@@ -667,6 +678,7 @@ void load_cache_to_device_buffer(
   const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
   const int64_t req_to_logical_stride = enable_full_lookup ? req_to_logical_token.strides()[0] : 0;
+  const int64_t resolver_stats_stride = enable_full_lookup ? resolver_stats.strides()[0] : 0;
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
 
   // Generic lambda: int32/int64 kernel variants are compiled for both
@@ -701,8 +713,10 @@ void load_cache_to_device_buffer(
         enable_full_lookup ? static_cast<const int64_t*>(full_data_version.data_ptr()) : nullptr,
         enable_full_lookup ? static_cast<const int64_t*>(full_host_version.data_ptr()) : nullptr,
         enable_full_lookup ? static_cast<int32_t*>(swap_status.data_ptr()) : nullptr,
+        enable_full_lookup ? static_cast<int32_t*>(resolver_stats.data_ptr()) : nullptr,
         static_cast<const int64_t*>(touch_clock.data_ptr()),
         req_to_logical_stride,
+        resolver_stats_stride,
         enable_full_lookup,
         enable_dynamic_hot_view,
         buffer_stride_0,

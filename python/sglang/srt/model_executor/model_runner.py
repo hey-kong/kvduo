@@ -1331,7 +1331,12 @@ class ModelRunner:
 
         # Hisparse coordinator — backends now read it from self.model_runner.
         if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+            coordinator = self.hisparse_coordinator
+            coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+            if coordinator.enable_mixed_residency:
+                coordinator.prepare_kvduo_graph_replay(
+                    forward_batch.req_pool_indices[: forward_batch.batch_size]
+                )
 
     def _pp_kwargs(self, pp_proxy_tensors) -> dict:
         """Build the pp_proxy_tensors forward kwarg, in one place.

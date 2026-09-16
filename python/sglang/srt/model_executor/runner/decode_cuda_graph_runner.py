@@ -1174,7 +1174,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._ragged_graph_size = graph_size_key
 
         if self.model_runner.hisparse_coordinator is not None:
-            self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
+            coordinator = self.model_runner.hisparse_coordinator
+            coordinator.num_real_reqs.fill_(raw_bs)
+            if coordinator.enable_mixed_residency:
+                coordinator.prepare_kvduo_graph_replay(
+                    buffers.req_pool_indices[:raw_bs]
+                )
 
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
