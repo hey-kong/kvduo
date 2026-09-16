@@ -1339,12 +1339,35 @@ class HiSparseCoordinator:
             if self._mixed_slots[req_idx]
         )
 
+        initial_mixed = {
+            req_idx for req_idx in requested if self._mixed_slots[req_idx]
+        }
+        optional_growth = {
+            (layer_id, req_idx): min(
+                int(self.kvduo_req_hot_capacity[layer_id, req_idx]) * 2,
+                16 * self.top_k,
+            )
+            for req_idx in initial_mixed
+            for layer_id in range(self.mem_pool_device.layer_num)
+            if int(self.kvduo_req_hot_capacity[layer_id, req_idx]) > 0
+            and int(stats_cpu[layer_id, req_idx, 0]) > 0
+        }
+
         # Pressure reclamation can demote another active request. Iterate to a
-        # fixed point so every mixed request has 2K in every storage group.
+        # capacity fixed point so every mixed request has 2K in every storage
+        # group. Historical optional growth is consumed on the first pass only.
+        pending = initial_mixed
         while True:
-            mixed = sorted(req_idx for req_idx in requested if self._mixed_slots[req_idx])
+            mixed = sorted(pending)
             if not mixed:
                 return
+            before = {
+                (layer_id, req_idx): int(
+                    self.kvduo_req_hot_capacity[layer_id, req_idx]
+                )
+                for req_idx in mixed
+                for layer_id in range(self.mem_pool_device.layer_num)
+            }
             mixed_gpu = torch.tensor(mixed, dtype=torch.int64, device=self.device)
             empty_selection = torch.full(
                 (len(mixed), self.top_k), -1, dtype=torch.int32, device=self.device
@@ -1355,8 +1378,8 @@ class HiSparseCoordinator:
                     current = int(self.kvduo_req_hot_capacity[layer_id, req_idx])
                     if current == 0:
                         targets[req_idx] = 2 * self.top_k
-                    elif int(stats_cpu[layer_id, req_idx, 0]) > 0:
-                        targets[req_idx] = min(current * 2, 16 * self.top_k)
+                    elif (layer_id, req_idx) in optional_growth:
+                        targets[req_idx] = optional_growth[layer_id, req_idx]
                 self._ensure_kvduo_hot_workset(
                     mixed_gpu,
                     empty_selection,
@@ -1364,14 +1387,34 @@ class HiSparseCoordinator:
                     allocate_mixed_minimum=True,
                     requested_capacities=targets,
                 )
-            newly_mixed = {
+            optional_growth.clear()
+            requested.update(
                 req_idx
                 for req_idx in self._active_kvduo_reqs
                 if self._mixed_slots[req_idx]
+            )
+            pending = {
+                req_idx
+                for req_idx in requested
+                if self._mixed_slots[req_idx]
+                and any(
+                    int(self.kvduo_req_hot_capacity[layer_id, req_idx])
+                    < 2 * self.top_k
+                    for layer_id in range(self.mem_pool_device.layer_num)
+                )
             }
-            if newly_mixed.issubset(requested):
+            if not pending:
                 break
-            requested.update(newly_mixed)
+            made_progress = any(
+                int(self.kvduo_req_hot_capacity[layer_id, req_idx])
+                > before.get((layer_id, req_idx), -1)
+                for req_idx in pending
+                for layer_id in range(self.mem_pool_device.layer_num)
+            )
+            if not made_progress:
+                raise RuntimeError(
+                    "KVDuo mixed request lacks mandatory 2K capacity before replay"
+                )
 
         for req_idx in requested:
             if not self._mixed_slots[req_idx]:
