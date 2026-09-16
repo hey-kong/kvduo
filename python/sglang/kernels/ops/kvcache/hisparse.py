@@ -102,9 +102,9 @@ def _load_cache_to_device_buffer_mla(
     resolver_stats: torch.Tensor | None = None,
     touch_clock: torch.Tensor | None = None,
 ) -> None:
-    assert (
-        hot_buffer_size >= num_top_k
-    ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    assert hot_buffer_size >= num_top_k, (
+        f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    )
 
     module = _jit_sparse_module(
         item_size_bytes,
@@ -117,10 +117,10 @@ def _load_cache_to_device_buffer_mla(
 
     # TVM FFI converts every TensorView argument before entering the wrapper,
     # including placeholders for inputs that the selected MLA path does not
-    # use.  Keep those placeholders on the launch device: a CPU placeholder
-    # mixed into a CUDA-graph capture can fail conversion with "tensor does
-    # not have a device" before the kernel wrapper gets a chance to ignore it.
-    empty = torch.empty(0, device=top_k_tokens.device)
+    # use.  Use a device-backed scalar instead of a zero-element tensor: empty
+    # tensors have a null data pointer, so the Torch fallback cannot recover a
+    # CUDA device from them while a CUDA graph is being captured.
+    placeholder = torch.empty((), device=top_k_tokens.device)
     enable_full_lookup = (
         req_to_logical_token is not None
         and full_to_device_loc is not None
@@ -149,13 +149,13 @@ def _load_cache_to_device_buffer_mla(
         assert full_host_version.device == top_k_tokens.device
         assert swap_status.device == top_k_tokens.device
         assert resolver_stats.device == top_k_tokens.device
-    req_to_logical_token = req_to_logical_token if enable_full_lookup else empty
-    full_to_device_loc = full_to_device_loc if enable_full_lookup else empty
-    full_last_touch = full_last_touch if enable_full_lookup else empty
-    full_data_version = full_data_version if enable_full_lookup else empty
-    full_host_version = full_host_version if enable_full_lookup else empty
-    swap_status = swap_status if enable_full_lookup else empty
-    resolver_stats = resolver_stats if enable_full_lookup else empty
+    req_to_logical_token = req_to_logical_token if enable_full_lookup else placeholder
+    full_to_device_loc = full_to_device_loc if enable_full_lookup else placeholder
+    full_last_touch = full_last_touch if enable_full_lookup else placeholder
+    full_data_version = full_data_version if enable_full_lookup else placeholder
+    full_host_version = full_host_version if enable_full_lookup else placeholder
+    swap_status = swap_status if enable_full_lookup else placeholder
+    resolver_stats = resolver_stats if enable_full_lookup else placeholder
     if touch_clock is None:
         touch_clock = torch.zeros(1, dtype=torch.int64, device=top_k_tokens.device)
     assert touch_clock.dtype == torch.int64
@@ -173,8 +173,12 @@ def _load_cache_to_device_buffer_mla(
         assert req_hot_buffer_sizes.device == top_k_tokens.device
         assert hot_page_last_touch.dtype == torch.int64
         assert hot_page_last_touch.device == top_k_tokens.device
-    req_hot_buffer_sizes = req_hot_buffer_sizes if enable_dynamic_hot_view else empty
-    hot_page_last_touch = hot_page_last_touch if enable_dynamic_hot_view else empty
+    req_hot_buffer_sizes = (
+        req_hot_buffer_sizes if enable_dynamic_hot_view else placeholder
+    )
+    hot_page_last_touch = (
+        hot_page_last_touch if enable_dynamic_hot_view else placeholder
+    )
 
     module.load_cache_to_device_buffer(
         top_k_tokens,
@@ -182,9 +186,9 @@ def _load_cache_to_device_buffer_mla(
         host_cache_locs,
         device_buffer_locs,
         host_cache,
-        empty,
+        placeholder,
         device_buffer,
-        empty,
+        placeholder,
         top_k_device_locs,
         req_pool_indices,
         seq_lens,
