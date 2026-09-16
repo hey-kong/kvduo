@@ -410,9 +410,9 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert (
-                self.support_pp
-            ), "Pipeline Parallel is not compatible with this model."
+            assert self.support_pp, (
+                "Pipeline Parallel is not compatible with this model."
+            )
 
         # For weight updates
         self.init_weight_updater()
@@ -1335,7 +1335,12 @@ class ModelRunner:
             coordinator.num_real_reqs.fill_(forward_batch.batch_size)
             if coordinator.enable_mixed_residency:
                 coordinator.prepare_kvduo_graph_replay(
-                    forward_batch.req_pool_indices[: forward_batch.batch_size]
+                    forward_batch.req_pool_indices[: forward_batch.batch_size],
+                    (
+                        forward_batch.req_pool_indices_cpu[: forward_batch.batch_size]
+                        if forward_batch.req_pool_indices_cpu is not None
+                        else None
+                    ),
                 )
 
     def _pp_kwargs(self, pp_proxy_tensors) -> dict:

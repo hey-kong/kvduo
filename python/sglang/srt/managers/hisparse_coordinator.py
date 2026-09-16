@@ -1,7 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import List, NamedTuple, Union
+from typing import List, NamedTuple, Sequence, Union
 
 import torch
 
@@ -38,12 +38,15 @@ from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
     plan_kvduo_prefix_restore,
 )
 from sglang.srt.utils import get_device_module, is_hip
+from sglang.srt.utils.common import is_pin_memory_available
 
 device_module = get_device_module()
 
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
+
+KVDUO_STATS_POLL_INTERVAL = 8
 
 
 class HiSparseAct(NamedTuple):
@@ -217,6 +220,22 @@ class HiSparseCoordinator:
                 dtype=torch.int32,
                 device=device,
             )
+            # Growth is opportunistic: the current 2K-or-larger workset can
+            # always resolve misses through entry-LRU. Poll cumulative counters
+            # only every few replays and stage them asynchronously so the CPU
+            # never blocks the next replay merely to decide optional growth.
+            self.kvduo_stats_poll_interval = KVDUO_STATS_POLL_INTERVAL
+            self._kvduo_replay_count = 0
+            self._kvduo_stats_host = torch.empty(
+                self.kvduo_resolver_stats.shape,
+                dtype=self.kvduo_resolver_stats.dtype,
+                device="cpu",
+                pin_memory=is_pin_memory_available(device),
+            )
+            self._kvduo_stats_stream = device_module.Stream()
+            self._kvduo_stats_event = device_module.Event()
+            self._kvduo_stats_pending = False
+            self._kvduo_stats_pending_owners = {}
             self._active_kvduo_reqs = {}
             self._kvduo_host_valid_len = [0] * max_num_req_slots
             self._pending_kvduo_host_valid = []
@@ -349,6 +368,8 @@ class HiSparseCoordinator:
         # See HostKVCache.destroy for why the explicit unregister matters.
         self.write_staging_stream.synchronize()
         self.decode_backup_stream.synchronize()
+        if self.enable_mixed_residency:
+            self._kvduo_stats_stream.synchronize()
         self.mem_pool_host.destroy()
 
     def get_token_stats(self) -> HiSparseTokenStats:
@@ -946,6 +967,7 @@ class HiSparseCoordinator:
             self.req_device_buffer_size_gpu[req.req_pool_idx] = 0
             self.kvduo_req_hot_capacity[:, req.req_pool_idx] = 0
             self.kvduo_req_hot_capacity_gpu[:, req.req_pool_idx] = 0
+            self.kvduo_resolver_stats[:, req.req_pool_idx, :] = 0
             self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
             self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
             return
@@ -1316,7 +1338,39 @@ class HiSparseCoordinator:
             # before their addresses and invalid tags are initialized.
             self.kvduo_req_hot_capacity_gpu[layer_id, req_idx] = target
 
-    def prepare_kvduo_graph_replay(self, req_pool_indices: torch.Tensor) -> None:
+    def _consume_kvduo_stats_snapshot(self):
+        """Return a completed asynchronous statistics snapshot, if available."""
+        if not self._kvduo_stats_pending or not self._kvduo_stats_event.query():
+            return None, None
+        self._kvduo_stats_pending = False
+        owners = self._kvduo_stats_pending_owners
+        self._kvduo_stats_pending_owners = {}
+        return self._kvduo_stats_host, owners
+
+    def _schedule_kvduo_stats_snapshot(self) -> None:
+        """Stage cumulative resolver counters without blocking the CPU.
+
+        Copy and reset are ordered on a side stream. The current stream waits on
+        that stream before replay, preventing the captured resolver from racing
+        the single statistics bank while leaving the host free to continue.
+        """
+        self._kvduo_stats_pending_owners = {
+            req_idx: req for req_idx, req in self._active_kvduo_reqs.items()
+        }
+        with device_module.stream(self._kvduo_stats_stream):
+            if self.decode_producer_stream is not None:
+                self._kvduo_stats_stream.wait_stream(self.decode_producer_stream)
+            self._kvduo_stats_host.copy_(self.kvduo_resolver_stats, non_blocking=True)
+            self.kvduo_resolver_stats.zero_()
+            self._kvduo_stats_event.record()
+        device_module.current_stream().wait_stream(self._kvduo_stats_stream)
+        self._kvduo_stats_pending = True
+
+    def prepare_kvduo_graph_replay(
+        self,
+        req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: Sequence[int] | torch.Tensor | None = None,
+    ) -> None:
         """Perform physical capacity management at the graph replay boundary.
 
         This is intentionally host-side and must run only after the preceding
@@ -1328,20 +1382,40 @@ class HiSparseCoordinator:
             return
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
-        # One synchronization transfers the previous period's fixed counters.
-        # Resetting the same tensor preserves its address across every replay.
-        stats_cpu = self.kvduo_resolver_stats.cpu()
-        self.kvduo_resolver_stats.zero_()
-        requested = set(req_pool_indices.to(device="cpu", dtype=torch.int64).tolist())
+        # Unit tests construct a minimal coordinator with ``__new__``. Keep that
+        # path synchronous while production GPU coordinators use the pre-created
+        # pinned snapshot and side stream.
+        if not hasattr(self, "_kvduo_replay_count"):
+            self.kvduo_stats_poll_interval = KVDUO_STATS_POLL_INTERVAL
+            self._kvduo_replay_count = 0
+        self._kvduo_replay_count += 1
+        poll_due = self._kvduo_replay_count % self.kvduo_stats_poll_interval == 0
+        if self.kvduo_resolver_stats.device.type == "cpu":
+            stats_cpu = None
+            stats_owners = None
+            if poll_due:
+                stats_cpu = self.kvduo_resolver_stats.clone()
+                self.kvduo_resolver_stats.zero_()
+                stats_owners = dict(self._active_kvduo_reqs)
+        else:
+            stats_cpu, stats_owners = self._consume_kvduo_stats_snapshot()
+            if poll_due and not self._kvduo_stats_pending and stats_cpu is None:
+                self._schedule_kvduo_stats_snapshot()
+
+        if req_pool_indices_cpu is None:
+            # Compatibility fallback for direct/unit-test callers. Runtime paths
+            # pass ScheduleBatch's existing CPU mirror and avoid this D2H read.
+            req_pool_indices_cpu = req_pool_indices.to(device="cpu", dtype=torch.int64)
+        requested = set(
+            req_pool_indices_cpu.tolist()
+            if isinstance(req_pool_indices_cpu, torch.Tensor)
+            else req_pool_indices_cpu
+        )
         requested.update(
-            req_idx
-            for req_idx in self._active_kvduo_reqs
-            if self._mixed_slots[req_idx]
+            req_idx for req_idx in self._active_kvduo_reqs if self._mixed_slots[req_idx]
         )
 
-        initial_mixed = {
-            req_idx for req_idx in requested if self._mixed_slots[req_idx]
-        }
+        initial_mixed = {req_idx for req_idx in requested if self._mixed_slots[req_idx]}
         optional_growth = {
             (layer_id, req_idx): min(
                 int(self.kvduo_req_hot_capacity[layer_id, req_idx]) * 2,
@@ -1349,7 +1423,9 @@ class HiSparseCoordinator:
             )
             for req_idx in initial_mixed
             for layer_id in range(self.mem_pool_device.layer_num)
-            if int(self.kvduo_req_hot_capacity[layer_id, req_idx]) > 0
+            if stats_cpu is not None
+            and stats_owners.get(req_idx) is self._active_kvduo_reqs.get(req_idx)
+            and int(self.kvduo_req_hot_capacity[layer_id, req_idx]) > 0
             and int(stats_cpu[layer_id, req_idx, 0]) > 0
         }
 
@@ -1362,9 +1438,7 @@ class HiSparseCoordinator:
             if not mixed:
                 return
             before = {
-                (layer_id, req_idx): int(
-                    self.kvduo_req_hot_capacity[layer_id, req_idx]
-                )
+                (layer_id, req_idx): int(self.kvduo_req_hot_capacity[layer_id, req_idx])
                 for req_idx in mixed
                 for layer_id in range(self.mem_pool_device.layer_num)
             }
@@ -1398,8 +1472,7 @@ class HiSparseCoordinator:
                 for req_idx in requested
                 if self._mixed_slots[req_idx]
                 and any(
-                    int(self.kvduo_req_hot_capacity[layer_id, req_idx])
-                    < 2 * self.top_k
+                    int(self.kvduo_req_hot_capacity[layer_id, req_idx]) < 2 * self.top_k
                     for layer_id in range(self.mem_pool_device.layer_num)
                 )
             }
@@ -2049,6 +2122,7 @@ class HiSparseCoordinator:
             self.req_to_full_lookup[req.req_pool_idx, :] = -1
             self.req_reserved_logical[req.req_pool_idx] = -1
             self._kvduo_host_valid_len[req.req_pool_idx] = 0
+            self.kvduo_resolver_stats[:, req.req_pool_idx, :] = 0
         self._mixed_slots[req.req_pool_idx] = False
         if self.enable_mixed_residency:
             self._active_kvduo_reqs.pop(req.req_pool_idx, None)
@@ -2156,6 +2230,7 @@ class HiSparseCoordinator:
         self.req_device_buffer_size_gpu[req.req_pool_idx] = 0
         if self.enable_mixed_residency:
             self.hot_page_last_touch[:, req.req_pool_idx, :] = 0
+            self.kvduo_resolver_stats[:, req.req_pool_idx, :] = 0
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         if self.enable_mixed_residency:

@@ -483,6 +483,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_split_seq_index: Optional[int] = None
 
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
+    # CPU mirror of req_pool_indices. KVDuo consumes this at graph boundaries so
+    # capacity policy never has to read the request-slot vector back from GPU.
+    req_pool_indices_cpu: Optional[torch.Tensor] = None
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
 
@@ -794,6 +797,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             mm_inputs=batch.multimodal_inputs,
@@ -1355,9 +1359,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # branch handles decode rows padded to a 1-token extend.
                 if hybrid_ssm or self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
-                    assert (
-                        self.seq_lens.shape[0] == 0
-                    ), "extend-idle conversion expects an empty rank"
+                    assert self.seq_lens.shape[0] == 0, (
+                        "extend-idle conversion expects an empty rank"
+                    )
                     self.extend_num_tokens = num_tokens
                     self.extend_seq_lens = torch.tensor(
                         [num_tokens], dtype=torch.int32, device=dev
