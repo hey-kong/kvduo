@@ -256,16 +256,16 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.mem_pool_device = SimpleNamespace(layer_num=1)
         coordinator._active_kvduo_reqs = {0: object()}
         coordinator._mixed_slots = [True]
+        coordinator.kvduo_stats_poll_interval = 1
+        coordinator._kvduo_replay_count = 0
         coordinator.kvduo_resolver_stats = torch.tensor([[[3, 4]]], dtype=torch.int32)
         coordinator.kvduo_req_hot_capacity = torch.tensor([[4]], dtype=torch.int64)
-        coordinator._ensure_kvduo_hot_workset = MagicMock()
+        coordinator._ensure_kvduo_hot_capacity_targets = MagicMock(return_value=True)
 
         coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
 
         self.assertEqual(
-            coordinator._ensure_kvduo_hot_workset.call_args.kwargs[
-                "requested_capacities"
-            ],
+            coordinator._ensure_kvduo_hot_capacity_targets.call_args.args[1],
             {0: 8},
         )
         self.assertTrue(torch.all(coordinator.kvduo_resolver_stats == 0))
@@ -286,25 +286,63 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.mem_pool_device = SimpleNamespace(layer_num=1)
         coordinator._active_kvduo_reqs = {0: object(), 1: object()}
         coordinator._mixed_slots = [True, False]
+        coordinator.kvduo_stats_poll_interval = 1
+        coordinator._kvduo_replay_count = 0
         coordinator.kvduo_resolver_stats = torch.tensor(
             [[[1, 4], [0, 4]]], dtype=torch.int32
         )
         coordinator.kvduo_req_hot_capacity = torch.tensor([[4, 0]], dtype=torch.int64)
         targets = []
 
-        def allocate(_, __, ___, *, requested_capacities, **kwargs):
+        def allocate(_, requested_capacities):
             targets.append(dict(requested_capacities))
             if len(targets) == 1:
                 coordinator._mixed_slots[1] = True
             else:
                 coordinator.kvduo_req_hot_capacity[0, 1] = 4
+            return True
 
-        coordinator._ensure_kvduo_hot_workset = MagicMock(side_effect=allocate)
+        coordinator._ensure_kvduo_hot_capacity_targets = MagicMock(side_effect=allocate)
 
         coordinator.prepare_kvduo_graph_replay(torch.tensor([0, 1]))
 
         self.assertEqual(targets, [{0: 8}, {1: 4}])
         self.assertEqual(int(coordinator.kvduo_req_hot_capacity[0, 1]), 4)
+
+    def test_graph_prepare_polls_growth_every_eight_replays(self):
+        """Miss statistics accumulate without affecting mandatory worksets."""
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.enable_mixed_residency = True
+        coordinator.decode_producer_stream = None
+        coordinator.device = "cpu"
+        coordinator.top_k = 2
+        coordinator.mem_pool_device = SimpleNamespace(layer_num=1)
+        owner = object()
+        coordinator._active_kvduo_reqs = {0: owner}
+        coordinator._mixed_slots = [True]
+        coordinator.kvduo_stats_poll_interval = 8
+        coordinator._kvduo_replay_count = 0
+        coordinator.kvduo_resolver_stats = torch.tensor([[[3, 4]]], dtype=torch.int32)
+        coordinator.kvduo_req_hot_capacity = torch.tensor([[4]], dtype=torch.int64)
+        coordinator._ensure_kvduo_hot_capacity_targets = MagicMock(return_value=True)
+
+        for _ in range(7):
+            coordinator.prepare_kvduo_graph_replay(
+                torch.tensor([99]), req_pool_indices_cpu=torch.tensor([0])
+            )
+        coordinator._ensure_kvduo_hot_capacity_targets.assert_not_called()
+        self.assertEqual(int(coordinator.kvduo_resolver_stats[0, 0, 0]), 3)
+
+        coordinator.prepare_kvduo_graph_replay(
+            torch.tensor([99]), req_pool_indices_cpu=torch.tensor([0])
+        )
+        self.assertEqual(
+            coordinator._ensure_kvduo_hot_capacity_targets.call_args.args[1],
+            {0: 8},
+        )
+        self.assertTrue(torch.all(coordinator.kvduo_resolver_stats == 0))
 
     def test_reclaims_only_dedicated_physical_shortfall(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
