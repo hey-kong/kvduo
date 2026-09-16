@@ -28,6 +28,10 @@ def _jit_sparse_module(
     )
     return load_jit(
         "sparse_cache",
+        # The FFI signature passes host caches as integer addresses.  Keep an
+        # explicit ABI tag in the cache key so an older TensorView wrapper can
+        # never be loaded after an editable-source update.
+        "host_ptr_abi_v1",
         *cache_args,
         cuda_files=["hisparse.cuh"],
         cuda_wrappers=[
