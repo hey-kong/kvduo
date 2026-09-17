@@ -2839,7 +2839,7 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
-        if self.enable_kvduo:
+        if get_memory().enable_kvduo:
             # Keep completed chunks request-owned until KVDuo performs its single
             # prefill-to-decode residency transition.  Publishing them to
             # RadixTree here would advance cache_protected_len and leave no
