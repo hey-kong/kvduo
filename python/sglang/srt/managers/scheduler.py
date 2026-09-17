@@ -2839,6 +2839,17 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
+        if get_memory().enable_kvduo:
+            # Keep completed chunks request-owned until KVDuo performs its single
+            # prefill-to-decode residency transition.  Publishing them to
+            # RadixTree here would advance cache_protected_len and leave no
+            # request-owned pages for the final demotion decision.  Advancing
+            # prefix_indices is still required so the prefill adder starts the
+            # next chunk at extend_range.end instead of recomputing old chunks.
+            req.prefix_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : req.extend_range.end
+            ].to(dtype=torch.int64, copy=True)
+            return
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
     def process_pending_chunked_abort(self) -> None:
