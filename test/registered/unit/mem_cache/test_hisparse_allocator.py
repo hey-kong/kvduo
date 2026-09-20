@@ -16,6 +16,18 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
+    def test_exposes_wrapped_swa_suballocators(self):
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        full_allocator = object()
+        swa_allocator = object()
+        allocator.logical_attn_allocator = SimpleNamespace(
+            full_attn_allocator=full_allocator,
+            swa_attn_allocator=swa_allocator,
+        )
+
+        self.assertIs(allocator.full_attn_allocator, full_allocator)
+        self.assertIs(allocator.swa_attn_allocator, swa_allocator)
+
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
         logical_allocator = MagicMock(spec=["alloc_extend_swa_tail"])

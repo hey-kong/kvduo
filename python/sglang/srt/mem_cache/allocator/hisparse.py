@@ -387,6 +387,16 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def full_to_swa_index_mapping(self):
         return self.logical_attn_allocator.full_to_swa_index_mapping
 
+    @property
+    def full_attn_allocator(self):
+        """Expose the wrapped full-attention allocator to cache components."""
+        return self.logical_attn_allocator.full_attn_allocator
+
+    @property
+    def swa_attn_allocator(self):
+        """Expose the wrapped sliding-window allocator to cache components."""
+        return self.logical_attn_allocator.swa_attn_allocator
+
     def debug_print(self) -> str:
         msg = self.logical_attn_allocator.debug_print()
         msg += (
