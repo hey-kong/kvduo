@@ -330,6 +330,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
+    def free_full(self, free_index: torch.Tensor):
+        """Free full-attention slots without touching their SWA counterparts."""
+        self.full_attn_allocator.free(free_index)
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:

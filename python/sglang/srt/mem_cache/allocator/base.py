@@ -109,6 +109,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free(self, free_index: torch.Tensor):
         raise NotImplementedError()
 
+    def free_full(self, free_index: torch.Tensor):
+        """Free slots owned by the full-attention cache component only."""
+        self.free(free_index)
+
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """Free ``kv_row[start_pos : start_pos + n]`` of one request (or a
         page-aligned copy); subclasses may use ``start_pos`` to skip the

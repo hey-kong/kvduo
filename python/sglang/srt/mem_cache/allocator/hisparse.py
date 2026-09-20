@@ -671,6 +671,13 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.free_compressed(compressed_indices)
 
+    def free_full(self, free_indices: torch.Tensor):
+        """Free full logical slots and their associated C4 physical slots."""
+        if free_indices.numel() == 0:
+            return
+        self.free_hisparse(free_indices)
+        self.logical_attn_allocator.free_full(free_indices)
+
     def clear(self):
         self.logical_attn_allocator.clear()
         self.hisparse_attn_allocator.clear()
