@@ -1,0 +1,209 @@
+---
+title: "KVDuo 设计与适用场景"
+description: "解释 --enable-kvduo 的混合 KV 驻留、内存回收、前缀复用，以及它与 vLLM Hybrid HiSparse 的区别。"
+---
+
+`--enable-kvduo` 是 SGLang 中面向原生稀疏注意力模型的混合 KV 驻留策略。它不会在请求进入 decode 时立即把全部稀疏 MLA KV 换到 CPU，而是让完整 KV 页在显存充足时继续驻留；只有主稀疏 KV 物理池出现分配压力时，才把已经有有效主机副本的冷页降级为 host-only，并按层为被选中的 top-k 条目按需分配 hot page。
+
+本文描述的是当前仓库中的实现，而不是传统 `--enable-hisparse` 的固定 device buffer 模式。KVDuo 会复用 HiSparse 的 host pool、稀疏选择和 CUDA resolver，但改变其显存驻留与回收策略。
+
+## 一句话结论
+
+KVDuo 适合**长上下文、高并发、decode 阶段主稀疏 KV 显存成为瓶颈**的服务：低压力时保留完整 GPU KV 的局部性，高压力时才以 CPU 容量和少量按需传输换取更高并发，并避免因整请求抢占而重新 prefill。
+
+它不一定改善短上下文或低并发下的单请求延迟；在这些场景中，完整 KV 本来就能驻留 GPU，host 备份和状态管理反而会增加额外工作。
+
+## 前提与当前限制
+
+- 模型必须具有运行时支持的原生稀疏 KV 选择路径，例如使用 DSA 稀疏 MLA 的模型或 DeepSeek V4。KVDuo 依赖模型先选出 top-k token；它不会把稠密注意力近似成稀疏注意力，因此不引入新的稀疏化精度损失。
+- 当前实现使用 HiSparse 的专用 KV pool 和 CUDA resolver；部署前应确认模型、attention backend、KV dtype 和 NVIDIA GPU 架构组合受支持。
+- 必须保留 RadixTree prefix cache，不能同时传 `--disable-radix-cache`。
+- 不能与 `--enable-hisparse`、`--enable-hierarchical-cache` 同时启用。KVDuo 自己管理 host backing store。
+- 当前不支持 speculative decoding。相比之下，vLLM 博文中的 Hybrid HiSparse 已支持通过可重放 resolver plan 组合 MTP。
+- `--kvduo-config` 只能与 `--enable-kvduo` 一起使用。
+- KVDuo 不要求关闭 chunked prefill。完成的 chunk 在最终提交前保持 request-owned，避免把尚未完成 KVDuo 状态转换的片段提前发布到 RadixTree。
+
+## 设计目标
+
+传统的两种做法各有明显代价：
+
+1. **整请求抢占**释放显存最彻底，但请求恢复时需要重新 prefill，重新支付 TTFT 和算力成本。
+2. **普通 KV offload**能保留 CPU 副本，但稠密注意力执行前仍需把完整历史搬回 GPU，活跃请求数仍容易受显存限制。
+3. **固定 buffer HiSparse**把完整历史留在 host、GPU 只保留固定 hot buffer，能给每请求 GPU KV 设置上界，但即使显存宽裕也会支付 top-k miss 的传输成本。
+
+KVDuo 的目标是在同一个物理稀疏 KV 池中同时容纳完整页和 hot page：先使用完整驻留，在确有压力时才逐页降级，并让请求在部分驻留状态下继续 decode。
+
+## 内存与状态模型
+
+### 三种驻留状态
+
+| 状态 | GPU 中的数据 | CPU 中的数据 | 何时出现 |
+| --- | --- | --- | --- |
+| 完整驻留 | 请求的完整稀疏 KV 页 | 已完成页的备份 | 显存尚未出现压力时 |
+| 混合驻留 | 未回收的完整页、受保护的尾页、按层 hot page | 已降级冷页及已备份历史 | 主稀疏 KV 池需要回收页时 |
+| host-only 前缀 | 当前请求尚未恢复该前缀的 GPU 完整页 | 可复用的完整前缀页 | RadixTree 的 GPU 命中之后仍存在有效 host 前缀时 |
+
+“完整驻留”和“混合驻留”可出现在同一批请求中。一个请求进入混合状态后，其地址表也可以同时包含：
+
+- 指向仍然完整驻留的真实页的地址；
+- host-only 位置的占位映射；
+- 指向 per-layer hot page 的地址。
+
+### 一个共享的物理页池
+
+完整页与 hot page 来自同一个主稀疏 KV 物理 allocator，也写入同一 KV tensor。回收的完整页可以被重新租给 decode 尾页，或成为某个 layer 的 hot page。这样稀疏 attention kernel 最终看到的仍是普通设备地址，不需要维护第二套独立 KV tensor。
+
+KVDuo 只接管**主稀疏 KV 的物理压力**。逻辑 token slot、SWA、indexer KV 和 compression state 仍由各自的 admission/allocator 路径管理，避免把其他资源短缺误判为可通过回收主 KV 页解决的问题。
+
+### Host backing store 和版本
+
+Prefill staging 会建立完整 host 副本；decode 中，当一个页被新尾页封口后，KVDuo 在独立 stream 上把该页异步备份到 host。页只有在以下条件都成立时才可降级：
+
+- 页属于请求可回收的完整页范围；
+- 不属于配置保护的最新尾页；
+- host 副本已经完成且版本与 GPU 数据版本一致；
+- 页没有被当前分配或 resolver 操作保护。
+
+实现同时跟踪 generation、data version 和 host version，防止异步 DMA 完成后把旧副本误认为当前数据。触碰时间用于页级 LRU；回收发生时，KVDuo 优先释放最冷的合法完整页，完整页不足后才考虑缩减可回收的 hot page。
+
+## 请求生命周期
+
+### 1. Prefill 与前缀匹配
+
+RadixTree 仍是 GPU 前缀的逻辑索引和锁定锚点。KVDuo 另外维护 host prefix cache：
+
+1. 先获得普通 RadixTree GPU prefix match。
+2. 再从命中末尾向后查找连续、版本有效的 host-only 完整页。
+3. 如果存在 host-only 后缀，在 prefill 执行前为它分配设备页并恢复完整 KV。
+4. 请求完成后，只有连续且有效的完整 host 页会转交给 host prefix cache；混合驻留造成的 GPU 空洞不会被错误发布为完整 RadixTree 前缀。
+
+因此，当前 KVDuo 的 host-only 前缀复用是“先恢复连续前缀，再执行 prefill”，不是在第一次稀疏 attention 时仅按 top-k 逐条恢复。
+
+### 2. 无压力的 decode
+
+请求开始 decode 时不预留 hot buffer，也不会为了进入 decode 主动降级完整页。新 token 继续写入正常完整页；封口页被异步备份。只要主稀疏 KV pool 有空间，resolver 直接返回完整驻留地址，避免不必要的 host-to-device copy。
+
+### 3. 压力触发的页级降级
+
+decode 即将申请新的物理页时，allocation guard 只检查主稀疏 KV pool。若空间不足，它会：
+
+1. 等待必要的在途备份到达安全边界；
+2. 排除 prefix-owned、当前操作保护和最新 `tail_protected_pages` 个尾页；
+3. 按页级 LRU 选择已有最新 host 副本的冷页；
+4. 清除这些逻辑位置的 full-page 设备映射并归还物理页；
+5. 标记受影响请求为混合驻留，然后重试分配。
+
+受保护尾页使连续写入和近期访问保持在 GPU 上。`tail_protected_pages` 不是 hot buffer 大小，而是禁止被页级回收的最新完整页数量。
+
+### 4. Fused resolver 与按需 hot page
+
+每层得到 top-k 逻辑位置后，一个 graph-capturable resolver kernel 对每个位置执行：
+
+1. **full hit**：完整页仍在 GPU，直接返回原位置并更新页触碰时间；
+2. **hot hit**：条目已在该层的 hot page，复用槽位并更新 entry/page LRU；
+3. **host miss**：从 pinned host memory 拷贝该层的一条 KV 到 LRU hot slot，再返回其设备位置。
+
+hot page 是**按 layer、按 request 按需分配**的。完整驻留请求的 hot capacity 为零；请求被降级为混合驻留后，系统会在下一次 graph replay 前为各层建立至少 `2 × top_k` 的初始工作集。resolver 以固定地址计数器记录 miss/有效访问；控制面每隔若干次 replay 异步抽样，在发生 miss 且内存允许时逐级扩展，最大元数据宽度为 `16 × top_k`。这个上限是 capture-stable 的地址表容量，不代表启动时预留同等大小的物理 KV。
+
+统计读取与可选扩容在 CUDA graph 外进行。即使扩容暂时失败，现有工作集仍可通过 entry LRU 处理 miss，不要求 decode 热路径等待一次 CPU 决策。
+
+## 能够优化什么
+
+### 1. 提高长上下文 decode 并发
+
+完整稀疏 KV 随上下文线性增长。进入混合驻留后，旧的冷页可释放，而活跃 GPU footprint 主要由未回收完整页、受保护尾页、indexer/SWA 等独立状态和动态 hot 工作集构成。上下文越长、并发越高，释放冷页带来的容量收益通常越明显。
+
+### 2. 减少抢占和重复 prefill
+
+内存压力由请求内部的冷页降级吸收，请求无需整体退出运行队列。相比丢弃整份 KV 后重新 prefill，它保留 host 数据并允许请求继续 decode，改善高负载下的尾延迟和有效吞吐。
+
+### 3. 避免低压力下过早 offload
+
+只要完整页仍有空间，attention 直接使用 GPU 原位置。KVDuo 因此不会像固定 device buffer 方案那样，从请求开始就把每次选中的历史条目都当作潜在 H2D miss。
+
+### 4. 保留前缀缓存价值
+
+GPU RadixTree 与 host prefix cache 共同工作。GPU 完整前缀继续走原有快速路径；已经降级但仍有一致 host 副本的连续前缀也可以复用，而不是必然重新计算。
+
+### 5. 在容量与传输之间动态取舍
+
+较小 hot 工作集提高可容纳的请求数，较大 hot 工作集降低重复 H2D miss。KVDuo 根据实际 resolver miss 逐层扩容，不要求所有请求、所有层固定使用同一个最坏情况 buffer。
+
+这些优化不保证所有负载都提升吞吐。实际收益取决于上下文长度、top-k 重用率、CPU 内存容量、PCIe/NVLink/NUMA 拓扑、请求长度分布，以及 indexer、SWA、workspace 或模型权重是否才是真正瓶颈。
+
+## 适用与不适用场景
+
+### 推荐评估
+
+- Agent、多轮对话、代码仓库分析等上下文持续增长的 workload；
+- decode 实例在高并发时因 KV pool 耗尽而频繁 retract/preempt；
+- 稀疏 MLA KV 占主要可回收显存，且 top-k 相对完整上下文很小；
+- 主机有足够 pinned memory，并能接受压力期的 H2D 流量；
+- 希望同一实例在低负载时保留 full-resident 快路径，在高负载时自动换容量。
+
+### 通常不推荐
+
+- 稠密注意力模型或没有受支持稀疏 selector/backend 的模型；
+- 短上下文、低并发，完整 KV 始终轻松放入 GPU；
+- CPU 内存不足、NUMA 配置不当或主机到 GPU 带宽已饱和；
+- 必须使用 speculative decoding、HiCache，或必须关闭 Radix cache 的部署；
+- 瓶颈来自权重、workspace、indexer KV、SWA 或计算，而不是主稀疏 KV 物理页。
+
+## 配置与启动
+
+在 NVIDIA CUDA 环境中，将 `MODEL_PATH` 替换为受支持的稀疏注意力模型：
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path MODEL_PATH \
+    --tp-size 8 \
+    --enable-kvduo \
+    --kvduo-config='{"top_k": 2048, "host_to_device_ratio": 2, "swap_in_block_size": 960, "tail_protected_pages": 2}'
+```
+
+| 参数 | 默认值 | 含义与调优方向 |
+| --- | ---: | --- |
+| `top_k` | `2048` | resolver 每层需要返回的条目数。模型配置中的 `index_topk` 若存在，会成为实际 top-k；应与模型稀疏选择语义一致。 |
+| `host_to_device_ratio` | `2` | host pool 相对 device pool 的逻辑容量比例。增大可保留更多历史/前缀，但会消耗更多主机内存。 |
+| `swap_in_block_size` | `960` | resolver CUDA thread block 大小，允许范围为 1–1024；它不是一次 H2D 搬运的 KV 条目数。 |
+| `tail_protected_pages` | `2` | 每请求禁止降级的最新完整页数，必须为正数。增大可保护近期局部性，但减少可回收页。 |
+
+`--enable-kvduo` 内部会启用共享 HiSparse pool/backend，并把 capture-stable `device_buffer_size` 元数据宽度设为 `16 × top_k`。不要再显式传 `--enable-hisparse` 或 `--hisparse-config`。所有 KVDuo 配置字段都必须是正整数，未知字段会直接报错。
+
+## 与 vLLM Hybrid HiSparse 的比较
+
+两者的核心思想非常接近：完整页与 hot page 共享 GPU block pool；显存宽裕时保留完整驻留；压力出现后逐页降级；融合 resolver 同时处理 full hit、hot hit 和 host miss；host 备份提前生成，因此释放页时不必同步拷贝整页。二者也都把优化重点放在长上下文、高并发 decode，而不是宣称改善所有负载。
+
+以下差异以当前 SGLang 实现和 vLLM 2026-09-08 的文章为准：
+
+| 维度 | SGLang KVDuo | vLLM Hybrid HiSparse |
+| --- | --- | --- |
+| 用户接口 | 独立的 `--enable-kvduo` 与 `--kvduo-config`，内部复用 HiSparse pool/backend | 通过 `--attention-config` 中的 `hisparse_config` 配置，并可与 KV connector 组合 |
+| Hot buffer 分配 | 按 request、按 layer 延迟分配；从 `2 × top_k` 起，根据异步 miss 统计逐级增长，capture 元数据上限为 `16 × top_k` | 博文描述默认 `2 × top-k` rows/request；文章重点是固定默认覆盖率与容量权衡，未描述 KVDuo 这种按层 miss 驱动的 2K→16K 动态 tier |
+| 尾页策略 | 显式 `tail_protected_pages`，最新若干完整页不参与页级 LRU 回收 | 博文说明 tail 永不驱逐，但公开启动参数中没有对应的尾页数量旋钮 |
+| Host-only 前缀命中 | RadixTree 锚定 GPU 前缀，独立 host prefix cache 扩展连续命中；在 prefill 前把 host-only 后缀完整恢复到 GPU | 博文描述无 GPU 驻留前缀可从 placeholder + hot page 开始，随后只在 indexer 选中时逐 row 到达；P/D import 也可直接落在 host |
+| 其他 KV 域 | 回收策略只处理主稀疏 KV 物理页；逻辑池、SWA、indexer、compression state 走各自路径 | 基于 vLLM Hybrid Memory Allocator/cache groups；indexer KV 不由 HiSparse 管理，可另用标准 OffloadingConnector |
+| Speculative decoding | 当前启动参数明确拒绝 | 博文实现支持 MTP 的 per-step replayable resolver plan；hot buffer 还需为验证 token 扩容 |
+| Host 容量表达 | `host_to_device_ratio` | `host_pool_gib`，按 DP replica 配置；博文还说明本地 TP ranks 共享 pinned pool、TP rank 0 写入 |
+| P/D 定位 | 当前 flag 本身不要求 PD disaggregation，可在支持的实例形态中使用 | 博文强调最适合 P/D 的 decode 侧，并描述 import 直接落 host 的组合方式 |
+| Prefix cache 约束 | 必须启用 RadixTree prefix cache | 启动示例使用 vLLM prefix caching；实现组合在 vLLM cache group/HMA 体系内 |
+
+因此，KVDuo 不是对 vLLM 配置项的一一移植。它在 SGLang 的 RadixTree、HiSparse allocator、chunked prefill 和 CUDA graph replay 边界内实现相同类别的“有压力才稀疏卸载”，同时增加了按层动态 hot capacity 和显式尾页保护；当前代价是 speculative decoding 等组合能力仍少于文章中的 vLLM 实现。
+
+## 评估建议
+
+不要只比较单请求 TPOT。建议至少同时采集以下两组基线：普通 GPU-resident KV，以及固定 buffer `--enable-hisparse`（若部署形态支持），然后逐步提高并发和上下文长度，观察：
+
+- 同一 TTFT/TPOT 目标下的 running requests 和总 token throughput；
+- retract/preemption 次数以及重复 prefill token 数；
+- 主稀疏 KV 物理池、host pool、hot page 的使用量；
+- resolver 的 host miss 比例和 H2D 带宽；
+- p50/p95/p99 TTFT、TPOT 和端到端延迟；
+- CPU pinned memory、NUMA 位置和 GPU copy engine 利用率。
+
+若短上下文性能下降而长上下文并发没有提高，应先确认压力是否真的来自主稀疏 KV；若 host miss 很高，则检查 top-k 时间局部性、hot tier 是否频繁回收以及主机带宽，而不是盲目增大 `host_to_device_ratio`。
+
+## 参考资料
+
+- [vLLM: GLM 5.3 Optimizations, Part 1: Hybrid HiSparse Offloading](https://vllm.ai/blog/2026-09-08-glm53-part1-hybrid-sparse-offloading)
+- [SGLang HiSparse 指南](/docs/advanced_features/hisparse_guide)
