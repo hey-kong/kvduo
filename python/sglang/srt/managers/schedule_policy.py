@@ -1143,9 +1143,59 @@ class PrefillAdder:
                         return AddReqResult.NO_TOKEN
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
-            # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
-            # report not-prefillable via finalize()) and before init_load_back
-            # (a delay verdict must not start KV load-back).
+            # Finish every admission decision before init_load_back. In
+            # particular, a KVDuo host restore allocates Full/C4 pages that are
+            # not yet request-owned; returning OTHER afterward would leak them
+            # when the next scheduling pass overwrites the prefix match.
+            def plan_prefill_after_prefix(prefix_length: int):
+                planned_input_tokens = self.ceil_paged_tokens(
+                    len(req.full_untruncated_fill_ids) - prefix_length
+                )
+                if (
+                    self.rem_chunk_tokens is None
+                    and len(self.can_run_list) != 0
+                    and planned_input_tokens >= self.rem_input_tokens
+                ):
+                    return None
+
+                planned_trunc_len = None
+                if (
+                    self.dllm_config is None
+                    and chunk_tokens_limit is not None
+                    and planned_input_tokens > chunk_tokens_limit
+                ):
+                    planned_trunc_len = (
+                        chunk_tokens_limit // self.page_size * self.page_size
+                    )
+                    if planned_trunc_len <= 0:
+                        return None
+                    if truncation_align_size is not None:
+                        if planned_trunc_len < truncation_align_size:
+                            return None
+                        planned_trunc_len = truncation_align_size * (
+                            planned_trunc_len // truncation_align_size
+                        )
+                    now_input_len = planned_trunc_len + prefix_length
+                    now_input_len = now_input_len // self.page_size * self.page_size
+                    planned_trunc_len = now_input_len - prefix_length
+                    if planned_trunc_len <= 0:
+                        return None
+                return planned_input_tokens, planned_trunc_len
+
+            prospective_prefix_len = len(req.prefix_indices) + req.host_hit_length
+            prefill_plan = plan_prefill_after_prefix(prospective_prefix_len)
+            if prefill_plan is None:
+                return AddReqResult.OTHER
+            input_tokens, trunc_len = prefill_plan
+
+            if self.dllm_config is not None:
+                if self.rem_dllm_tokens <= 0:
+                    return AddReqResult.OTHER
+                assert (
+                    truncation_align_size is None
+                ), "truncation_align_size is not supported for dllm prefill"
+
+            # Negotiate only after every KV-budget gate and before load-back.
             if (self.prefill_delayer_single_pass is not None) and (
                 not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                     local_prefillable=True,
@@ -1158,39 +1208,40 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if req.needs_host_load_back():
-                new_indices, req.last_node = self.tree_cache.init_load_back(
+                new_indices, restored_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
                 )
+                # KVDuo host-prefix restore may be transiently short of logical
+                # or physical pages. All TP ranks make this decision together;
+                # leave the request and its host-prefix references intact so a
+                # later scheduling pass can retry safely.
+                if new_indices is None:
+                    return AddReqResult.OTHER
+                req.last_node = restored_node
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
-            input_tokens = self.ceil_paged_tokens(
-                len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
-            )
-
-            if (
-                self.rem_chunk_tokens is None
-                and len(self.can_run_list) != 0
-                and input_tokens >= self.rem_input_tokens
-            ):
-                # If without chunked prefill:
-                # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
-                # - if the can_run_list is empty, always accept the first prefill request
-                return AddReqResult.OTHER
+                if prefix_len != prospective_prefix_len:
+                    # Ordinary HiCache may decline or partially satisfy a
+                    # speculative host hit. Re-plan against what was actually
+                    # restored. KVDuo has already allocated request-specific
+                    # Full/C4 pages and promises an exact restore length, so it
+                    # must never enter a post-allocation deferral path.
+                    if getattr(req, "kvduo_residency_plan", None) is not None:
+                        raise RuntimeError(
+                            "KVDuo host-prefix restore returned an unexpected length"
+                        )
+                    prefill_plan = plan_prefill_after_prefix(prefix_len)
+                    if prefill_plan is None:
+                        return AddReqResult.OTHER
+                    input_tokens, trunc_len = prefill_plan
 
             if self.dllm_config is not None:
-                if self.rem_dllm_tokens <= 0:
-                    return AddReqResult.OTHER
-
-                assert (
-                    truncation_align_size is None
-                ), "truncation_align_size is not supported for dllm prefill"
-
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
             elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
@@ -1212,29 +1263,7 @@ class PrefillAdder:
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
             else:
-                # Make sure at least one page is available
-                trunc_len = chunk_tokens_limit // self.page_size * self.page_size
-
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
-
-                # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
-                # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
-                # we need the prefill prefix length to be multiple of attention split size
-                if truncation_align_size is not None:
-                    if trunc_len < truncation_align_size:
-                        return AddReqResult.OTHER
-                    else:
-                        trunc_len = truncation_align_size * (
-                            trunc_len // truncation_align_size
-                        )
-
-                now_input_len = trunc_len + len(req.prefix_indices)
-                now_input_len = now_input_len // self.page_size * self.page_size
-                trunc_len = now_input_len - len(req.prefix_indices)
-
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
+                assert trunc_len is not None
 
                 # Chunked prefill
                 req.set_extend_range(

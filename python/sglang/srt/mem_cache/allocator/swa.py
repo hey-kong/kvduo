@@ -255,6 +255,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
 
         if swa_tail_len == 0:
+            # Virtual Full ids can be recycled. Ensure a previous owner's SWA
+            # mapping cannot be observed or freed by this Full-only allocation.
+            self.full_to_swa_index_mapping[
+                alloc_full_indices.to(torch.int64)
+            ] = 0
             return alloc_full_indices
 
         device = self.device

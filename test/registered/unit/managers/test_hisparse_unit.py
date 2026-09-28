@@ -11,7 +11,7 @@ import os
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
@@ -39,6 +39,34 @@ MAX_CONTEXT_LEN = 2048
 
 
 class TestKVDuoPhysicalReclaim(unittest.TestCase):
+    def test_generic_restore_requires_no_swa_pages(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.is_dsv4_hisparse = False
+        coordinator.page_size = 2
+        coordinator.compress_ratio = 1
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(page_size=2)
+
+        requirements = coordinator._kvduo_restore_page_requirements(
+            torch.tensor([2], dtype=torch.int64),
+            torch.tensor([4], dtype=torch.int64),
+        )
+
+        self.assertEqual(requirements, (1, 0, 1))
+
+    def test_regular_cache_reserves_swa_window_from_kvduo_host_match(self):
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache._sliding_window_size = 4
+        cache.swa_reprefill_tail_tokens = MagicMock(return_value=0)
+        coordinator = SimpleNamespace(is_dsv4_hisparse=True)
+        key = RadixKey(token_ids=array("i", range(12)))
+
+        self.assertEqual(cache._kvduo_max_prefix_len(key, coordinator), 8)
+
     def test_host_only_prefix_is_matched_and_restored_before_prefill(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
         from sglang.srt.mem_cache.base_prefix_cache import MatchResult
@@ -47,6 +75,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             KVDuoHostPrefixCache,
             KVDuoPrefixResidency,
         )
+        from sglang.srt.mem_cache.sparsity.core.kvduo_state import (
+            KVDuoPressureAction,
+        )
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
@@ -54,6 +85,8 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.page_size = 2
         coordinator.compress_ratio = 1
         coordinator.device = "cpu"
+        coordinator.is_dsv4_hisparse = True
+        coordinator.tp_world_size = 1
         coordinator.item_size_bytes = 4
         coordinator.mem_pool_device = SimpleNamespace(layer_num=2)
         coordinator.full_generation = torch.zeros(32, dtype=torch.int64)
@@ -63,8 +96,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.host_prefix_cache = KVDuoHostPrefixCache(8)
         for ordinal, (identity, locs, touches) in enumerate(
             (
-                ((1, (1, 2)), (20, 21), (7, 8)),
-                ((1, (1, 2, 3, 4)), (22, 23), (9, 10)),
+                ((1, "tenant-a", (1, 2)), (20, 21), (7, 8)),
+                ((1, "tenant-a", (1, 2, 3, 4)), (22, 23), (9, 10)),
+                ((1, "tenant-a", (1, 2, 3, 4, 5, 6)), (24, 25), (11, 12)),
             )
         ):
             coordinator.host_prefix_cache.insert(
@@ -81,8 +115,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         req = SimpleNamespace(
             rid="restore",
+            extra_key="tenant-a",
             prefix_indices=torch.tensor([5, 6], dtype=torch.int64),
-            get_fill_ids=lambda: [1, 2, 3, 4, 5],
+            get_fill_ids=lambda: [1, 2, 3, 4, 5, 6, 7],
             _compute_max_prefix_len=lambda length: length - 1,
         )
         gpu_match = MatchResult(
@@ -91,7 +126,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             last_host_node=object(),
             best_match_node=object(),
         )
-        match = coordinator.augment_kvduo_prefix_match(req, gpu_match)
+        match = coordinator.augment_kvduo_prefix_match(
+            req, gpu_match, max_prefix_len=4
+        )
         self.assertEqual(match.host_hit_length, 2)
         self.assertEqual(match.full_kv_hit_length, 4)
         self.assertEqual(
@@ -100,9 +137,159 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         req.kvduo_residency_plan = match.kvduo_residency_plan
 
+        other_namespace = SimpleNamespace(
+            rid="other",
+            extra_key="tenant-b",
+            prefix_indices=req.prefix_indices,
+            get_fill_ids=req.get_fill_ids,
+            _compute_max_prefix_len=req._compute_max_prefix_len,
+        )
+        isolated = coordinator.augment_kvduo_prefix_match(
+            other_namespace, gpu_match, max_prefix_len=4
+        )
+        self.assertEqual(isolated.host_hit_length, 0)
+
+        rank_mismatch = SimpleNamespace(
+            rid="rank-mismatch",
+            extra_key="tenant-a",
+            prefix_indices=req.prefix_indices,
+            get_fill_ids=req.get_fill_ids,
+            _compute_max_prefix_len=req._compute_max_prefix_len,
+        )
+        coordinator.tp_world_size = 2
+        coordinator.tp_group = object()
+
+        heterogeneous_gpu = SimpleNamespace(
+            rid="heterogeneous-gpu",
+            extra_key="tenant-a",
+            prefix_indices=req.prefix_indices,
+            get_fill_ids=req.get_fill_ids,
+            _compute_max_prefix_len=req._compute_max_prefix_len,
+        )
+
+        def remote_has_longer_gpu_prefix(value, **kwargs):
+            # Local boundaries are [host_end=4, gpu_len=2, -gpu_len=-2]. The
+            # remote rank has the same final host end but a 3-token GPU prefix.
+            value[0] = min(int(value[0]), 4)
+            value[1] = min(int(value[1]), 3)
+            value[2] = min(int(value[2]), -3)
+
+        with patch(
+            "torch.distributed.all_reduce", side_effect=remote_has_longer_gpu_prefix
+        ):
+            synchronized = coordinator.augment_kvduo_prefix_match(
+                heterogeneous_gpu, gpu_match, max_prefix_len=4
+            )
+        self.assertEqual(
+            len(gpu_match.device_indices) + synchronized.host_hit_length, 4
+        )
+        coordinator.release_kvduo_match_refs(heterogeneous_gpu)
+
+        # Preserve the two-token common GPU prefix instead of falling back to
+        # an empty match; this can keep a long prompt within prefill budget.
+        common_gpu_matcher = MagicMock(return_value=gpu_match)
+
+        def remote_cannot_reach_longer_gpu_prefix(value, **kwargs):
+            # The remote GPU prefix is longer than the shortest host-covered
+            # prefix, so no positive restore can produce a common final end.
+            if value.numel() == 3:
+                value[0] = min(int(value[0]), 2)
+                value[1] = min(int(value[1]), 3)
+                value[2] = min(int(value[2]), -3)
+
+        with patch(
+            "torch.distributed.all_reduce",
+            side_effect=remote_cannot_reach_longer_gpu_prefix,
+        ):
+            synchronized = coordinator.augment_kvduo_prefix_match(
+                rank_mismatch,
+                gpu_match,
+                max_prefix_len=4,
+                common_gpu_matcher=common_gpu_matcher,
+            )
+        self.assertIs(synchronized, gpu_match)
+        self.assertEqual(len(synchronized.device_indices), 2)
+        common_gpu_matcher.assert_called_once_with(2)
+
+        nonmonotonic_req = SimpleNamespace(
+            rid="nonmonotonic-swa",
+            extra_key="tenant-a",
+            prefix_indices=req.prefix_indices,
+            get_fill_ids=req.get_fill_ids,
+            _compute_max_prefix_len=req._compute_max_prefix_len,
+        )
+        empty_gpu_match = gpu_match._replace(
+            device_indices=torch.empty(0, dtype=torch.int64)
+        )
+        nonmonotonic_matcher = MagicMock(
+            side_effect=[gpu_match, empty_gpu_match]
+        )
+        reduce_step = 0
+
+        def remote_swa_rematch_misses(value, **kwargs):
+            nonlocal reduce_step
+            reduce_step += 1
+            if reduce_step == 1:
+                value[0] = min(int(value[0]), 2)
+                value[1] = min(int(value[1]), 3)
+                value[2] = min(int(value[2]), -3)
+            elif reduce_step == 2:
+                # Local bounded rematch still hits two tokens; remote SWA
+                # validation temporarily loses the whole bounded prefix.
+                value[0] = 0
+                value[1] = min(int(value[1]), -2)
+
+        with patch(
+            "torch.distributed.all_reduce", side_effect=remote_swa_rematch_misses
+        ):
+            synchronized = coordinator.augment_kvduo_prefix_match(
+                nonmonotonic_req,
+                gpu_match,
+                max_prefix_len=4,
+                common_gpu_matcher=nonmonotonic_matcher,
+            )
+        self.assertEqual(len(synchronized.device_indices), 0)
+        self.assertEqual(
+            [call.args[0] for call in nonmonotonic_matcher.call_args_list], [2, 0]
+        )
+
+        def remote_miss(value, **kwargs):
+            value.zero_()
+
+        with patch("torch.distributed.all_reduce", side_effect=remote_miss) as reduce:
+            synchronized = coordinator.augment_kvduo_prefix_match(
+                rank_mismatch, gpu_match, max_prefix_len=4
+            )
+        self.assertEqual(synchronized.host_hit_length, 0)
+        self.assertEqual(rank_mismatch.kvduo_host_prefix_records, set())
+        reduce.assert_called_once()
+
+        free_pages = {"full": 0, "swa": 0, "physical": 0}
+        logical_allocator = SimpleNamespace(
+            full_available_size=lambda: free_pages["full"] * 2,
+            swa_available_size=lambda: free_pages["swa"] * 2,
+        )
+        physical_allocator = SimpleNamespace(
+            available_size=lambda: free_pages["physical"] * 2
+        )
+
+        def alloc_extend(*args):
+            free_pages["full"] -= 1
+            free_pages["physical"] -= 1
+            return torch.tensor([10, 11])
+
+        def rollback_restore_allocation(indices):
+            free_pages["full"] += 1
+            free_pages["physical"] += 1
+
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
-            alloc_extend=MagicMock(return_value=torch.tensor([10, 11])),
-            free=MagicMock(),
+            page_size=2,
+            logical_attn_allocator=logical_allocator,
+            hisparse_attn_allocator=physical_allocator,
+            alloc_kvduo_restore=MagicMock(side_effect=alloc_extend),
+            rollback_restore_allocation=MagicMock(
+                side_effect=rollback_restore_allocation
+            ),
         )
         load = MagicMock()
         coordinator.mem_pool_device = SimpleNamespace(
@@ -111,14 +298,90 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             translate_loc_from_full_to_hisparse_device=lambda value: value,
         )
         coordinator.mem_pool_host = SimpleNamespace(load_to_device_per_layer=load)
-        restored = coordinator.init_kvduo_load_back(req, match.host_hit_length)
+        protected_during_reclaim = []
+
+        def reclaim(slots):
+            protected_during_reclaim.append(
+                coordinator._kvduo_pressure_protected.clone()
+            )
+            return SimpleNamespace(action=KVDuoPressureAction.SUCCESS)
+
+        coordinator._kvduo_pressure_protected = None
+        coordinator._reclaim_for_physical_allocation = MagicMock(side_effect=reclaim)
+
+        radix_reclaimer = MagicMock()
+
+        def evict_radix(full_tokens, swa_tokens):
+            # No active request can be reclaimed in this boundary case; the
+            # schedulable capacity exists entirely in an evictable Radix page.
+            free_pages["full"] = 4
+            free_pages["swa"] = 0
+            free_pages["physical"] = 1
+            return full_tokens, swa_tokens
+
+        radix_reclaimer.side_effect = evict_radix
+        all_reduce_count = 0
+
+        def fail_remote_allocation(value, **kwargs):
+            nonlocal all_reduce_count
+            all_reduce_count += 1
+            # Logical preflight and physical reclaim pass on every rank. Only
+            # the final allocation fails remotely.
+            if all_reduce_count == 3:
+                value.zero_()
+
+        before_partial_alloc = dict(free_pages)
+        with patch("torch.distributed.all_reduce", side_effect=fail_remote_allocation):
+            deferred = coordinator.init_kvduo_load_back(
+                req, match.host_hit_length, radix_reclaimer=radix_reclaimer
+            )
+        self.assertIsNone(deferred)
+        radix_reclaimer.assert_called_once_with(2, 0)
+        # Restore intentionally owns no SWA page. A successful local rank must
+        # return its Full and C4 pages when another TP rank rejects allocation.
+        self.assertEqual(free_pages, {"full": 4, "swa": 0, "physical": 1})
+        self.assertNotEqual(free_pages, before_partial_alloc)
+        rollback = (
+            coordinator.token_to_kv_pool_allocator.rollback_restore_allocation
+        )
+        rollback.assert_called_once()
+        self.assertTrue(
+            torch.equal(
+                rollback.call_args.args[0],
+                torch.tensor([10, 11]),
+            )
+        )
+        host_record = coordinator.host_prefix_cache.records[
+            (1, "tenant-a", (1, 2, 3, 4))
+        ]
+        self.assertIn(req.rid, host_record.request_references)
+        self.assertNotIn(
+            req.rid,
+            coordinator.host_prefix_cache.records[
+                (1, "tenant-a", (1, 2, 3, 4, 5, 6))
+            ].request_references,
+        )
+        self.assertEqual(host_record.restore_pins, 0)
+
+        coordinator.tp_world_size = 1
+        restored = coordinator.init_kvduo_load_back(
+            req, match.host_hit_length, radix_reclaimer=radix_reclaimer
+        )
 
         self.assertTrue(torch.equal(restored, torch.tensor([10, 11])))
+        self.assertEqual(
+            coordinator._reclaim_for_physical_allocation.call_args_list,
+            [call(2), call(2)],
+        )
+        self.assertEqual(protected_during_reclaim[0].tolist(), [5, 6])
+        self.assertIsNone(coordinator._kvduo_pressure_protected)
         self.assertEqual(load.call_count, 2)
         self.assertEqual(coordinator.full_data_version[10:12].tolist(), [2, 2])
         self.assertEqual(coordinator.full_last_touch[10:12].tolist(), [9, 10])
         self.assertEqual(
-            coordinator.host_prefix_cache.records[(1, (1, 2, 3, 4))].restore_pins,
+            coordinator.host_prefix_cache.records[
+                (1, "tenant-a", (1, 2, 3, 4))
+            ].restore_pins,
             0,
         )
 

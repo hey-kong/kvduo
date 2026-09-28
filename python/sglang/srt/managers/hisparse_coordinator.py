@@ -38,7 +38,7 @@ from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
     plan_kvduo_prefix_restore,
 )
 from sglang.srt.utils import get_device_module, is_hip
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import get_num_new_pages, is_pin_memory_available
 
 device_module = get_device_module()
 
@@ -397,9 +397,19 @@ class HiSparseCoordinator:
             len(fill_ids),
             (page_ordinal + 1) * self.page_size * self.compress_ratio,
         )
-        return (self.compress_ratio, tuple(fill_ids[:token_end]))
+        return (
+            self.compress_ratio,
+            getattr(req, "extra_key", None),
+            tuple(fill_ids[:token_end]),
+        )
 
-    def augment_kvduo_prefix_match(self, req: Req, match_result):
+    def augment_kvduo_prefix_match(
+        self,
+        req: Req,
+        match_result,
+        max_prefix_len: int | None = None,
+        common_gpu_matcher=None,
+    ):
         """Extend a GPU Radix hit with the longest valid host-owned prefix.
 
         The Radix node remains the lock anchor for its GPU portion.  Host pages
@@ -415,10 +425,14 @@ class HiSparseCoordinator:
         gpu_len = len(match_result.device_indices)
         page_tokens = self.page_size * self.compress_ratio
         max_prefix = req._compute_max_prefix_len(len(req.get_fill_ids()))
+        if max_prefix_len is not None:
+            # Preserve the cache's own match cap. In particular, DeepSeek V4's
+            # unified SWA cache holds back a trailing window for re-prefill;
+            # KVDuo must not extend a main/C4-only host hit into that window.
+            max_prefix = min(max_prefix, max_prefix_len)
         max_prefix = max_prefix // page_tokens * page_tokens
         host_end = gpu_len // page_tokens * page_tokens
         pages = []
-        identities = []
         for ordinal in range(max_prefix // page_tokens):
             identity = self._host_prefix_identity(req, ordinal)
             record = self.host_prefix_cache.records.get(identity)
@@ -435,12 +449,44 @@ class HiSparseCoordinator:
                 )
             )
             host_end = (ordinal + 1) * page_tokens
-            if not gpu_full:
-                self.host_prefix_cache.acquire(identity, req.rid, 0)
-                identities.append(identity)
 
-        if host_end <= gpu_len:
+        # GPU and host eviction are rank-local. Coordinate the final reusable
+        # prefix end, not the per-rank incremental host hit: ranks can start
+        # with different GPU prefix lengths. Only extend when the common host
+        # end is beyond every rank's GPU end, ensuring every rank enters restore
+        # and finishes with exactly the same prefix length.
+        common_host_end = host_end
+        min_gpu_len = gpu_len
+        max_gpu_len = gpu_len
+        if self.tp_world_size > 1:
+            boundaries = torch.tensor(
+                [host_end, gpu_len, -gpu_len], dtype=torch.int64, device="cpu"
+            )
+            torch.distributed.all_reduce(
+                boundaries, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+            common_host_end = int(boundaries[0].item())
+            min_gpu_len = int(boundaries[1].item())
+            max_gpu_len = -int(boundaries[2].item())
+        if common_host_end <= max_gpu_len:
+            if min_gpu_len != max_gpu_len:
+                if common_gpu_matcher is None:
+                    raise RuntimeError(
+                        "KVDuo TP GPU prefix lengths diverged without a common "
+                        "host-covered extension or common-prefix matcher"
+                    )
+                return self._converge_common_gpu_match(
+                    min_gpu_len, common_gpu_matcher
+                )
             return match_result
+        host_end = common_host_end
+        pages = pages[: host_end // page_tokens]
+        identities = []
+        first_host_page = gpu_len // page_tokens
+        for ordinal in range(first_host_page, host_end // page_tokens):
+            identity = self._host_prefix_identity(req, ordinal)
+            self.host_prefix_cache.acquire(identity, req.rid, 0)
+            identities.append(identity)
         # Repeated scheduling matches are idempotent because request references
         # are sets.  Keep the identities on Req rather than a request-slot row.
         req.kvduo_host_prefix_records = set(identities)
@@ -458,7 +504,42 @@ class HiSparseCoordinator:
             kvduo_residency_plan=plan,
         )
 
-    def init_kvduo_load_back(self, req: Req, host_hit_length: int):
+    def _converge_common_gpu_match(self, target_len: int, common_gpu_matcher):
+        """Rematch until every TP rank has the same actual GPU prefix length."""
+        for _ in range(8):
+            result = common_gpu_matcher(target_len)
+            actual_len = len(result.device_indices)
+            if self.tp_world_size <= 1:
+                return result
+            lengths = torch.tensor(
+                [actual_len, -actual_len], dtype=torch.int64, device="cpu"
+            )
+            torch.distributed.all_reduce(
+                lengths, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+            min_actual = int(lengths[0].item())
+            max_actual = -int(lengths[1].item())
+            if min_actual == max_actual:
+                return result
+            # A bounded rematch should not grow beyond its target. If a cache
+            # validator violates that assumption, converge conservatively.
+            target_len = min_actual if min_actual < target_len else 0
+
+        result = common_gpu_matcher(0)
+        actual_len = len(result.device_indices)
+        lengths = torch.tensor(
+            [actual_len, -actual_len], dtype=torch.int64, device="cpu"
+        )
+        torch.distributed.all_reduce(
+            lengths, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+        )
+        if int(lengths[0].item()) != -int(lengths[1].item()):
+            raise RuntimeError("KVDuo TP GPU prefix rematch failed to converge")
+        return result
+
+    def init_kvduo_load_back(
+        self, req: Req, host_hit_length: int, radix_reclaimer=None
+    ):
         """Allocate and restore the host-only suffix before prefill executes."""
         plan = getattr(req, "kvduo_residency_plan", None)
         if plan is None or host_hit_length <= 0:
@@ -477,7 +558,156 @@ class HiSparseCoordinator:
         )
         restored = None
         try:
-            restored = self.token_to_kv_pool_allocator.alloc_extend(
+            allocator = self.token_to_kv_pool_allocator
+            logical_pages, swa_pages, physical_pages = (
+                self._kvduo_restore_page_requirements(prefix_cpu, target_cpu)
+            )
+
+            logical_allocator = allocator.logical_attn_allocator
+            physical_allocator = allocator.hisparse_attn_allocator
+            if self.is_dsv4_hisparse:
+                full_before = (
+                    logical_allocator.full_available_size() // allocator.page_size
+                )
+                swa_before = (
+                    logical_allocator.swa_available_size() // allocator.page_size
+                )
+            else:
+                full_before = (
+                    logical_allocator.available_size() // allocator.page_size
+                )
+                swa_before = 0
+            physical_before = physical_allocator.available_size() // self.page_size
+            full_initial = full_before
+            swa_initial = swa_before
+            physical_initial = physical_before
+            radix_evicted_full_tokens = 0
+            radix_evicted_swa_tokens = 0
+
+            # Prefill admission includes evictable Radix pages. Materialize that
+            # budget before judging the restore impossible. A physical-only
+            # shortage may require evicting more than the logical shortfall;
+            # repeat while eviction makes progress because an evicted host-only
+            # Radix page need not release a sparse physical page.
+            if radix_reclaimer is not None:
+                while (
+                    full_before < logical_pages
+                    or swa_before < swa_pages
+                    or physical_before < physical_pages
+                ):
+                    full_shortfall = max(0, logical_pages - full_before)
+                    swa_shortfall = max(0, swa_pages - swa_before)
+                    physical_shortfall = max(0, physical_pages - physical_before)
+                    full_evict_tokens = max(
+                        full_shortfall * allocator.page_size,
+                        physical_shortfall * self.page_size * self.compress_ratio,
+                    )
+                    swa_evict_tokens = swa_shortfall * allocator.page_size
+                    if full_evict_tokens == 0 and swa_evict_tokens == 0:
+                        break
+                    evicted_full, evicted_swa = radix_reclaimer(
+                        full_evict_tokens, swa_evict_tokens
+                    )
+                    if evicted_full <= 0 and evicted_swa <= 0:
+                        break
+                    radix_evicted_full_tokens += evicted_full
+                    radix_evicted_swa_tokens += evicted_swa
+                    if self.is_dsv4_hisparse:
+                        full_before = (
+                            logical_allocator.full_available_size()
+                            // allocator.page_size
+                        )
+                        swa_before = (
+                            logical_allocator.swa_available_size()
+                            // allocator.page_size
+                        )
+                    else:
+                        full_before = (
+                            logical_allocator.available_size() // allocator.page_size
+                        )
+                    physical_before = (
+                        physical_allocator.available_size() // self.page_size
+                    )
+            local_ready = (
+                full_before >= logical_pages and swa_before >= swa_pages
+            )
+            if self.tp_world_size > 1:
+                ready = torch.tensor(
+                    int(local_ready), dtype=torch.int32, device=self.device
+                )
+                torch.distributed.all_reduce(
+                    ready, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                )
+                local_ready = bool(ready.item())
+            if not local_ready:
+                logger.warning(
+                    "KVDuo host-prefix restore deferred for req %s: logical Full/SWA "
+                    "need Full=%d/SWA=%d pages, had Full=%d/SWA=%d initially and "
+                    "Full=%d/SWA=%d after evicting Full=%d/SWA=%d Radix tokens; "
+                    "physical pool needs %d pages, had %d initially and %d after "
+                    "Radix eviction",
+                    req.rid,
+                    logical_pages,
+                    swa_pages,
+                    full_initial,
+                    swa_initial,
+                    full_before,
+                    swa_before,
+                    radix_evicted_full_tokens,
+                    radix_evicted_swa_tokens,
+                    physical_pages,
+                    physical_initial,
+                    physical_before,
+                )
+                return None
+
+            # A restore can need a full physical page even though its tokens were
+            # discounted from the prefill-input budget. Reclaim before entering
+            # alloc_extend, while protecting every GPU prefix location that this
+            # request is about to append to.
+            protected = self.mem_pool_device.translate_loc_from_full_to_compressed(
+                req.prefix_indices
+            )
+            self._kvduo_pressure_protected = protected
+            try:
+                pressure = self._reclaim_for_physical_allocation(
+                    physical_pages * self.page_size
+                )
+            finally:
+                self._kvduo_pressure_protected = None
+            local_ready = pressure.action is KVDuoPressureAction.SUCCESS
+            if self.tp_world_size > 1:
+                ready = torch.tensor(
+                    int(local_ready), dtype=torch.int32, device=self.device
+                )
+                torch.distributed.all_reduce(
+                    ready, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                )
+                local_ready = bool(ready.item())
+            if not local_ready:
+                logger.warning(
+                    "KVDuo host-prefix restore deferred for req %s: physical pool "
+                    "reclaim failed (needs %d pages, had %d initially and %d after "
+                    "evicting Full=%d/SWA=%d Radix tokens, "
+                    "action=%s, reason=%s, remaining_shortfall_bytes=%d); logical "
+                    "Full/SWA pools had %d/%d initially and %d/%d after Radix eviction",
+                    req.rid,
+                    physical_pages,
+                    physical_initial,
+                    physical_before,
+                    radix_evicted_full_tokens,
+                    radix_evicted_swa_tokens,
+                    pressure.action.name,
+                    pressure.reason.name,
+                    pressure.remaining_shortfall_bytes,
+                    full_initial,
+                    swa_initial,
+                    full_before,
+                    swa_before,
+                )
+                return None
+
+            restored = self.token_to_kv_pool_allocator.alloc_kvduo_restore(
                 prefix_gpu,
                 prefix_cpu,
                 target_gpu,
@@ -485,8 +715,35 @@ class HiSparseCoordinator:
                 last_loc,
                 host_hit_length,
             )
-            if restored is None:
-                raise RuntimeError("KVDuo host-prefix restore admission became invalid")
+            allocation_ready = restored is not None
+            if self.tp_world_size > 1:
+                ready = torch.tensor(
+                    int(allocation_ready), dtype=torch.int32, device=self.device
+                )
+                torch.distributed.all_reduce(
+                    ready, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                )
+                allocation_ready = bool(ready.item())
+            if not allocation_ready:
+                if restored is not None:
+                    # Roll back every pool touched by alloc_kvduo_restore (Full
+                    # and C4 for DeepSeek V4) rather than using a component-only
+                    # free method. The allocator also safely clears any SWA map.
+                    self.token_to_kv_pool_allocator.rollback_restore_allocation(
+                        restored
+                    )
+                    restored = None
+                logger.warning(
+                    "KVDuo host-prefix restore deferred for req %s: alloc_extend "
+                    "failed after admission (logical pool had %d pages; physical "
+                    "pool had %d pages before reclaim; needed logical=%d, physical=%d)",
+                    req.rid,
+                    min(full_before, swa_before),
+                    physical_before,
+                    logical_pages,
+                    physical_pages,
+                )
+                return None
 
             host_locs = []
             versions = []
@@ -544,10 +801,35 @@ class HiSparseCoordinator:
             return restored
         except Exception:
             if restored is not None:
-                self.token_to_kv_pool_allocator.free(restored)
+                self.token_to_kv_pool_allocator.rollback_restore_allocation(restored)
             raise
         finally:
             finish_kvduo_prefix_restore(commitment, self.host_prefix_cache)
+
+    def _kvduo_restore_page_requirements(
+        self, prefix_lens_cpu: torch.Tensor, seq_lens_cpu: torch.Tensor
+    ) -> tuple[int, int, int]:
+        """Return Full/logical, SWA, and sparse-physical pages for restore.
+
+        Both supported KVDuo restore allocators own no SWA pages: generic
+        HiSparse has no SWA sub-pool, while DeepSeek V4 deliberately leaves its
+        trailing SWA window to normal prefill.
+        """
+        allocator = self.token_to_kv_pool_allocator
+        logical_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=allocator.page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
+        if self.is_dsv4_hisparse:
+            physical_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu // self.compress_ratio,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu // self.compress_ratio,
+            )
+        else:
+            physical_pages = logical_pages
+        return logical_pages, 0, physical_pages
 
     def _evict_host_prefix_for_slots(self, required_slots: int) -> None:
         if not self.enable_mixed_residency:
