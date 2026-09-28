@@ -607,6 +607,29 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         self.assertTrue(torch.all(coordinator.kvduo_resolver_stats == 0))
 
+    def test_graph_prepare_skips_steady_state_capacity_scan(self):
+        """Established hot tiers add no per-layer Python work per replay."""
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.enable_mixed_residency = True
+        coordinator.decode_producer_stream = None
+        coordinator.top_k = 2
+        coordinator.mem_pool_device = SimpleNamespace(layer_num=64)
+        coordinator._active_kvduo_reqs = {0: object()}
+        coordinator._mixed_slots = [True]
+        coordinator._kvduo_pending_hot_minimum = set()
+        coordinator.kvduo_stats_poll_interval = 8
+        coordinator._kvduo_replay_count = 0
+        coordinator.kvduo_resolver_stats = torch.zeros((64, 1, 2), dtype=torch.int32)
+        # Any layer/capacity scan would fail this test before reaching a mock.
+        coordinator.kvduo_req_hot_capacity = None
+        coordinator._ensure_kvduo_hot_capacity_targets = MagicMock()
+
+        coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
+
+        coordinator._ensure_kvduo_hot_capacity_targets.assert_not_called()
+
     def test_reclaims_only_dedicated_physical_shortfall(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
