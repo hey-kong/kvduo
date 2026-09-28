@@ -429,7 +429,6 @@ class HiSparseCoordinator:
         max_prefix = max_prefix // page_tokens * page_tokens
         host_end = gpu_len // page_tokens * page_tokens
         pages = []
-        identities = []
         for ordinal in range(max_prefix // page_tokens):
             identity = self._host_prefix_identity(req, ordinal)
             record = self.host_prefix_cache.records.get(identity)
@@ -446,12 +445,27 @@ class HiSparseCoordinator:
                 )
             )
             host_end = (ordinal + 1) * page_tokens
-            if not gpu_full:
-                self.host_prefix_cache.acquire(identity, req.rid, 0)
-                identities.append(identity)
 
-        if host_end <= gpu_len:
+        # Host-cache eviction is rank-local. Every TP rank must nevertheless
+        # make the same restore decision, otherwise only a subset enters the
+        # collectives in init_kvduo_load_back. Use the shortest contiguous hit.
+        host_hit_length = max(0, host_end - gpu_len)
+        if self.tp_world_size > 1:
+            common_hit = torch.tensor(host_hit_length, dtype=torch.int64, device="cpu")
+            torch.distributed.all_reduce(
+                common_hit, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+            host_hit_length = int(common_hit.item())
+        host_end = gpu_len + host_hit_length
+        if host_hit_length <= 0:
             return match_result
+        pages = pages[: host_end // page_tokens]
+        identities = []
+        first_host_page = gpu_len // page_tokens
+        for ordinal in range(first_host_page, host_end // page_tokens):
+            identity = self._host_prefix_identity(req, ordinal)
+            self.host_prefix_cache.acquire(identity, req.rid, 0)
+            identities.append(identity)
         # Repeated scheduling matches are idempotent because request references
         # are sets.  Keep the identities on Req rather than a request-slot row.
         req.kvduo_host_prefix_records = set(identities)

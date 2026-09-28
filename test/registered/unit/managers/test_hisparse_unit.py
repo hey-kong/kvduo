@@ -86,7 +86,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.compress_ratio = 1
         coordinator.device = "cpu"
         coordinator.is_dsv4_hisparse = True
-        coordinator.tp_world_size = 2
+        coordinator.tp_world_size = 1
         coordinator.item_size_bytes = 4
         coordinator.mem_pool_device = SimpleNamespace(layer_num=2)
         coordinator.full_generation = torch.zeros(32, dtype=torch.int64)
@@ -148,6 +148,27 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             other_namespace, gpu_match, max_prefix_len=4
         )
         self.assertEqual(isolated.host_hit_length, 0)
+
+        rank_mismatch = SimpleNamespace(
+            rid="rank-mismatch",
+            extra_key="tenant-a",
+            prefix_indices=req.prefix_indices,
+            get_fill_ids=req.get_fill_ids,
+            _compute_max_prefix_len=req._compute_max_prefix_len,
+        )
+        coordinator.tp_world_size = 2
+        coordinator.tp_group = object()
+
+        def remote_miss(value, **kwargs):
+            value.zero_()
+
+        with patch("torch.distributed.all_reduce", side_effect=remote_miss) as reduce:
+            synchronized = coordinator.augment_kvduo_prefix_match(
+                rank_mismatch, gpu_match, max_prefix_len=4
+            )
+        self.assertEqual(synchronized.host_hit_length, 0)
+        self.assertEqual(rank_mismatch.kvduo_host_prefix_records, set())
+        reduce.assert_called_once()
 
         free_pages = {"full": 0, "swa": 0, "physical": 0}
         logical_allocator = SimpleNamespace(
