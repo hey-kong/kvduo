@@ -365,6 +365,57 @@ def test_load_cache_to_device_buffer_fast_path_overwrites_stale_output() -> None
     assert torch.equal(out.cpu(), torch.tensor([[7, -1, -1, -1]], dtype=torch.int32))
 
 
+def test_kvduo_full_resident_fast_path_skips_empty_hot_view() -> None:
+    state = _long_case()
+    top_k_tokens = torch.tensor([[4, 2, 1]], dtype=torch.int32, device=DEVICE)
+    out = torch.full_like(top_k_tokens, -1)
+    lru_before = state["lru_slots"].clone()
+    full_to_device_loc = torch.zeros(16, dtype=torch.int64, device=DEVICE)
+    full_to_device_loc[:8] = torch.tensor(
+        [12, 13, 14, 15, 8, 9, 10, 11], dtype=torch.int64, device=DEVICE
+    )
+    versions = torch.ones(16, dtype=torch.int64, device=DEVICE)
+    resolver_stats = torch.zeros((1, 2), dtype=torch.int32, device=DEVICE)
+
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=state["device_buffer_tokens"],
+        host_cache_locs=state["host_cache_locs"],
+        device_buffer_locs=state["device_buffer_locs"],
+        host_cache=state["host_cache"],
+        device_buffer=state["device_buffer"],
+        top_k_device_locs=out,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([8], dtype=torch.int32, device=DEVICE),
+        lru_slots=state["lru_slots"],
+        item_size_bytes=ITEM_SIZE_BYTES,
+        num_top_k=3,
+        hot_buffer_size=HOT_BUFFER_SIZE,
+        page_size=1,
+        block_size=256,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+        req_hot_buffer_sizes=torch.zeros(1, dtype=torch.int32, device=DEVICE),
+        hot_page_last_touch=torch.zeros(
+            (1, HOT_BUFFER_SIZE), dtype=torch.int64, device=DEVICE
+        ),
+        req_to_logical_token=torch.arange(8, dtype=torch.int64, device=DEVICE).view(
+            1, -1
+        ),
+        full_to_device_loc=full_to_device_loc,
+        full_last_touch=torch.zeros(16, dtype=torch.int64, device=DEVICE),
+        full_data_version=versions,
+        full_host_version=versions.clone(),
+        swap_status=torch.zeros(1, dtype=torch.int32, device=DEVICE),
+        resolver_stats=resolver_stats,
+        touch_clock=torch.tensor([7], dtype=torch.int64, device=DEVICE),
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(out.cpu(), torch.tensor([[8, 14, 13]], dtype=torch.int32))
+    assert torch.equal(state["lru_slots"].cpu(), lru_before.cpu())
+    assert torch.equal(resolver_stats.cpu(), torch.tensor([[0, 3]], dtype=torch.int32))
+
+
 def test_load_cache_to_device_buffer_hits_newest_and_updates_lru() -> None:
     state = _long_case()
 

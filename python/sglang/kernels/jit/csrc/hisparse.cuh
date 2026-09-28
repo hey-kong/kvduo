@@ -251,9 +251,9 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   const int64_t rid = req_pool_indices[bid];
   const int64_t seq_len = seq_lens[bid];
-  const int hot_buffer_size = enable_dynamic_hot_view
-      ? min(max(req_hot_buffer_sizes[rid], 0), HOT_BUFFER_SIZE)
-      : HOT_BUFFER_SIZE;
+  const int hot_buffer_size =
+      enable_dynamic_hot_view ? min(max(req_hot_buffer_sizes[rid], 0), HOT_BUFFER_SIZE) : HOT_BUFFER_SIZE;
+  const int num_buffer_chunks = (hot_buffer_size + WARP_SIZE - 1) / WARP_SIZE;
 
   // Calculate offsets for this request
   const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
@@ -265,6 +265,56 @@ __global__ void load_cache_to_device_buffer_kernel(
   int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
   if (tid == 0 && enable_full_lookup) swap_status[rid] = 0;
   __syncthreads();
+
+  // KVDuo deliberately keeps complete pages resident until memory pressure
+  // requires demotion.  In that common state every selected row already has a
+  // canonical device address, so do not initialize or scan the (up to 16K)
+  // hot-buffer workspace.  The old path paid O(HOT_BUFFER_SIZE) LRU work even
+  // when the request had hot capacity zero and all top-k rows were full hits.
+  //
+  // A block-wide flag makes the fast path graph-safe: if any valid selection
+  // needs the hot/newest path, all threads fall through to the existing
+  // resolver.  Writes performed here are harmless because that resolver
+  // overwrites the corresponding output entries.
+  __shared__ int needs_hot_resolver;
+  __shared__ int full_resident_accesses;
+  if (tid == 0) {
+    needs_hot_resolver = 0;
+    full_resident_accesses = 0;
+  }
+  __syncthreads();
+  if (enable_full_lookup) {
+    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+      const int32_t token_idx = req_top_k_tokens[i];
+      if (token_idx < 0 || token_idx >= seq_len) {
+        req_top_k_device_locs[i] = -1;
+        continue;
+      }
+
+      const int64_t logical_loc = req_to_logical_token[rid * req_to_logical_stride + token_idx];
+      const int64_t full_loc = logical_loc >= 0 ? full_to_device_loc[logical_loc] : 0;
+      if (logical_loc < 0 || (full_loc <= 0 && (req_host_cache_locs[token_idx] < 0 ||
+                                                full_host_version[logical_loc] != full_data_version[logical_loc]))) {
+        req_top_k_device_locs[i] = -1;
+        atomicMax(&swap_status[rid], 1);
+      } else if (full_loc > 0) {
+        req_top_k_device_locs[i] = static_cast<int32_t>(full_loc);
+        atomicAdd(&full_resident_accesses, 1);
+        atomicMax(
+            reinterpret_cast<unsigned long long*>(&full_last_touch[logical_loc]),
+            static_cast<unsigned long long>(touch_clock[0]));
+      } else {
+        atomicExch(&needs_hot_resolver, 1);
+      }
+    }
+    __syncthreads();
+    if (needs_hot_resolver == 0) {
+      if (tid == 0) {
+        atomicAdd(&resolver_stats[rid * resolver_stats_stride + 1], full_resident_accesses);
+      }
+      return;
+    }
+  }
 
   // Fast path: short sequences have all tokens in the device buffer in order.
   if (!enable_full_lookup && seq_len <= HOT_BUFFER_SIZE) {
@@ -318,7 +368,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
     s_hash_keys[i] = HASH_EMPTY;
   }
-  for (int i = tid; i < NUM_BUFFER_CHUNKS + 1; i += BLOCK_SIZE) {
+  for (int i = tid; i < num_buffer_chunks + 1; i += BLOCK_SIZE) {
     s_chunk_offset[i] = 0;
     s_evict_chunk_offset[i] = 0;
   }
@@ -345,10 +395,8 @@ __global__ void load_cache_to_device_buffer_kernel(
       // Invalid/padded selections never participate in hashing or miss loading.
     } else if (
         enable_full_lookup &&
-        (logical_loc < 0 ||
-         (full_loc <= 0 &&
-          (req_host_cache_locs[token_idx] < 0 ||
-           full_host_version[logical_loc] != full_data_version[logical_loc])))) {
+        (logical_loc < 0 || (full_loc <= 0 && (req_host_cache_locs[token_idx] < 0 ||
+                                               full_host_version[logical_loc] != full_data_version[logical_loc])))) {
       // Never let attention consume an address table backed by a missing or
       // stale host version. The status tensor is capture-stable and can be
       // checked at the execution boundary without dereferencing an invalid row.
@@ -383,12 +431,12 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  constexpr int ITERATIONS_PER_WARP_BUFFER = (NUM_BUFFER_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
+  const int iterations_per_warp_buffer = (num_buffer_chunks + NUM_WARPS - 1) / NUM_WARPS;
   int total_hit_count = 0;
   int total_evict_count = 0;
-  for (int iter = 0; iter < ITERATIONS_PER_WARP_BUFFER; iter++) {
+  for (int iter = 0; iter < iterations_per_warp_buffer; iter++) {
     int chunk_idx = warp_id + iter * NUM_WARPS;
-    bool has_valid_chunk = chunk_idx < NUM_BUFFER_CHUNKS;
+    bool has_valid_chunk = chunk_idx < num_buffer_chunks;
 
     const int slot_idx = chunk_idx * WARP_SIZE + lane_id;
     const bool has_valid_slot = has_valid_chunk && (slot_idx < hot_buffer_size);
@@ -420,8 +468,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       req_top_k_device_locs[my_found_top_k_idx] = req_device_buffer_locs[buf_slot];
       if (enable_dynamic_hot_view) {
         atomicMax(
-            reinterpret_cast<unsigned long long*>(
-                &hot_page_last_touch[rid * hot_page_stride_0 + buf_slot / page_size]),
+            reinterpret_cast<unsigned long long*>(&hot_page_last_touch[rid * hot_page_stride_0 + buf_slot / page_size]),
             static_cast<unsigned long long>(touch_clock[0]));
       }
     }
@@ -448,15 +495,15 @@ __global__ void load_cache_to_device_buffer_kernel(
       // positions belonging to future iterations, corrupting their reads.
       // Bound the scan window to NUM_WARPS lanes.
       const int scan_offset = iter * NUM_WARPS + 1;
-      const int scan_count = min(scan_offset + NUM_WARPS, NUM_BUFFER_CHUNKS + 1);
+      const int scan_count = min(scan_offset + NUM_WARPS, num_buffer_chunks + 1);
       total_hit_count = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_hit_count);
       total_evict_count =
           warp_inclusive_scan(s_evict_chunk_offset, lane_id, scan_offset, scan_count, total_evict_count);
 #else
       total_hit_count =
-          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
+          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, num_buffer_chunks + 1, total_hit_count);
       total_evict_count =
-          warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
+          warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, num_buffer_chunks + 1, total_evict_count);
 #endif
       if (tid == 0) {
         s_total_hits = total_hit_count;
@@ -551,8 +598,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       // between replays. Column 0 is host misses; column 1 is valid accesses.
       atomicAdd(&resolver_stats[rid * resolver_stats_stride], total_misses);
       atomicAdd(
-          &resolver_stats[rid * resolver_stats_stride + 1],
-          total_misses + s_total_hits + s_full_hits + s_newest_hit);
+          &resolver_stats[rid * resolver_stats_stride + 1], total_misses + s_total_hits + s_full_hits + s_newest_hit);
     }
   }
   __syncthreads();
