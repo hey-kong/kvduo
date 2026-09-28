@@ -10,10 +10,54 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.schedule_policy import (  # noqa: E402
+    AddReqResult,
+    PrefillAdder,
+)
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.srt.utils.common import Range  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def test_host_restore_waits_for_one_page_of_chunk_budget():
+    adder = PrefillAdder.__new__(PrefillAdder)
+    adder.dsa_prefill_cp_in_seq_split = False
+    adder.prefill_max_requests = None
+    adder.can_run_list = []
+    adder.page_size = 4
+    adder.rem_chunk_tokens = 3
+    adder.rem_input_tokens = 100
+    adder.rem_total_token_offset = 0
+    adder.cur_rem_token_offset = 0
+    adder._mamba_slot_cost = 0
+    adder.is_all_swa = False
+    adder.is_hybrid_swa = False
+    adder.is_hybrid_ssm_cache = False
+    adder.dllm_config = None
+    adder.prefill_delayer_single_pass = None
+    adder.token_to_kv_pool_allocator = SimpleNamespace(available_size=lambda: 100)
+    adder.tree_cache = MagicMock(
+        disable=False,
+        evictable_size=MagicMock(return_value=0),
+        is_tree_cache=MagicMock(return_value=False),
+    )
+    req = SimpleNamespace(
+        sampling_params=SimpleNamespace(ignore_eos=False, max_new_tokens=0),
+        output_ids=[],
+        full_untruncated_fill_ids=list(range(10)),
+        prefix_indices=torch.tensor([1, 2], dtype=torch.int64),
+        host_hit_length=4,
+        swa_host_hit_length=0,
+        mamba_pool_idx=None,
+        last_node=object(),
+    )
+
+    result = adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+    assert result is AddReqResult.OTHER
+    adder.tree_cache.init_load_back.assert_not_called()
+    assert adder.token_to_kv_pool_allocator.available_size() == 100
 
 
 def test_kvduo_keeps_chunked_prefill_enabled():
