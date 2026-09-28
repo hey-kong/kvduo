@@ -192,9 +192,10 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         def remote_cannot_reach_longer_gpu_prefix(value, **kwargs):
             # The remote GPU prefix is longer than the shortest host-covered
             # prefix, so no positive restore can produce a common final end.
-            value[0] = min(int(value[0]), 2)
-            value[1] = min(int(value[1]), 3)
-            value[2] = min(int(value[2]), -3)
+            if value.numel() == 3:
+                value[0] = min(int(value[0]), 2)
+                value[1] = min(int(value[1]), 3)
+                value[2] = min(int(value[2]), -3)
 
         with patch(
             "torch.distributed.all_reduce",
@@ -209,6 +210,48 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         self.assertIs(synchronized, gpu_match)
         self.assertEqual(len(synchronized.device_indices), 2)
         common_gpu_matcher.assert_called_once_with(2)
+
+        nonmonotonic_req = SimpleNamespace(
+            rid="nonmonotonic-swa",
+            extra_key="tenant-a",
+            prefix_indices=req.prefix_indices,
+            get_fill_ids=req.get_fill_ids,
+            _compute_max_prefix_len=req._compute_max_prefix_len,
+        )
+        empty_gpu_match = gpu_match._replace(
+            device_indices=torch.empty(0, dtype=torch.int64)
+        )
+        nonmonotonic_matcher = MagicMock(
+            side_effect=[gpu_match, empty_gpu_match]
+        )
+        reduce_step = 0
+
+        def remote_swa_rematch_misses(value, **kwargs):
+            nonlocal reduce_step
+            reduce_step += 1
+            if reduce_step == 1:
+                value[0] = min(int(value[0]), 2)
+                value[1] = min(int(value[1]), 3)
+                value[2] = min(int(value[2]), -3)
+            elif reduce_step == 2:
+                # Local bounded rematch still hits two tokens; remote SWA
+                # validation temporarily loses the whole bounded prefix.
+                value[0] = 0
+                value[1] = min(int(value[1]), -2)
+
+        with patch(
+            "torch.distributed.all_reduce", side_effect=remote_swa_rematch_misses
+        ):
+            synchronized = coordinator.augment_kvduo_prefix_match(
+                nonmonotonic_req,
+                gpu_match,
+                max_prefix_len=4,
+                common_gpu_matcher=nonmonotonic_matcher,
+            )
+        self.assertEqual(len(synchronized.device_indices), 0)
+        self.assertEqual(
+            [call.args[0] for call in nonmonotonic_matcher.call_args_list], [2, 0]
+        )
 
         def remote_miss(value, **kwargs):
             value.zero_()

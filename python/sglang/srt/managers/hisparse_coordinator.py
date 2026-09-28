@@ -475,7 +475,9 @@ class HiSparseCoordinator:
                         "KVDuo TP GPU prefix lengths diverged without a common "
                         "host-covered extension or common-prefix matcher"
                     )
-                return common_gpu_matcher(min_gpu_len)
+                return self._converge_common_gpu_match(
+                    min_gpu_len, common_gpu_matcher
+                )
             return match_result
         host_end = common_host_end
         pages = pages[: host_end // page_tokens]
@@ -501,6 +503,39 @@ class HiSparseCoordinator:
             cache_protected_len=gpu_len,
             kvduo_residency_plan=plan,
         )
+
+    def _converge_common_gpu_match(self, target_len: int, common_gpu_matcher):
+        """Rematch until every TP rank has the same actual GPU prefix length."""
+        for _ in range(8):
+            result = common_gpu_matcher(target_len)
+            actual_len = len(result.device_indices)
+            if self.tp_world_size <= 1:
+                return result
+            lengths = torch.tensor(
+                [actual_len, -actual_len], dtype=torch.int64, device="cpu"
+            )
+            torch.distributed.all_reduce(
+                lengths, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+            min_actual = int(lengths[0].item())
+            max_actual = -int(lengths[1].item())
+            if min_actual == max_actual:
+                return result
+            # A bounded rematch should not grow beyond its target. If a cache
+            # validator violates that assumption, converge conservatively.
+            target_len = min_actual if min_actual < target_len else 0
+
+        result = common_gpu_matcher(0)
+        actual_len = len(result.device_indices)
+        lengths = torch.tensor(
+            [actual_len, -actual_len], dtype=torch.int64, device="cpu"
+        )
+        torch.distributed.all_reduce(
+            lengths, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+        )
+        if int(lengths[0].item()) != -int(lengths[1].item()):
+            raise RuntimeError("KVDuo TP GPU prefix rematch failed to converge")
+        return result
 
     def init_kvduo_load_back(
         self, req: Req, host_hit_length: int, radix_reclaimer=None
