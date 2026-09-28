@@ -60,6 +60,64 @@ def test_host_restore_waits_for_one_page_of_chunk_budget():
     assert adder.token_to_kv_pool_allocator.available_size() == 100
 
 
+def test_hicache_replans_chunk_from_actual_empty_restore():
+    adder = PrefillAdder.__new__(PrefillAdder)
+    adder.dsa_prefill_cp_in_seq_split = False
+    adder.prefill_max_requests = None
+    adder.can_run_list = []
+    adder.new_chunked_req = None
+    adder.page_size = 4
+    adder.rem_chunk_tokens = 4
+    adder.rem_input_tokens = 100
+    adder.rem_total_token_offset = 0
+    adder.cur_rem_token_offset = 0
+    adder._mamba_slot_cost = 0
+    adder.is_all_swa = False
+    adder.is_hybrid_swa = False
+    adder.is_hybrid_ssm_cache = False
+    adder.dllm_config = None
+    adder.prefill_delayer_single_pass = None
+    adder.token_to_kv_pool_allocator = SimpleNamespace(available_size=lambda: 100)
+    restored_node = object()
+    adder.tree_cache = MagicMock(
+        disable=False,
+        evictable_size=MagicMock(return_value=0),
+        is_tree_cache=MagicMock(return_value=False),
+        init_load_back=MagicMock(
+            return_value=(torch.empty(0, dtype=torch.int64), restored_node)
+        ),
+    )
+    adder._req_inc_lock_ref = MagicMock()
+    adder._update_prefill_budget = MagicMock()
+    adder.budget_state = MagicMock(return_value=AddReqResult.CONTINUE)
+    req = SimpleNamespace(
+        sampling_params=SimpleNamespace(ignore_eos=False, max_new_tokens=0),
+        output_ids=[],
+        full_untruncated_fill_ids=list(range(10)),
+        prefix_indices=torch.tensor([1, 2], dtype=torch.int64),
+        host_hit_length=4,
+        swa_host_hit_length=0,
+        mamba_pool_idx=None,
+        last_node=object(),
+        best_match_node=object(),
+        kvduo_residency_plan=None,
+        cache_protected_len=2,
+        retracted_stain=False,
+        needs_host_load_back=lambda: True,
+    )
+    req.set_extend_range = lambda start, end: setattr(
+        req, "extend_range", Range(start, end)
+    )
+
+    result = adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+    assert result is AddReqResult.CONTINUE
+    assert req.extend_range == Range(2, 6)
+    assert adder.new_chunked_req is req
+    adder._update_prefill_budget.assert_called_once()
+    assert adder._update_prefill_budget.call_args.args[1] == 4
+
+
 def test_kvduo_keeps_chunked_prefill_enabled():
     args = SimpleNamespace(
         enable_kvduo=True,
