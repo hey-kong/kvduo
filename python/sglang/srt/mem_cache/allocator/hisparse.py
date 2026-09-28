@@ -317,6 +317,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Undo an alloc_extend used for host-prefix restoration."""
         self.free(free_indices)
 
+    def alloc_kvduo_restore(self, *args, **kwargs):
+        return self.alloc_extend(*args, **kwargs)
+
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
@@ -684,12 +687,68 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.logical_attn_allocator.free_full(free_indices)
 
     def rollback_restore_allocation(self, free_indices: torch.Tensor) -> None:
-        """Release C4, Full, and SWA ownership acquired by alloc_extend."""
+        """Release C4/Full restore ownership and any mapped SWA slots."""
         if free_indices.numel() == 0:
             return
         self.free_hisparse(free_indices)
         # Unlike free_full(), SWA.free() releases both its Full and SWA sides.
         self.logical_attn_allocator.free(free_indices)
+
+    def alloc_kvduo_restore(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ):
+        """Allocate Full+C4 for host restore, leaving SWA to tail prefill."""
+        num_full_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
+        num_c4_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu // self.compress_ratio,
+            page_size=self.hisparse_page_size,
+            prefix_lens=prefix_lens_cpu // self.compress_ratio,
+        )
+        if (
+            num_full_pages
+            > self.logical_attn_allocator.full_available_size() // self.page_size
+            or num_c4_pages
+            > self.hisparse_attn_allocator.available_size()
+            // self.hisparse_page_size
+        ):
+            return None
+
+        logical_indices = self.logical_attn_allocator.alloc_extend_swa_tail(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            swa_tail_len=0,
+        )
+        assert logical_indices is not None
+        compressed = self.hisparse_kvcache.translate_loc_from_full_to_compressed(
+            logical_indices
+        )
+        c4_indices = self.hisparse_attn_allocator.alloc_extend(
+            prefix_lens // self.compress_ratio,
+            prefix_lens_cpu // self.compress_ratio,
+            seq_lens // self.compress_ratio,
+            seq_lens_cpu // self.compress_ratio,
+            self.get_last_loc_hisparse_device(last_loc),
+            len(compressed),
+        )
+        assert c4_indices is not None
+        self.full_to_hisparse_device_index_mapping[compressed] = c4_indices.to(
+            torch.int64
+        )
+        return logical_indices
 
     def clear(self):
         self.logical_attn_allocator.clear()

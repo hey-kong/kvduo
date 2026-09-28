@@ -70,6 +70,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             (
                 ((1, (1, 2)), (20, 21), (7, 8)),
                 ((1, (1, 2, 3, 4)), (22, 23), (9, 10)),
+                ((1, (1, 2, 3, 4, 5, 6)), (24, 25), (11, 12)),
             )
         ):
             coordinator.host_prefix_cache.insert(
@@ -87,7 +88,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         req = SimpleNamespace(
             rid="restore",
             prefix_indices=torch.tensor([5, 6], dtype=torch.int64),
-            get_fill_ids=lambda: [1, 2, 3, 4, 5],
+            get_fill_ids=lambda: [1, 2, 3, 4, 5, 6, 7],
             _compute_max_prefix_len=lambda length: length - 1,
         )
         gpu_match = MatchResult(
@@ -96,7 +97,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             last_host_node=object(),
             best_match_node=object(),
         )
-        match = coordinator.augment_kvduo_prefix_match(req, gpu_match)
+        match = coordinator.augment_kvduo_prefix_match(
+            req, gpu_match, max_prefix_len=4
+        )
         self.assertEqual(match.host_hit_length, 2)
         self.assertEqual(match.full_kv_hit_length, 4)
         self.assertEqual(
@@ -116,20 +119,18 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         def alloc_extend(*args):
             free_pages["full"] -= 1
-            free_pages["swa"] -= 1
             free_pages["physical"] -= 1
             return torch.tensor([10, 11])
 
         def rollback_restore_allocation(indices):
             free_pages["full"] += 1
-            free_pages["swa"] += 1
             free_pages["physical"] += 1
 
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=2,
             logical_attn_allocator=logical_allocator,
             hisparse_attn_allocator=physical_allocator,
-            alloc_extend=MagicMock(side_effect=alloc_extend),
+            alloc_kvduo_restore=MagicMock(side_effect=alloc_extend),
             rollback_restore_allocation=MagicMock(
                 side_effect=rollback_restore_allocation
             ),
@@ -158,7 +159,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             # No active request can be reclaimed in this boundary case; the
             # schedulable capacity exists entirely in an evictable Radix page.
             free_pages["full"] = 4
-            free_pages["swa"] = 1
+            free_pages["swa"] = 0
             free_pages["physical"] = 1
             return full_tokens, swa_tokens
 
@@ -179,10 +180,10 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
                 req, match.host_hit_length, radix_reclaimer=radix_reclaimer
             )
         self.assertIsNone(deferred)
-        radix_reclaimer.assert_called_once_with(2, 2)
-        # The successful local rank must release Full, SWA, and C4 pages when
-        # another TP rank rejects the allocation.
-        self.assertEqual(free_pages, {"full": 4, "swa": 1, "physical": 1})
+        radix_reclaimer.assert_called_once_with(2, 0)
+        # Restore intentionally owns no SWA page. A successful local rank must
+        # return its Full and C4 pages when another TP rank rejects allocation.
+        self.assertEqual(free_pages, {"full": 4, "swa": 0, "physical": 1})
         self.assertNotEqual(free_pages, before_partial_alloc)
         rollback = (
             coordinator.token_to_kv_pool_allocator.rollback_restore_allocation
@@ -196,6 +197,12 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         host_record = coordinator.host_prefix_cache.records[(1, (1, 2, 3, 4))]
         self.assertIn(req.rid, host_record.request_references)
+        self.assertNotIn(
+            req.rid,
+            coordinator.host_prefix_cache.records[
+                (1, (1, 2, 3, 4, 5, 6))
+            ].request_references,
+        )
         self.assertEqual(host_record.restore_pins, 0)
 
         coordinator.tp_world_size = 1

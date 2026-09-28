@@ -384,7 +384,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if result is not None:
             coordinator = getattr(self, "kvduo_coordinator", None)
             if coordinator is not None and params.req is not None:
-                result = coordinator.augment_kvduo_prefix_match(params.req, result)
+                result = coordinator.augment_kvduo_prefix_match(
+                    params.req, result, max_prefix_len=len(params.key)
+                )
             return result
         if self.disable:
             return self.tree_core.empty_match_result
@@ -398,7 +400,9 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not result.cache_actions
         coordinator = getattr(self, "kvduo_coordinator", None)
         if coordinator is not None and params.req is not None:
-            result = coordinator.augment_kvduo_prefix_match(params.req, result)
+            result = coordinator.augment_kvduo_prefix_match(
+                params.req, result, max_prefix_len=len(params.key)
+            )
         return result
 
     def insert(self, params: InsertParams) -> InsertResult:

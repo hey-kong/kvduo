@@ -399,7 +399,9 @@ class HiSparseCoordinator:
         )
         return (self.compress_ratio, tuple(fill_ids[:token_end]))
 
-    def augment_kvduo_prefix_match(self, req: Req, match_result):
+    def augment_kvduo_prefix_match(
+        self, req: Req, match_result, max_prefix_len: int | None = None
+    ):
         """Extend a GPU Radix hit with the longest valid host-owned prefix.
 
         The Radix node remains the lock anchor for its GPU portion.  Host pages
@@ -415,6 +417,11 @@ class HiSparseCoordinator:
         gpu_len = len(match_result.device_indices)
         page_tokens = self.page_size * self.compress_ratio
         max_prefix = req._compute_max_prefix_len(len(req.get_fill_ids()))
+        if max_prefix_len is not None:
+            # Preserve the cache's own match cap. In particular, DeepSeek V4's
+            # unified SWA cache holds back a trailing window for re-prefill;
+            # KVDuo must not extend a main/C4-only host hit into that window.
+            max_prefix = min(max_prefix, max_prefix_len)
         max_prefix = max_prefix // page_tokens * page_tokens
         host_end = gpu_len // page_tokens * page_tokens
         pages = []
@@ -507,11 +514,12 @@ class HiSparseCoordinator:
                 full_before = (
                     logical_allocator.available_size() // allocator.page_size
                 )
-                swa_before = logical_pages
+                swa_before = 0
             physical_before = physical_allocator.available_size() // self.page_size
             full_initial = full_before
             swa_initial = swa_before
             physical_initial = physical_before
+            swa_pages = 0 if self.is_dsv4_hisparse else logical_pages
             radix_evicted_full_tokens = 0
             radix_evicted_swa_tokens = 0
 
@@ -523,11 +531,11 @@ class HiSparseCoordinator:
             if radix_reclaimer is not None:
                 while (
                     full_before < logical_pages
-                    or swa_before < logical_pages
+                    or swa_before < swa_pages
                     or physical_before < physical_pages
                 ):
                     full_shortfall = max(0, logical_pages - full_before)
-                    swa_shortfall = max(0, logical_pages - swa_before)
+                    swa_shortfall = max(0, swa_pages - swa_before)
                     physical_shortfall = max(0, physical_pages - physical_before)
                     full_evict_tokens = max(
                         full_shortfall * allocator.page_size,
@@ -560,7 +568,7 @@ class HiSparseCoordinator:
                         physical_allocator.available_size() // self.page_size
                     )
             local_ready = (
-                full_before >= logical_pages and swa_before >= logical_pages
+                full_before >= logical_pages and swa_before >= swa_pages
             )
             if self.tp_world_size > 1:
                 ready = torch.tensor(
@@ -573,12 +581,13 @@ class HiSparseCoordinator:
             if not local_ready:
                 logger.warning(
                     "KVDuo host-prefix restore deferred for req %s: logical Full/SWA "
-                    "need %d pages each, had Full=%d/SWA=%d initially and "
+                    "need Full=%d/SWA=%d pages, had Full=%d/SWA=%d initially and "
                     "Full=%d/SWA=%d after evicting Full=%d/SWA=%d Radix tokens; "
                     "physical pool needs %d pages, had %d initially and %d after "
                     "Radix eviction",
                     req.rid,
                     logical_pages,
+                    swa_pages,
                     full_initial,
                     swa_initial,
                     full_before,
@@ -637,7 +646,7 @@ class HiSparseCoordinator:
                 )
                 return None
 
-            restored = self.token_to_kv_pool_allocator.alloc_extend(
+            restored = self.token_to_kv_pool_allocator.alloc_kvduo_restore(
                 prefix_gpu,
                 prefix_cpu,
                 target_gpu,
@@ -656,9 +665,9 @@ class HiSparseCoordinator:
                 allocation_ready = bool(ready.item())
             if not allocation_ready:
                 if restored is not None:
-                    # Restore allocation owns every pool touched by alloc_extend
-                    # (Full, SWA, and C4 for DeepSeek V4), so use its symmetric
-                    # rollback rather than a component-specific free method.
+                    # Roll back every pool touched by alloc_kvduo_restore (Full
+                    # and C4 for DeepSeek V4) rather than using a component-only
+                    # free method. The allocator also safely clears any SWA map.
                     self.token_to_kv_pool_allocator.rollback_restore_allocation(
                         restored
                     )

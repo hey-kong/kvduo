@@ -51,6 +51,49 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         allocator.free_hisparse.assert_called_once_with(indices)
         allocator.logical_attn_allocator.free.assert_called_once_with(indices)
 
+    def test_kvduo_restore_allocates_full_and_c4_without_swa(self):
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = 2
+        allocator.hisparse_page_size = 2
+        allocator.compress_ratio = 1
+        logical_indices = torch.tensor([4, 5], dtype=torch.int64)
+        c4_indices = torch.tensor([8, 9], dtype=torch.int64)
+        allocator.logical_attn_allocator = SimpleNamespace(
+            full_available_size=lambda: 8,
+            alloc_extend_swa_tail=MagicMock(return_value=logical_indices),
+        )
+        allocator.hisparse_attn_allocator = SimpleNamespace(
+            available_size=lambda: 8,
+            alloc_extend=MagicMock(return_value=c4_indices),
+        )
+        allocator.hisparse_kvcache = SimpleNamespace(
+            translate_loc_from_full_to_compressed=lambda value: value
+        )
+        allocator.get_last_loc_hisparse_device = MagicMock(
+            return_value=torch.tensor([-1], dtype=torch.int64)
+        )
+        allocator.full_to_hisparse_device_index_mapping = torch.zeros(
+            16, dtype=torch.int64
+        )
+        prefix = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([2], dtype=torch.int64)
+        last = torch.tensor([-1], dtype=torch.int64)
+
+        result = allocator.alloc_kvduo_restore(
+            prefix, prefix, seq, seq, last, extend_num_tokens=2
+        )
+
+        self.assertTrue(torch.equal(result, logical_indices))
+        self.assertEqual(
+            allocator.logical_attn_allocator.alloc_extend_swa_tail.call_args.kwargs[
+                "swa_tail_len"
+            ],
+            0,
+        )
+        self.assertEqual(
+            allocator.full_to_hisparse_device_index_mapping[4:6].tolist(), [8, 9]
+        )
+
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
         logical_allocator = MagicMock(spec=["alloc_extend_swa_tail"])
