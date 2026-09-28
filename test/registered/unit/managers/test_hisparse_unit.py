@@ -159,6 +159,31 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.tp_world_size = 2
         coordinator.tp_group = object()
 
+        heterogeneous_gpu = SimpleNamespace(
+            rid="heterogeneous-gpu",
+            extra_key="tenant-a",
+            prefix_indices=req.prefix_indices,
+            get_fill_ids=req.get_fill_ids,
+            _compute_max_prefix_len=req._compute_max_prefix_len,
+        )
+
+        def remote_has_longer_gpu_prefix(value, **kwargs):
+            # Local boundaries are [host_end=4, -gpu_len=-2]. The remote rank
+            # has the same final host end but a three-token GPU prefix.
+            value[0] = min(int(value[0]), 4)
+            value[1] = min(int(value[1]), -3)
+
+        with patch(
+            "torch.distributed.all_reduce", side_effect=remote_has_longer_gpu_prefix
+        ):
+            synchronized = coordinator.augment_kvduo_prefix_match(
+                heterogeneous_gpu, gpu_match, max_prefix_len=4
+            )
+        self.assertEqual(
+            len(gpu_match.device_indices) + synchronized.host_hit_length, 4
+        )
+        coordinator.release_kvduo_match_refs(heterogeneous_gpu)
+
         def remote_miss(value, **kwargs):
             value.zero_()
 

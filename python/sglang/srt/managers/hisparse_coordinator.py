@@ -446,19 +446,25 @@ class HiSparseCoordinator:
             )
             host_end = (ordinal + 1) * page_tokens
 
-        # Host-cache eviction is rank-local. Every TP rank must nevertheless
-        # make the same restore decision, otherwise only a subset enters the
-        # collectives in init_kvduo_load_back. Use the shortest contiguous hit.
-        host_hit_length = max(0, host_end - gpu_len)
+        # GPU and host eviction are rank-local. Coordinate the final reusable
+        # prefix end, not the per-rank incremental host hit: ranks can start
+        # with different GPU prefix lengths. Only extend when the common host
+        # end is beyond every rank's GPU end, ensuring every rank enters restore
+        # and finishes with exactly the same prefix length.
+        common_host_end = host_end
+        max_gpu_len = gpu_len
         if self.tp_world_size > 1:
-            common_hit = torch.tensor(host_hit_length, dtype=torch.int64, device="cpu")
-            torch.distributed.all_reduce(
-                common_hit, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            boundaries = torch.tensor(
+                [host_end, -gpu_len], dtype=torch.int64, device="cpu"
             )
-            host_hit_length = int(common_hit.item())
-        host_end = gpu_len + host_hit_length
-        if host_hit_length <= 0:
+            torch.distributed.all_reduce(
+                boundaries, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+            common_host_end = int(boundaries[0].item())
+            max_gpu_len = -int(boundaries[1].item())
+        if common_host_end <= max_gpu_len:
             return match_result
+        host_end = common_host_end
         pages = pages[: host_end // page_tokens]
         identities = []
         first_host_page = gpu_len // page_tokens
