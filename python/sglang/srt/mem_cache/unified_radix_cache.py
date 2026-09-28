@@ -379,13 +379,29 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
+    def _kvduo_max_prefix_len(self, key: RadixKey, coordinator) -> int:
+        limit = len(key)
+        if not coordinator.is_dsv4_hisparse:
+            return limit
+        # KVDuo host records contain C4/main KV but no SWA. Always reserve one
+        # SWA window for ordinary prefill, even in cache layouts whose generic
+        # swa_reprefill_tail_tokens() policy returns zero.
+        already_held_back = self.swa_reprefill_tail_tokens()
+        required = self.sliding_window_size or 0
+        return max(0, limit - max(0, required - already_held_back))
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+
         result = self.session.try_match_prefix(params)
         if result is not None:
             coordinator = getattr(self, "kvduo_coordinator", None)
             if coordinator is not None and params.req is not None:
                 result = coordinator.augment_kvduo_prefix_match(
-                    params.req, result, max_prefix_len=len(params.key)
+                    params.req,
+                    result,
+                    max_prefix_len=self._kvduo_max_prefix_len(
+                        params.key, coordinator
+                    ),
                 )
             return result
         if self.disable:
@@ -401,7 +417,9 @@ class UnifiedRadixCache(BasePrefixCache):
         coordinator = getattr(self, "kvduo_coordinator", None)
         if coordinator is not None and params.req is not None:
             result = coordinator.augment_kvduo_prefix_match(
-                params.req, result, max_prefix_len=len(params.key)
+                params.req,
+                result,
+                max_prefix_len=self._kvduo_max_prefix_len(params.key, coordinator),
             )
         return result
 

@@ -687,12 +687,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.logical_attn_allocator.free_full(free_indices)
 
     def rollback_restore_allocation(self, free_indices: torch.Tensor) -> None:
-        """Release C4/Full restore ownership and any mapped SWA slots."""
+        """Release the C4 and Full pages owned by a restore allocation."""
         if free_indices.numel() == 0:
             return
         self.free_hisparse(free_indices)
-        # Unlike free_full(), SWA.free() releases both its Full and SWA sides.
-        self.logical_attn_allocator.free(free_indices)
+        self.logical_attn_allocator.free_full(free_indices)
 
     def alloc_kvduo_restore(
         self,

@@ -397,7 +397,11 @@ class HiSparseCoordinator:
             len(fill_ids),
             (page_ordinal + 1) * self.page_size * self.compress_ratio,
         )
-        return (self.compress_ratio, tuple(fill_ids[:token_end]))
+        return (
+            self.compress_ratio,
+            getattr(req, "extra_key", None),
+            tuple(fill_ids[:token_end]),
+        )
 
     def augment_kvduo_prefix_match(
         self, req: Req, match_result, max_prefix_len: int | None = None

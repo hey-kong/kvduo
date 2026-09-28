@@ -9,6 +9,7 @@ import torch
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -40,16 +41,47 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         allocator.logical_attn_allocator.free_full.assert_called_once_with(indices)
         allocator.logical_attn_allocator.free_swa.assert_not_called()
 
-    def test_restore_rollback_releases_c4_full_and_swa_slots(self):
+    def test_restore_rollback_releases_only_owned_c4_and_full_slots(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
         allocator.free_hisparse = MagicMock()
-        allocator.logical_attn_allocator = MagicMock(spec=["free"])
+        allocator.logical_attn_allocator = MagicMock(spec=["free_full", "free_swa"])
         indices = torch.tensor([3, 7], dtype=torch.int64)
 
         allocator.rollback_restore_allocation(indices)
 
         allocator.free_hisparse.assert_called_once_with(indices)
-        allocator.logical_attn_allocator.free.assert_called_once_with(indices)
+        allocator.logical_attn_allocator.free_full.assert_called_once_with(indices)
+        allocator.logical_attn_allocator.free_swa.assert_not_called()
+
+    def test_zero_swa_tail_clears_recycled_full_mapping(self):
+        allocator = object.__new__(SWATokenToKVPoolAllocator)
+        allocator.page_size = 2
+        allocator.device = "cpu"
+        full_indices = torch.tensor([4, 5], dtype=torch.int64)
+        allocator.full_attn_allocator = SimpleNamespace(
+            available_size=lambda: 8,
+            alloc_extend=MagicMock(return_value=full_indices),
+        )
+        allocator.swa_attn_allocator = SimpleNamespace(
+            available_size=lambda: 8,
+            alloc_extend=MagicMock(),
+        )
+        allocator.full_to_swa_index_mapping = torch.zeros(16, dtype=torch.int64)
+        allocator.full_to_swa_index_mapping[4:6] = torch.tensor([10, 11])
+        allocator.translate_loc_from_full_to_swa = MagicMock(
+            return_value=torch.tensor([-1], dtype=torch.int64)
+        )
+        prefix = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([2], dtype=torch.int64)
+        last = torch.tensor([-1], dtype=torch.int64)
+
+        result = allocator.alloc_extend_swa_tail(
+            prefix, prefix, seq, seq, last, extend_num_tokens=2, swa_tail_len=0
+        )
+
+        self.assertTrue(torch.equal(result, full_indices))
+        self.assertEqual(allocator.full_to_swa_index_mapping[4:6].tolist(), [0, 0])
+        allocator.swa_attn_allocator.alloc_extend.assert_not_called()
 
     def test_kvduo_restore_allocates_full_and_c4_without_swa(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)

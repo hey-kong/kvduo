@@ -39,6 +39,18 @@ MAX_CONTEXT_LEN = 2048
 
 
 class TestKVDuoPhysicalReclaim(unittest.TestCase):
+    def test_regular_cache_reserves_swa_window_from_kvduo_host_match(self):
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache._sliding_window_size = 4
+        cache.swa_reprefill_tail_tokens = MagicMock(return_value=0)
+        coordinator = SimpleNamespace(is_dsv4_hisparse=True)
+        key = RadixKey(token_ids=array("i", range(12)))
+
+        self.assertEqual(cache._kvduo_max_prefix_len(key, coordinator), 8)
+
     def test_host_only_prefix_is_matched_and_restored_before_prefill(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
         from sglang.srt.mem_cache.base_prefix_cache import MatchResult
@@ -68,9 +80,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.host_prefix_cache = KVDuoHostPrefixCache(8)
         for ordinal, (identity, locs, touches) in enumerate(
             (
-                ((1, (1, 2)), (20, 21), (7, 8)),
-                ((1, (1, 2, 3, 4)), (22, 23), (9, 10)),
-                ((1, (1, 2, 3, 4, 5, 6)), (24, 25), (11, 12)),
+                ((1, "tenant-a", (1, 2)), (20, 21), (7, 8)),
+                ((1, "tenant-a", (1, 2, 3, 4)), (22, 23), (9, 10)),
+                ((1, "tenant-a", (1, 2, 3, 4, 5, 6)), (24, 25), (11, 12)),
             )
         ):
             coordinator.host_prefix_cache.insert(
@@ -87,6 +99,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         req = SimpleNamespace(
             rid="restore",
+            extra_key="tenant-a",
             prefix_indices=torch.tensor([5, 6], dtype=torch.int64),
             get_fill_ids=lambda: [1, 2, 3, 4, 5, 6, 7],
             _compute_max_prefix_len=lambda length: length - 1,
@@ -107,6 +120,18 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             KVDuoPrefixResidency.RESTORE_REQUIRED,
         )
         req.kvduo_residency_plan = match.kvduo_residency_plan
+
+        other_namespace = SimpleNamespace(
+            rid="other",
+            extra_key="tenant-b",
+            prefix_indices=req.prefix_indices,
+            get_fill_ids=req.get_fill_ids,
+            _compute_max_prefix_len=req._compute_max_prefix_len,
+        )
+        isolated = coordinator.augment_kvduo_prefix_match(
+            other_namespace, gpu_match, max_prefix_len=4
+        )
+        self.assertEqual(isolated.host_hit_length, 0)
 
         free_pages = {"full": 0, "swa": 0, "physical": 0}
         logical_allocator = SimpleNamespace(
@@ -195,12 +220,14 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
                 torch.tensor([10, 11]),
             )
         )
-        host_record = coordinator.host_prefix_cache.records[(1, (1, 2, 3, 4))]
+        host_record = coordinator.host_prefix_cache.records[
+            (1, "tenant-a", (1, 2, 3, 4))
+        ]
         self.assertIn(req.rid, host_record.request_references)
         self.assertNotIn(
             req.rid,
             coordinator.host_prefix_cache.records[
-                (1, (1, 2, 3, 4, 5, 6))
+                (1, "tenant-a", (1, 2, 3, 4, 5, 6))
             ].request_references,
         )
         self.assertEqual(host_record.restore_pins, 0)
@@ -221,7 +248,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         self.assertEqual(coordinator.full_data_version[10:12].tolist(), [2, 2])
         self.assertEqual(coordinator.full_last_touch[10:12].tolist(), [9, 10])
         self.assertEqual(
-            coordinator.host_prefix_cache.records[(1, (1, 2, 3, 4))].restore_pins,
+            coordinator.host_prefix_cache.records[
+                (1, "tenant-a", (1, 2, 3, 4))
+            ].restore_pins,
             0,
         )
 
