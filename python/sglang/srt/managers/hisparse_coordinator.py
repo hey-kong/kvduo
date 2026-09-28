@@ -491,19 +491,9 @@ class HiSparseCoordinator:
         restored = None
         try:
             allocator = self.token_to_kv_pool_allocator
-            logical_pages = get_num_new_pages(
-                seq_lens=target_cpu,
-                page_size=allocator.page_size,
-                prefix_lens=prefix_cpu,
+            logical_pages, swa_pages, physical_pages = (
+                self._kvduo_restore_page_requirements(prefix_cpu, target_cpu)
             )
-            if self.is_dsv4_hisparse:
-                physical_pages = get_num_new_pages(
-                    seq_lens=target_cpu // self.compress_ratio,
-                    page_size=self.page_size,
-                    prefix_lens=prefix_cpu // self.compress_ratio,
-                )
-            else:
-                physical_pages = logical_pages
 
             logical_allocator = allocator.logical_attn_allocator
             physical_allocator = allocator.hisparse_attn_allocator
@@ -523,7 +513,6 @@ class HiSparseCoordinator:
             full_initial = full_before
             swa_initial = swa_before
             physical_initial = physical_before
-            swa_pages = 0 if self.is_dsv4_hisparse else logical_pages
             radix_evicted_full_tokens = 0
             radix_evicted_swa_tokens = 0
 
@@ -748,6 +737,31 @@ class HiSparseCoordinator:
             raise
         finally:
             finish_kvduo_prefix_restore(commitment, self.host_prefix_cache)
+
+    def _kvduo_restore_page_requirements(
+        self, prefix_lens_cpu: torch.Tensor, seq_lens_cpu: torch.Tensor
+    ) -> tuple[int, int, int]:
+        """Return Full/logical, SWA, and sparse-physical pages for restore.
+
+        Both supported KVDuo restore allocators own no SWA pages: generic
+        HiSparse has no SWA sub-pool, while DeepSeek V4 deliberately leaves its
+        trailing SWA window to normal prefill.
+        """
+        allocator = self.token_to_kv_pool_allocator
+        logical_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=allocator.page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
+        if self.is_dsv4_hisparse:
+            physical_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu // self.compress_ratio,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu // self.compress_ratio,
+            )
+        else:
+            physical_pages = logical_pages
+        return logical_pages, 0, physical_pages
 
     def _evict_host_prefix_for_slots(self, required_slots: int) -> None:
         if not self.enable_mixed_residency:

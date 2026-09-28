@@ -39,6 +39,22 @@ MAX_CONTEXT_LEN = 2048
 
 
 class TestKVDuoPhysicalReclaim(unittest.TestCase):
+    def test_generic_restore_requires_no_swa_pages(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.is_dsv4_hisparse = False
+        coordinator.page_size = 2
+        coordinator.compress_ratio = 1
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(page_size=2)
+
+        requirements = coordinator._kvduo_restore_page_requirements(
+            torch.tensor([2], dtype=torch.int64),
+            torch.tensor([4], dtype=torch.int64),
+        )
+
+        self.assertEqual(requirements, (1, 0, 1))
+
     def test_regular_cache_reserves_swa_window_from_kvduo_host_match(self):
         from sglang.srt.mem_cache.radix_cache import RadixKey
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
