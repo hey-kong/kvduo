@@ -1158,13 +1158,20 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if req.needs_host_load_back():
-                new_indices, req.last_node = self.tree_cache.init_load_back(
+                new_indices, restored_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
                 )
+                # KVDuo host-prefix restore may be transiently short of logical
+                # or physical pages. All TP ranks make this decision together;
+                # leave the request and its host-prefix references intact so a
+                # later scheduling pass can retry safely.
+                if new_indices is None:
+                    return AddReqResult.OTHER
+                req.last_node = restored_node
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len

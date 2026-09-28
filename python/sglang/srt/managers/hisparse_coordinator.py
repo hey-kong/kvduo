@@ -38,7 +38,7 @@ from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
     plan_kvduo_prefix_restore,
 )
 from sglang.srt.utils import get_device_module, is_hip
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import get_num_new_pages, is_pin_memory_available
 
 device_module = get_device_module()
 
@@ -477,6 +477,86 @@ class HiSparseCoordinator:
         )
         restored = None
         try:
+            allocator = self.token_to_kv_pool_allocator
+            logical_pages = get_num_new_pages(
+                seq_lens=target_cpu,
+                page_size=allocator.page_size,
+                prefix_lens=prefix_cpu,
+            )
+            if self.is_dsv4_hisparse:
+                physical_pages = get_num_new_pages(
+                    seq_lens=target_cpu // self.compress_ratio,
+                    page_size=self.page_size,
+                    prefix_lens=prefix_cpu // self.compress_ratio,
+                )
+            else:
+                physical_pages = logical_pages
+
+            logical_allocator = allocator.logical_attn_allocator
+            physical_allocator = allocator.hisparse_attn_allocator
+            logical_before = logical_allocator.available_size() // allocator.page_size
+            physical_before = physical_allocator.available_size() // self.page_size
+            local_ready = logical_before >= logical_pages
+            if self.tp_world_size > 1:
+                ready = torch.tensor(
+                    int(local_ready), dtype=torch.int32, device=self.device
+                )
+                torch.distributed.all_reduce(
+                    ready, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                )
+                local_ready = bool(ready.item())
+            if not local_ready:
+                logger.warning(
+                    "KVDuo host-prefix restore deferred for req %s: logical pool "
+                    "needs %d pages, had %d before allocation; physical pool needs "
+                    "%d pages, had %d",
+                    req.rid,
+                    logical_pages,
+                    logical_before,
+                    physical_pages,
+                    physical_before,
+                )
+                return None
+
+            # A restore can need a full physical page even though its tokens were
+            # discounted from the prefill-input budget. Reclaim before entering
+            # alloc_extend, while protecting every GPU prefix location that this
+            # request is about to append to.
+            protected = self.mem_pool_device.translate_loc_from_full_to_compressed(
+                req.prefix_indices
+            )
+            self._kvduo_pressure_protected = protected
+            try:
+                pressure = self._reclaim_for_physical_allocation(
+                    physical_pages * self.page_size
+                )
+            finally:
+                self._kvduo_pressure_protected = None
+            local_ready = pressure.action is KVDuoPressureAction.SUCCESS
+            if self.tp_world_size > 1:
+                ready = torch.tensor(
+                    int(local_ready), dtype=torch.int32, device=self.device
+                )
+                torch.distributed.all_reduce(
+                    ready, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                )
+                local_ready = bool(ready.item())
+            if not local_ready:
+                logger.warning(
+                    "KVDuo host-prefix restore deferred for req %s: physical pool "
+                    "reclaim failed (needs %d pages, had %d before reclaim, "
+                    "action=%s, reason=%s, remaining_shortfall_bytes=%d); logical "
+                    "pool had %d pages",
+                    req.rid,
+                    physical_pages,
+                    physical_before,
+                    pressure.action.name,
+                    pressure.reason.name,
+                    pressure.remaining_shortfall_bytes,
+                    logical_before,
+                )
+                return None
+
             restored = self.token_to_kv_pool_allocator.alloc_extend(
                 prefix_gpu,
                 prefix_cpu,
@@ -485,8 +565,30 @@ class HiSparseCoordinator:
                 last_loc,
                 host_hit_length,
             )
-            if restored is None:
-                raise RuntimeError("KVDuo host-prefix restore admission became invalid")
+            allocation_ready = restored is not None
+            if self.tp_world_size > 1:
+                ready = torch.tensor(
+                    int(allocation_ready), dtype=torch.int32, device=self.device
+                )
+                torch.distributed.all_reduce(
+                    ready, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                )
+                allocation_ready = bool(ready.item())
+            if not allocation_ready:
+                if restored is not None:
+                    self.token_to_kv_pool_allocator.free(restored)
+                    restored = None
+                logger.warning(
+                    "KVDuo host-prefix restore deferred for req %s: alloc_extend "
+                    "failed after admission (logical pool had %d pages; physical "
+                    "pool had %d pages before reclaim; needed logical=%d, physical=%d)",
+                    req.rid,
+                    logical_before,
+                    physical_before,
+                    logical_pages,
+                    physical_pages,
+                )
+                return None
 
             host_locs = []
             versions = []

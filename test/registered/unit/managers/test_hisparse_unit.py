@@ -11,7 +11,7 @@ import os
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import torch
 
@@ -47,6 +47,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             KVDuoHostPrefixCache,
             KVDuoPrefixResidency,
         )
+        from sglang.srt.mem_cache.sparsity.core.kvduo_state import (
+            KVDuoPressureAction,
+        )
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
@@ -54,6 +57,8 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.page_size = 2
         coordinator.compress_ratio = 1
         coordinator.device = "cpu"
+        coordinator.is_dsv4_hisparse = False
+        coordinator.tp_world_size = 1
         coordinator.item_size_bytes = 4
         coordinator.mem_pool_device = SimpleNamespace(layer_num=2)
         coordinator.full_generation = torch.zeros(32, dtype=torch.int64)
@@ -100,8 +105,15 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         req.kvduo_residency_plan = match.kvduo_residency_plan
 
+        logical_allocator = SimpleNamespace(available_size=lambda: 8)
+        physical_allocator = SimpleNamespace(available_size=lambda: 0)
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
-            alloc_extend=MagicMock(return_value=torch.tensor([10, 11])),
+            page_size=2,
+            logical_attn_allocator=logical_allocator,
+            hisparse_attn_allocator=physical_allocator,
+            alloc_extend=MagicMock(
+                side_effect=[None, torch.tensor([10, 11])]
+            ),
             free=MagicMock(),
         )
         load = MagicMock()
@@ -111,9 +123,35 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             translate_loc_from_full_to_hisparse_device=lambda value: value,
         )
         coordinator.mem_pool_host = SimpleNamespace(load_to_device_per_layer=load)
+        protected_during_reclaim = []
+
+        def reclaim(slots):
+            protected_during_reclaim.append(
+                coordinator._kvduo_pressure_protected.clone()
+            )
+            return SimpleNamespace(action=KVDuoPressureAction.SUCCESS)
+
+        coordinator._kvduo_pressure_protected = None
+        coordinator._reclaim_for_physical_allocation = MagicMock(side_effect=reclaim)
+
+        # The allocator can still lose a race after preflight. This must defer
+        # rather than crash, and the request-owned host match must remain pinned
+        # for the next scheduling pass.
+        deferred = coordinator.init_kvduo_load_back(req, match.host_hit_length)
+        self.assertIsNone(deferred)
+        host_record = coordinator.host_prefix_cache.records[(1, (1, 2, 3, 4))]
+        self.assertIn(req.rid, host_record.request_references)
+        self.assertEqual(host_record.restore_pins, 0)
+
         restored = coordinator.init_kvduo_load_back(req, match.host_hit_length)
 
         self.assertTrue(torch.equal(restored, torch.tensor([10, 11])))
+        self.assertEqual(
+            coordinator._reclaim_for_physical_allocation.call_args_list,
+            [call(2), call(2)],
+        )
+        self.assertEqual(protected_during_reclaim[0].tolist(), [5, 6])
+        self.assertIsNone(coordinator._kvduo_pressure_protected)
         self.assertEqual(load.call_count, 2)
         self.assertEqual(coordinator.full_data_version[10:12].tolist(), [2, 2])
         self.assertEqual(coordinator.full_last_touch[10:12].tolist(), [9, 10])
