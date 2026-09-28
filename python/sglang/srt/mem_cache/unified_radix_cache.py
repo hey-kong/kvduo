@@ -1908,7 +1908,11 @@ class UnifiedRadixCache(BasePrefixCache):
         coordinator = getattr(self, "kvduo_coordinator", None)
         if coordinator is not None and params.req is not None:
             restored = coordinator.init_kvduo_load_back(
-                params.req, params.host_hit_length
+                params.req,
+                params.host_hit_length,
+                radix_reclaimer=lambda num_tokens: self.evict(
+                    EvictParams(num_tokens=num_tokens)
+                ).num_tokens_evicted,
             )
             return restored, params.best_match_node
         best_match_node_id = params.best_match_node

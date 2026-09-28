@@ -458,7 +458,9 @@ class HiSparseCoordinator:
             kvduo_residency_plan=plan,
         )
 
-    def init_kvduo_load_back(self, req: Req, host_hit_length: int):
+    def init_kvduo_load_back(
+        self, req: Req, host_hit_length: int, radix_reclaimer=None
+    ):
         """Allocate and restore the host-only suffix before prefill executes."""
         plan = getattr(req, "kvduo_residency_plan", None)
         if plan is None or host_hit_length <= 0:
@@ -496,6 +498,33 @@ class HiSparseCoordinator:
             physical_allocator = allocator.hisparse_attn_allocator
             logical_before = logical_allocator.available_size() // allocator.page_size
             physical_before = physical_allocator.available_size() // self.page_size
+            logical_initial = logical_before
+            physical_initial = physical_before
+            radix_evicted_tokens = 0
+
+            # Prefill admission includes evictable Radix pages. Materialize that
+            # budget before judging the restore impossible. A physical-only
+            # shortage may require evicting more than the logical shortfall;
+            # repeat while eviction makes progress because an evicted host-only
+            # Radix page need not release a sparse physical page.
+            if radix_reclaimer is not None:
+                while logical_before < logical_pages or physical_before < physical_pages:
+                    logical_shortfall = max(0, logical_pages - logical_before)
+                    physical_shortfall = max(0, physical_pages - physical_before)
+                    evict_tokens = max(
+                        logical_shortfall * allocator.page_size,
+                        physical_shortfall * self.page_size * self.compress_ratio,
+                    )
+                    evicted = 0 if evict_tokens == 0 else radix_reclaimer(evict_tokens)
+                    if evicted <= 0:
+                        break
+                    radix_evicted_tokens += evicted
+                    logical_before = (
+                        logical_allocator.available_size() // allocator.page_size
+                    )
+                    physical_before = (
+                        physical_allocator.available_size() // self.page_size
+                    )
             local_ready = logical_before >= logical_pages
             if self.tp_world_size > 1:
                 ready = torch.tensor(
@@ -508,12 +537,16 @@ class HiSparseCoordinator:
             if not local_ready:
                 logger.warning(
                     "KVDuo host-prefix restore deferred for req %s: logical pool "
-                    "needs %d pages, had %d before allocation; physical pool needs "
-                    "%d pages, had %d",
+                    "needs %d pages, had %d initially and %d after evicting %d "
+                    "Radix tokens; physical pool needs %d pages, had %d initially "
+                    "and %d after Radix eviction",
                     req.rid,
                     logical_pages,
+                    logical_initial,
                     logical_before,
+                    radix_evicted_tokens,
                     physical_pages,
+                    physical_initial,
                     physical_before,
                 )
                 return None
@@ -544,15 +577,19 @@ class HiSparseCoordinator:
             if not local_ready:
                 logger.warning(
                     "KVDuo host-prefix restore deferred for req %s: physical pool "
-                    "reclaim failed (needs %d pages, had %d before reclaim, "
+                    "reclaim failed (needs %d pages, had %d initially and %d after "
+                    "evicting %d Radix tokens, "
                     "action=%s, reason=%s, remaining_shortfall_bytes=%d); logical "
-                    "pool had %d pages",
+                    "pool had %d initially and %d after Radix eviction",
                     req.rid,
                     physical_pages,
+                    physical_initial,
                     physical_before,
+                    radix_evicted_tokens,
                     pressure.action.name,
                     pressure.reason.name,
                     pressure.remaining_shortfall_bytes,
+                    logical_initial,
                     logical_before,
                 )
                 return None
@@ -576,7 +613,10 @@ class HiSparseCoordinator:
                 allocation_ready = bool(ready.item())
             if not allocation_ready:
                 if restored is not None:
-                    self.token_to_kv_pool_allocator.free(restored)
+                    # DeepSeek-V4's free() owns only logical slots. Restore
+                    # allocation owns both logical and C4 physical pages, so a
+                    # cross-rank rollback must use the full-allocation release.
+                    self.token_to_kv_pool_allocator.free_full(restored)
                     restored = None
                 logger.warning(
                     "KVDuo host-prefix restore deferred for req %s: alloc_extend "

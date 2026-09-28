@@ -11,7 +11,7 @@ import os
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
@@ -58,7 +58,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.compress_ratio = 1
         coordinator.device = "cpu"
         coordinator.is_dsv4_hisparse = False
-        coordinator.tp_world_size = 1
+        coordinator.tp_world_size = 2
         coordinator.item_size_bytes = 4
         coordinator.mem_pool_device = SimpleNamespace(layer_num=2)
         coordinator.full_generation = torch.zeros(32, dtype=torch.int64)
@@ -105,16 +105,29 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         req.kvduo_residency_plan = match.kvduo_residency_plan
 
-        logical_allocator = SimpleNamespace(available_size=lambda: 8)
-        physical_allocator = SimpleNamespace(available_size=lambda: 0)
+        free_pages = {"logical": 0, "physical": 0}
+        logical_allocator = SimpleNamespace(
+            available_size=lambda: free_pages["logical"] * 2
+        )
+        physical_allocator = SimpleNamespace(
+            available_size=lambda: free_pages["physical"] * 2
+        )
+
+        def alloc_extend(*args):
+            free_pages["logical"] -= 1
+            free_pages["physical"] -= 1
+            return torch.tensor([10, 11])
+
+        def free_full(indices):
+            free_pages["logical"] += 1
+            free_pages["physical"] += 1
+
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=2,
             logical_attn_allocator=logical_allocator,
             hisparse_attn_allocator=physical_allocator,
-            alloc_extend=MagicMock(
-                side_effect=[None, torch.tensor([10, 11])]
-            ),
-            free=MagicMock(),
+            alloc_extend=MagicMock(side_effect=alloc_extend),
+            free_full=MagicMock(side_effect=free_full),
         )
         load = MagicMock()
         coordinator.mem_pool_device = SimpleNamespace(
@@ -134,16 +147,52 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator._kvduo_pressure_protected = None
         coordinator._reclaim_for_physical_allocation = MagicMock(side_effect=reclaim)
 
-        # The allocator can still lose a race after preflight. This must defer
-        # rather than crash, and the request-owned host match must remain pinned
-        # for the next scheduling pass.
-        deferred = coordinator.init_kvduo_load_back(req, match.host_hit_length)
+        radix_reclaimer = MagicMock()
+
+        def evict_radix(num_tokens):
+            # No active request can be reclaimed in this boundary case; the
+            # schedulable capacity exists entirely in an evictable Radix page.
+            free_pages["logical"] = 4
+            free_pages["physical"] = 1
+            return num_tokens
+
+        radix_reclaimer.side_effect = evict_radix
+        all_reduce_count = 0
+
+        def fail_remote_allocation(value, **kwargs):
+            nonlocal all_reduce_count
+            all_reduce_count += 1
+            # Logical preflight and physical reclaim pass on every rank. Only
+            # the final allocation fails remotely.
+            if all_reduce_count == 3:
+                value.zero_()
+
+        before_partial_alloc = dict(free_pages)
+        with patch("torch.distributed.all_reduce", side_effect=fail_remote_allocation):
+            deferred = coordinator.init_kvduo_load_back(
+                req, match.host_hit_length, radix_reclaimer=radix_reclaimer
+            )
         self.assertIsNone(deferred)
+        radix_reclaimer.assert_called_once_with(2)
+        # The successful local rank must release both logical and C4 pages when
+        # another TP rank rejects the allocation.
+        self.assertEqual(free_pages, {"logical": 4, "physical": 1})
+        self.assertNotEqual(free_pages, before_partial_alloc)
+        coordinator.token_to_kv_pool_allocator.free_full.assert_called_once()
+        self.assertTrue(
+            torch.equal(
+                coordinator.token_to_kv_pool_allocator.free_full.call_args.args[0],
+                torch.tensor([10, 11]),
+            )
+        )
         host_record = coordinator.host_prefix_cache.records[(1, (1, 2, 3, 4))]
         self.assertIn(req.rid, host_record.request_references)
         self.assertEqual(host_record.restore_pins, 0)
 
-        restored = coordinator.init_kvduo_load_back(req, match.host_hit_length)
+        coordinator.tp_world_size = 1
+        restored = coordinator.init_kvduo_load_back(
+            req, match.host_hit_length, radix_reclaimer=radix_reclaimer
+        )
 
         self.assertTrue(torch.equal(restored, torch.tensor([10, 11])))
         self.assertEqual(
