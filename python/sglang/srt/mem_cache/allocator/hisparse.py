@@ -307,10 +307,15 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.available_size()
             <= self.logical_attn_allocator.size
         )
+
         assert (
             self.hisparse_attn_allocator.available_size()
             <= self.hisparse_attn_allocator.size
         )
+
+    def rollback_restore_allocation(self, free_indices: torch.Tensor) -> None:
+        """Undo an alloc_extend used for host-prefix restoration."""
+        self.free(free_indices)
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -677,6 +682,14 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
         self.free_hisparse(free_indices)
         self.logical_attn_allocator.free_full(free_indices)
+
+    def rollback_restore_allocation(self, free_indices: torch.Tensor) -> None:
+        """Release C4, Full, and SWA ownership acquired by alloc_extend."""
+        if free_indices.numel() == 0:
+            return
+        self.free_hisparse(free_indices)
+        # Unlike free_full(), SWA.free() releases both its Full and SWA sides.
+        self.logical_attn_allocator.free(free_indices)
 
     def clear(self):
         self.logical_attn_allocator.clear()

@@ -1907,12 +1907,18 @@ class UnifiedRadixCache(BasePrefixCache):
         Returns (device_indices, last_node) tuple."""
         coordinator = getattr(self, "kvduo_coordinator", None)
         if coordinator is not None and params.req is not None:
+            def reclaim_radix(full_tokens: int, swa_tokens: int) -> tuple[int, int]:
+                result = self.evict(
+                    EvictParams(
+                        num_tokens=full_tokens, swa_num_tokens=swa_tokens
+                    )
+                )
+                return result.num_tokens_evicted, result.swa_num_tokens_evicted
+
             restored = coordinator.init_kvduo_load_back(
                 params.req,
                 params.host_hit_length,
-                radix_reclaimer=lambda num_tokens: self.evict(
-                    EvictParams(num_tokens=num_tokens)
-                ).num_tokens_evicted,
+                radix_reclaimer=reclaim_radix,
             )
             return restored, params.best_match_node
         best_match_node_id = params.best_match_node

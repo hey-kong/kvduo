@@ -57,7 +57,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.page_size = 2
         coordinator.compress_ratio = 1
         coordinator.device = "cpu"
-        coordinator.is_dsv4_hisparse = False
+        coordinator.is_dsv4_hisparse = True
         coordinator.tp_world_size = 2
         coordinator.item_size_bytes = 4
         coordinator.mem_pool_device = SimpleNamespace(layer_num=2)
@@ -105,21 +105,24 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         req.kvduo_residency_plan = match.kvduo_residency_plan
 
-        free_pages = {"logical": 0, "physical": 0}
+        free_pages = {"full": 0, "swa": 0, "physical": 0}
         logical_allocator = SimpleNamespace(
-            available_size=lambda: free_pages["logical"] * 2
+            full_available_size=lambda: free_pages["full"] * 2,
+            swa_available_size=lambda: free_pages["swa"] * 2,
         )
         physical_allocator = SimpleNamespace(
             available_size=lambda: free_pages["physical"] * 2
         )
 
         def alloc_extend(*args):
-            free_pages["logical"] -= 1
+            free_pages["full"] -= 1
+            free_pages["swa"] -= 1
             free_pages["physical"] -= 1
             return torch.tensor([10, 11])
 
-        def free_full(indices):
-            free_pages["logical"] += 1
+        def rollback_restore_allocation(indices):
+            free_pages["full"] += 1
+            free_pages["swa"] += 1
             free_pages["physical"] += 1
 
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
@@ -127,7 +130,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             logical_attn_allocator=logical_allocator,
             hisparse_attn_allocator=physical_allocator,
             alloc_extend=MagicMock(side_effect=alloc_extend),
-            free_full=MagicMock(side_effect=free_full),
+            rollback_restore_allocation=MagicMock(
+                side_effect=rollback_restore_allocation
+            ),
         )
         load = MagicMock()
         coordinator.mem_pool_device = SimpleNamespace(
@@ -149,12 +154,13 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         radix_reclaimer = MagicMock()
 
-        def evict_radix(num_tokens):
+        def evict_radix(full_tokens, swa_tokens):
             # No active request can be reclaimed in this boundary case; the
             # schedulable capacity exists entirely in an evictable Radix page.
-            free_pages["logical"] = 4
+            free_pages["full"] = 4
+            free_pages["swa"] = 1
             free_pages["physical"] = 1
-            return num_tokens
+            return full_tokens, swa_tokens
 
         radix_reclaimer.side_effect = evict_radix
         all_reduce_count = 0
@@ -173,15 +179,18 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
                 req, match.host_hit_length, radix_reclaimer=radix_reclaimer
             )
         self.assertIsNone(deferred)
-        radix_reclaimer.assert_called_once_with(2)
-        # The successful local rank must release both logical and C4 pages when
+        radix_reclaimer.assert_called_once_with(2, 2)
+        # The successful local rank must release Full, SWA, and C4 pages when
         # another TP rank rejects the allocation.
-        self.assertEqual(free_pages, {"logical": 4, "physical": 1})
+        self.assertEqual(free_pages, {"full": 4, "swa": 1, "physical": 1})
         self.assertNotEqual(free_pages, before_partial_alloc)
-        coordinator.token_to_kv_pool_allocator.free_full.assert_called_once()
+        rollback = (
+            coordinator.token_to_kv_pool_allocator.rollback_restore_allocation
+        )
+        rollback.assert_called_once()
         self.assertTrue(
             torch.equal(
-                coordinator.token_to_kv_pool_allocator.free_full.call_args.args[0],
+                rollback.call_args.args[0],
                 torch.tensor([10, 11]),
             )
         )

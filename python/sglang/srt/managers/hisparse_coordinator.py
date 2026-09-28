@@ -496,11 +496,24 @@ class HiSparseCoordinator:
 
             logical_allocator = allocator.logical_attn_allocator
             physical_allocator = allocator.hisparse_attn_allocator
-            logical_before = logical_allocator.available_size() // allocator.page_size
+            if self.is_dsv4_hisparse:
+                full_before = (
+                    logical_allocator.full_available_size() // allocator.page_size
+                )
+                swa_before = (
+                    logical_allocator.swa_available_size() // allocator.page_size
+                )
+            else:
+                full_before = (
+                    logical_allocator.available_size() // allocator.page_size
+                )
+                swa_before = logical_pages
             physical_before = physical_allocator.available_size() // self.page_size
-            logical_initial = logical_before
+            full_initial = full_before
+            swa_initial = swa_before
             physical_initial = physical_before
-            radix_evicted_tokens = 0
+            radix_evicted_full_tokens = 0
+            radix_evicted_swa_tokens = 0
 
             # Prefill admission includes evictable Radix pages. Materialize that
             # budget before judging the restore impossible. A physical-only
@@ -508,24 +521,47 @@ class HiSparseCoordinator:
             # repeat while eviction makes progress because an evicted host-only
             # Radix page need not release a sparse physical page.
             if radix_reclaimer is not None:
-                while logical_before < logical_pages or physical_before < physical_pages:
-                    logical_shortfall = max(0, logical_pages - logical_before)
+                while (
+                    full_before < logical_pages
+                    or swa_before < logical_pages
+                    or physical_before < physical_pages
+                ):
+                    full_shortfall = max(0, logical_pages - full_before)
+                    swa_shortfall = max(0, logical_pages - swa_before)
                     physical_shortfall = max(0, physical_pages - physical_before)
-                    evict_tokens = max(
-                        logical_shortfall * allocator.page_size,
+                    full_evict_tokens = max(
+                        full_shortfall * allocator.page_size,
                         physical_shortfall * self.page_size * self.compress_ratio,
                     )
-                    evicted = 0 if evict_tokens == 0 else radix_reclaimer(evict_tokens)
-                    if evicted <= 0:
+                    swa_evict_tokens = swa_shortfall * allocator.page_size
+                    if full_evict_tokens == 0 and swa_evict_tokens == 0:
                         break
-                    radix_evicted_tokens += evicted
-                    logical_before = (
-                        logical_allocator.available_size() // allocator.page_size
+                    evicted_full, evicted_swa = radix_reclaimer(
+                        full_evict_tokens, swa_evict_tokens
                     )
+                    if evicted_full <= 0 and evicted_swa <= 0:
+                        break
+                    radix_evicted_full_tokens += evicted_full
+                    radix_evicted_swa_tokens += evicted_swa
+                    if self.is_dsv4_hisparse:
+                        full_before = (
+                            logical_allocator.full_available_size()
+                            // allocator.page_size
+                        )
+                        swa_before = (
+                            logical_allocator.swa_available_size()
+                            // allocator.page_size
+                        )
+                    else:
+                        full_before = (
+                            logical_allocator.available_size() // allocator.page_size
+                        )
                     physical_before = (
                         physical_allocator.available_size() // self.page_size
                     )
-            local_ready = logical_before >= logical_pages
+            local_ready = (
+                full_before >= logical_pages and swa_before >= logical_pages
+            )
             if self.tp_world_size > 1:
                 ready = torch.tensor(
                     int(local_ready), dtype=torch.int32, device=self.device
@@ -536,15 +572,19 @@ class HiSparseCoordinator:
                 local_ready = bool(ready.item())
             if not local_ready:
                 logger.warning(
-                    "KVDuo host-prefix restore deferred for req %s: logical pool "
-                    "needs %d pages, had %d initially and %d after evicting %d "
-                    "Radix tokens; physical pool needs %d pages, had %d initially "
-                    "and %d after Radix eviction",
+                    "KVDuo host-prefix restore deferred for req %s: logical Full/SWA "
+                    "need %d pages each, had Full=%d/SWA=%d initially and "
+                    "Full=%d/SWA=%d after evicting Full=%d/SWA=%d Radix tokens; "
+                    "physical pool needs %d pages, had %d initially and %d after "
+                    "Radix eviction",
                     req.rid,
                     logical_pages,
-                    logical_initial,
-                    logical_before,
-                    radix_evicted_tokens,
+                    full_initial,
+                    swa_initial,
+                    full_before,
+                    swa_before,
+                    radix_evicted_full_tokens,
+                    radix_evicted_swa_tokens,
                     physical_pages,
                     physical_initial,
                     physical_before,
@@ -578,19 +618,22 @@ class HiSparseCoordinator:
                 logger.warning(
                     "KVDuo host-prefix restore deferred for req %s: physical pool "
                     "reclaim failed (needs %d pages, had %d initially and %d after "
-                    "evicting %d Radix tokens, "
+                    "evicting Full=%d/SWA=%d Radix tokens, "
                     "action=%s, reason=%s, remaining_shortfall_bytes=%d); logical "
-                    "pool had %d initially and %d after Radix eviction",
+                    "Full/SWA pools had %d/%d initially and %d/%d after Radix eviction",
                     req.rid,
                     physical_pages,
                     physical_initial,
                     physical_before,
-                    radix_evicted_tokens,
+                    radix_evicted_full_tokens,
+                    radix_evicted_swa_tokens,
                     pressure.action.name,
                     pressure.reason.name,
                     pressure.remaining_shortfall_bytes,
-                    logical_initial,
-                    logical_before,
+                    full_initial,
+                    swa_initial,
+                    full_before,
+                    swa_before,
                 )
                 return None
 
@@ -613,17 +656,19 @@ class HiSparseCoordinator:
                 allocation_ready = bool(ready.item())
             if not allocation_ready:
                 if restored is not None:
-                    # DeepSeek-V4's free() owns only logical slots. Restore
-                    # allocation owns both logical and C4 physical pages, so a
-                    # cross-rank rollback must use the full-allocation release.
-                    self.token_to_kv_pool_allocator.free_full(restored)
+                    # Restore allocation owns every pool touched by alloc_extend
+                    # (Full, SWA, and C4 for DeepSeek V4), so use its symmetric
+                    # rollback rather than a component-specific free method.
+                    self.token_to_kv_pool_allocator.rollback_restore_allocation(
+                        restored
+                    )
                     restored = None
                 logger.warning(
                     "KVDuo host-prefix restore deferred for req %s: alloc_extend "
                     "failed after admission (logical pool had %d pages; physical "
                     "pool had %d pages before reclaim; needed logical=%d, physical=%d)",
                     req.rid,
-                    logical_before,
+                    min(full_before, swa_before),
                     physical_before,
                     logical_pages,
                     physical_pages,
@@ -686,7 +731,7 @@ class HiSparseCoordinator:
             return restored
         except Exception:
             if restored is not None:
-                self.token_to_kv_pool_allocator.free(restored)
+                self.token_to_kv_pool_allocator.rollback_restore_allocation(restored)
             raise
         finally:
             finish_kvduo_prefix_restore(commitment, self.host_prefix_cache)

@@ -40,6 +40,17 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         allocator.logical_attn_allocator.free_full.assert_called_once_with(indices)
         allocator.logical_attn_allocator.free_swa.assert_not_called()
 
+    def test_restore_rollback_releases_c4_full_and_swa_slots(self):
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.free_hisparse = MagicMock()
+        allocator.logical_attn_allocator = MagicMock(spec=["free"])
+        indices = torch.tensor([3, 7], dtype=torch.int64)
+
+        allocator.rollback_restore_allocation(indices)
+
+        allocator.free_hisparse.assert_called_once_with(indices)
+        allocator.logical_attn_allocator.free.assert_called_once_with(indices)
+
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
         logical_allocator = MagicMock(spec=["alloc_extend_swa_tail"])
