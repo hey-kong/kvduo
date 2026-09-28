@@ -185,7 +185,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         coordinator.release_kvduo_match_refs(heterogeneous_gpu)
 
-        fallback = object()
+        # Preserve the two-token common GPU prefix instead of falling back to
+        # an empty match; this can keep a long prompt within prefill budget.
+        common_gpu_matcher = MagicMock(return_value=gpu_match)
 
         def remote_cannot_reach_longer_gpu_prefix(value, **kwargs):
             # The remote GPU prefix is longer than the shortest host-covered
@@ -202,9 +204,11 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
                 rank_mismatch,
                 gpu_match,
                 max_prefix_len=4,
-                empty_match_result=fallback,
+                common_gpu_matcher=common_gpu_matcher,
             )
-        self.assertIs(synchronized, fallback)
+        self.assertIs(synchronized, gpu_match)
+        self.assertEqual(len(synchronized.device_indices), 2)
+        common_gpu_matcher.assert_called_once_with(2)
 
         def remote_miss(value, **kwargs):
             value.zero_()

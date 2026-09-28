@@ -390,20 +390,9 @@ class UnifiedRadixCache(BasePrefixCache):
         required = self.sliding_window_size or 0
         return max(0, limit - max(0, required - already_held_back))
 
-    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-
+    def _match_prefix_without_kvduo(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:
-            coordinator = getattr(self, "kvduo_coordinator", None)
-            if coordinator is not None and params.req is not None:
-                result = coordinator.augment_kvduo_prefix_match(
-                    params.req,
-                    result,
-                    max_prefix_len=self._kvduo_max_prefix_len(
-                        params.key, coordinator
-                    ),
-                    empty_match_result=self.tree_core.empty_match_result,
-                )
             return result
         if self.disable:
             return self.tree_core.empty_match_result
@@ -415,13 +404,35 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        return result
+
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        result = self._match_prefix_without_kvduo(params)
         coordinator = getattr(self, "kvduo_coordinator", None)
         if coordinator is not None and params.req is not None:
+            def match_common_gpu_prefix(common_len: int) -> MatchResult:
+                key = params.key
+                raw_limit = common_len + 1 if key.is_bigram else common_len
+                limit = (
+                    raw_limit if key.limit is None else min(key.limit, raw_limit)
+                )
+                common_params = MatchPrefixParams(
+                    key=RadixKey(
+                        token_ids=key.token_ids,
+                        extra_key=key.extra_key,
+                        is_bigram=key.is_bigram,
+                        limit=limit,
+                    ),
+                    cow_mamba=params.cow_mamba,
+                    req=params.req,
+                )
+                return self._match_prefix_without_kvduo(common_params)
+
             result = coordinator.augment_kvduo_prefix_match(
                 params.req,
                 result,
                 max_prefix_len=self._kvduo_max_prefix_len(params.key, coordinator),
-                empty_match_result=self.tree_core.empty_match_result,
+                common_gpu_matcher=match_common_gpu_prefix,
             )
         return result
 

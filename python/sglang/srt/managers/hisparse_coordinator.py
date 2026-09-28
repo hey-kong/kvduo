@@ -408,7 +408,7 @@ class HiSparseCoordinator:
         req: Req,
         match_result,
         max_prefix_len: int | None = None,
-        empty_match_result=None,
+        common_gpu_matcher=None,
     ):
         """Extend a GPU Radix hit with the longest valid host-owned prefix.
 
@@ -470,12 +470,12 @@ class HiSparseCoordinator:
             max_gpu_len = -int(boundaries[2].item())
         if common_host_end <= max_gpu_len:
             if min_gpu_len != max_gpu_len:
-                if empty_match_result is None:
+                if common_gpu_matcher is None:
                     raise RuntimeError(
                         "KVDuo TP GPU prefix lengths diverged without a common "
-                        "host-covered extension"
+                        "host-covered extension or common-prefix matcher"
                     )
-                return empty_match_result
+                return common_gpu_matcher(min_gpu_len)
             return match_result
         host_end = common_host_end
         pages = pages[: host_end // page_tokens]
