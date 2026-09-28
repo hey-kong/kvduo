@@ -402,6 +402,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     max_prefix_len=self._kvduo_max_prefix_len(
                         params.key, coordinator
                     ),
+                    empty_match_result=self.tree_core.empty_match_result,
                 )
             return result
         if self.disable:
@@ -420,6 +421,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 params.req,
                 result,
                 max_prefix_len=self._kvduo_max_prefix_len(params.key, coordinator),
+                empty_match_result=self.tree_core.empty_match_result,
             )
         return result
 

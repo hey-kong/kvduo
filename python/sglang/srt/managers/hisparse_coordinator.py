@@ -404,7 +404,11 @@ class HiSparseCoordinator:
         )
 
     def augment_kvduo_prefix_match(
-        self, req: Req, match_result, max_prefix_len: int | None = None
+        self,
+        req: Req,
+        match_result,
+        max_prefix_len: int | None = None,
+        empty_match_result=None,
     ):
         """Extend a GPU Radix hit with the longest valid host-owned prefix.
 
@@ -452,17 +456,26 @@ class HiSparseCoordinator:
         # end is beyond every rank's GPU end, ensuring every rank enters restore
         # and finishes with exactly the same prefix length.
         common_host_end = host_end
+        min_gpu_len = gpu_len
         max_gpu_len = gpu_len
         if self.tp_world_size > 1:
             boundaries = torch.tensor(
-                [host_end, -gpu_len], dtype=torch.int64, device="cpu"
+                [host_end, gpu_len, -gpu_len], dtype=torch.int64, device="cpu"
             )
             torch.distributed.all_reduce(
                 boundaries, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
             common_host_end = int(boundaries[0].item())
-            max_gpu_len = -int(boundaries[1].item())
+            min_gpu_len = int(boundaries[1].item())
+            max_gpu_len = -int(boundaries[2].item())
         if common_host_end <= max_gpu_len:
+            if min_gpu_len != max_gpu_len:
+                if empty_match_result is None:
+                    raise RuntimeError(
+                        "KVDuo TP GPU prefix lengths diverged without a common "
+                        "host-covered extension"
+                    )
+                return empty_match_result
             return match_result
         host_end = common_host_end
         pages = pages[: host_end // page_tokens]

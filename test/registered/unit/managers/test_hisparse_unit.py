@@ -168,10 +168,11 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
 
         def remote_has_longer_gpu_prefix(value, **kwargs):
-            # Local boundaries are [host_end=4, -gpu_len=-2]. The remote rank
-            # has the same final host end but a three-token GPU prefix.
+            # Local boundaries are [host_end=4, gpu_len=2, -gpu_len=-2]. The
+            # remote rank has the same final host end but a 3-token GPU prefix.
             value[0] = min(int(value[0]), 4)
-            value[1] = min(int(value[1]), -3)
+            value[1] = min(int(value[1]), 3)
+            value[2] = min(int(value[2]), -3)
 
         with patch(
             "torch.distributed.all_reduce", side_effect=remote_has_longer_gpu_prefix
@@ -183,6 +184,27 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             len(gpu_match.device_indices) + synchronized.host_hit_length, 4
         )
         coordinator.release_kvduo_match_refs(heterogeneous_gpu)
+
+        fallback = object()
+
+        def remote_cannot_reach_longer_gpu_prefix(value, **kwargs):
+            # The remote GPU prefix is longer than the shortest host-covered
+            # prefix, so no positive restore can produce a common final end.
+            value[0] = min(int(value[0]), 2)
+            value[1] = min(int(value[1]), 3)
+            value[2] = min(int(value[2]), -3)
+
+        with patch(
+            "torch.distributed.all_reduce",
+            side_effect=remote_cannot_reach_longer_gpu_prefix,
+        ):
+            synchronized = coordinator.augment_kvduo_prefix_match(
+                rank_mismatch,
+                gpu_match,
+                max_prefix_len=4,
+                empty_match_result=fallback,
+            )
+        self.assertIs(synchronized, fallback)
 
         def remote_miss(value, **kwargs):
             value.zero_()
