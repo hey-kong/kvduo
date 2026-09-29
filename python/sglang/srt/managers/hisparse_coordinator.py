@@ -1598,30 +1598,30 @@ class HiSparseCoordinator:
         *,
         allow_reclaim: bool = True,
     ) -> None:
-        """Materialize CPU-known capacity targets without inspecting GPU tags."""
+        """Materialize page-aligned CPU-known targets without exponential tiers.
+
+        This path serves mandatory 2K admission and statistics-driven optional
+        growth.  Unlike the immediate workset path above, optional targets must
+        retain their linear 2K progression after physical-page alignment.
+        """
         if not requested_capacities:
             return
         page_size = self.page_size
-        tiers = [
-            ((multiplier * self.top_k + page_size - 1) // page_size) * page_size
-            for multiplier in (2, 4, 8, 16)
-        ]
+        minimum_target = ((2 * self.top_k + page_size - 1) // page_size) * page_size
         requests = []
         mandatory_targets = {}
         for req_idx, required_slots in requested_capacities.items():
             if required_slots > self.device_buffer_size:
                 raise RuntimeError("KVDuo hot target exceeds fixed 16K metadata")
             current = int(self.kvduo_req_hot_capacity[layer_id, req_idx])
-            target = next((tier for tier in tiers if tier >= required_slots), tiers[-1])
-            if current:
-                target = min(
-                    target, next((tier for tier in tiers if tier > current), tiers[-1])
-                )
+            target = ((required_slots + page_size - 1) // page_size) * page_size
+            if target > self.device_buffer_size:
+                raise RuntimeError("KVDuo page-aligned target exceeds fixed 16K metadata")
             if target <= current:
                 continue
             requests.append((req_idx, current, target, target - current))
             if current == 0 and self._mixed_slots[req_idx]:
-                mandatory_targets[req_idx] = tiers[0]
+                mandatory_targets[req_idx] = minimum_target
         self._materialize_kvduo_hot_growth(
             layer_id,
             requests,
@@ -1893,7 +1893,7 @@ class HiSparseCoordinator:
                     # Optional space must have enough observations to plausibly
                     # amortize one Top-k tier and a meaningful miss fraction.
                     # Hashing/replay noise or a handful of cold-start misses
-                    # therefore cannot repeatedly double 2K into 16K.
+                    # therefore cannot repeatedly grow the tier up to 16K.
                     if (
                         current > 0
                         and current < 16 * self.top_k
@@ -1902,8 +1902,11 @@ class HiSparseCoordinator:
                         and host_misses
                         >= valid_accesses * KVDUO_OPTIONAL_GROWTH_MIN_MISS_RATE
                     ):
+                        # Grow linearly by 2K per observation window
+                        # (2K -> 4K -> 6K -> ... -> 16K) so one request cannot
+                        # consume exponentially larger tiers under pressure.
                         optional_growth[(layer_id, req_idx)] = min(
-                            current * 2, 16 * self.top_k
+                            current + 2 * self.top_k, 16 * self.top_k
                         )
 
         # Pressure reclamation can demote another active request. Iterate to a

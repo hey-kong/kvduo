@@ -677,6 +677,50 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator._ensure_kvduo_hot_capacity_targets.assert_not_called()
 
+    def test_graph_prepare_grows_hot_capacity_linearly_and_stops_at_16k(self):
+        """Page allocation preserves the 4K -> 6K -> 8K progression."""
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.device = "cpu"
+        coordinator.page_size = 2
+        coordinator.top_k = 2
+        coordinator.device_buffer_size = 32
+        coordinator.mem_pool_device = SimpleNamespace(layer_num=1)
+        coordinator._mixed_slots = [True]
+        coordinator.kvduo_req_hot_capacity = torch.tensor([[4]], dtype=torch.int64)
+        coordinator.kvduo_req_hot_capacity_gpu = torch.tensor([[4]], dtype=torch.int32)
+        coordinator.req_device_buffer_token_locs = torch.full(
+            (1, 1, 32), -1, dtype=torch.int32
+        )
+        coordinator.req_device_buffer_tokens = torch.full(
+            (1, 1, 32), -1, dtype=torch.int32
+        )
+        coordinator.lru_slots = torch.arange(32, dtype=torch.int16).view(1, 1, -1)
+        coordinator._kvduo_req_layer_pages = {(0, 0): [10, 12]}
+        coordinator._kvduo_hot_carriers = {
+            start: [0] for start in (10, 12)
+        } | {start: [None] for start in range(14, 44, 2)}
+        coordinator._kvduo_free_layer_pages = [set(range(14, 44, 2))]
+
+        capacities = []
+        physical_page_counts = []
+        for target in (8, 12, 16):
+            coordinator._ensure_kvduo_hot_capacity_targets(0, {0: target})
+            capacities.append(int(coordinator.kvduo_req_hot_capacity[0, 0]))
+            physical_page_counts.append(
+                len(coordinator._kvduo_req_layer_pages[(0, 0)])
+            )
+
+        self.assertEqual(capacities, [8, 12, 16])
+        self.assertEqual(physical_page_counts, [4, 6, 8])
+
+        coordinator._ensure_kvduo_hot_capacity_targets(0, {0: 32})
+        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[0, 0]), 32)
+        self.assertEqual(len(coordinator._kvduo_req_layer_pages[(0, 0)]), 16)
+        with self.assertRaisesRegex(RuntimeError, "exceeds fixed 16K"):
+            coordinator._ensure_kvduo_hot_capacity_targets(0, {0: 36})
+
     def test_optional_hot_growth_never_reclaims_full_pages(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
