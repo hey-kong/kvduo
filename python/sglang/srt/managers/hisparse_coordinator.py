@@ -151,6 +151,13 @@ class HiSparseCoordinator:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.top_k = top_k
         self.device_buffer_size = device_buffer_size
+        # ``server_args.device`` intentionally contains only the device type
+        # (for example, ``"cuda"``).  Do not use that unindexed value for
+        # stream/event selection: on a scheduler worker thread it resolves to
+        # that thread's current device, which starts as logical GPU 0.  The
+        # already allocated request-pool tensor carries the authoritative TP
+        # rank index (``cuda:0``, ``cuda:1``, ...).
+        device = req_to_token_pool.req_to_token.device
         self.device = device
         self.swap_in_block_size = swap_in_block_size
         self.tail_protected_pages = tail_protected_pages
@@ -1086,7 +1093,8 @@ class HiSparseCoordinator:
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
-        start_event.record()
+        schedule_stream = device_module.current_stream(self.device)
+        start_event.record(schedule_stream)
         with device_module.stream(self.write_staging_stream):
             start_event.wait(self.write_staging_stream)
             self.mem_pool_host.backup_from_device_all_layer(
@@ -1095,7 +1103,7 @@ class HiSparseCoordinator:
                 device_indices,
                 io_backend="kernel",
             )
-            finish_event.record()
+            finish_event.record(self.write_staging_stream)
             if host_indices.is_cuda:
                 host_indices.record_stream(self.write_staging_stream)
             if device_indices.is_cuda:
@@ -1920,11 +1928,12 @@ class HiSparseCoordinator:
         }
         self._kvduo_stats_snapshot.copy_(self.kvduo_resolver_stats)
         self.kvduo_resolver_stats.zero_()
-        self._kvduo_stats_snapshot_ready_event.record()
+        schedule_stream = device_module.current_stream(self.device)
+        self._kvduo_stats_snapshot_ready_event.record(schedule_stream)
         with device_module.stream(self._kvduo_stats_stream):
             self._kvduo_stats_stream.wait_event(self._kvduo_stats_snapshot_ready_event)
             self._kvduo_stats_host.copy_(self._kvduo_stats_snapshot, non_blocking=True)
-            self._kvduo_stats_event.record()
+            self._kvduo_stats_event.record(self._kvduo_stats_stream)
         self._kvduo_stats_pending = True
 
     def prepare_kvduo_graph_replay(
@@ -2444,7 +2453,7 @@ class HiSparseCoordinator:
                 device_locs,
                 io_backend="kernel",
             )
-            self._backup_done_event.record()
+            self._backup_done_event.record(self.decode_backup_stream)
             if host_locs.is_cuda:
                 host_locs.record_stream(self.decode_backup_stream)
             if device_locs.is_cuda:
@@ -2536,7 +2545,7 @@ class HiSparseCoordinator:
                 device_locs,
                 io_backend="kernel",
             )
-            self._backup_done_event.record()
+            self._backup_done_event.record(self.decode_backup_stream)
             if host_locs.is_cuda:
                 host_locs.record_stream(self.decode_backup_stream)
             if backup_req_indices.is_cuda:
