@@ -741,9 +741,11 @@ class HiSparseCoordinator:
                     )
             local_ready = full_before >= logical_pages and swa_before >= swa_pages
             if self.tp_world_size > 1:
-                ready = torch.tensor(
-                    int(local_ready), dtype=torch.int32, device=self.device
-                )
+                # ``tp_group`` is deliberately the Gloo/CPU group.  Keep its
+                # control-plane scalar on CPU as well: passing a CUDA tensor to
+                # this request-time collective makes Gloo initialize CUDA's
+                # default logical device (GPU 0) in every TP process.
+                ready = torch.tensor(int(local_ready), dtype=torch.int32)
                 torch.distributed.all_reduce(
                     ready, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
                 )
@@ -786,9 +788,7 @@ class HiSparseCoordinator:
                 self._kvduo_pressure_protected = None
             local_ready = pressure.action is KVDuoPressureAction.SUCCESS
             if self.tp_world_size > 1:
-                ready = torch.tensor(
-                    int(local_ready), dtype=torch.int32, device=self.device
-                )
+                ready = torch.tensor(int(local_ready), dtype=torch.int32)
                 torch.distributed.all_reduce(
                     ready, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
                 )
@@ -826,9 +826,7 @@ class HiSparseCoordinator:
             )
             allocation_ready = restored is not None
             if self.tp_world_size > 1:
-                ready = torch.tensor(
-                    int(allocation_ready), dtype=torch.int32, device=self.device
-                )
+                ready = torch.tensor(int(allocation_ready), dtype=torch.int32)
                 torch.distributed.all_reduce(
                     ready, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
                 )

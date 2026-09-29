@@ -161,13 +161,35 @@ def test_cuda_streams_are_bound_to_the_tensor_parallel_device():
     assert ".record()" not in source
 
 
-def test_scheduler_thread_sets_its_rank_device_before_creating_streams():
-    overlap = _method_source(SCHEDULER, "Scheduler", "init_overlap")
-    event_loop = _method_source(SCHEDULER, "Scheduler", "run_event_loop")
+def test_kvduo_cpu_group_never_reduces_cuda_control_tensors():
+    source = COORDINATOR.read_text()
+    tree = ast.parse(source)
+    klass = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "HiSparseCoordinator"
+    )
+    restore = next(
+        node
+        for node in klass.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "init_kvduo_load_back"
+    )
 
-    assert "self.rank_device = self.req_to_token_pool.req_to_token.device" in overlap
-    assert "self.device_module.set_device(self.rank_device)" in overlap
-    assert "self.device_module.Stream()" not in overlap
-    assert "self.device_module.set_device(self.rank_device)" in event_loop
-    assert "**self._stream_device_kwargs" in event_loop
-    assert "self.device_module.Stream(priority=0)" not in event_loop
+    ready_tensors = []
+    for node in ast.walk(restore):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "ready"
+            for target in node.targets
+        ):
+            continue
+        assert isinstance(node.value, ast.Call)
+        ready_tensors.append(node.value)
+
+    assert len(ready_tensors) == 3
+    assert all(
+        not any(keyword.arg == "device" for keyword in call.keywords)
+        for call in ready_tensors
+    )
