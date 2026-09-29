@@ -133,3 +133,16 @@ def test_graph_prepare_batches_a_whole_capacity_round():
     assert batch.count("allocator.alloc(physical_slots)") == 1
     assert batch.count('to(device="cpu").tolist()') == 1
     assert "for layer_id, req_idx, current, target, grow in requests" in batch
+
+
+def test_cuda_streams_are_bound_to_the_tensor_parallel_device():
+    source = COORDINATOR.read_text()
+    init = _method_source(COORDINATOR, "HiSparseCoordinator", "__init__")
+
+    # CUDA's current device is thread-local.  A scheduler worker starts on
+    # logical device zero, so implicit stream selection would make every TP
+    # process establish an otherwise unused context on TP0's GPU.
+    assert "device_module.Stream()" not in init
+    assert init.count("device_module.Stream(device=device)") == 3
+    assert "device_module.current_stream()" not in source
+    assert "device_module.current_stream(self.device)" in source
