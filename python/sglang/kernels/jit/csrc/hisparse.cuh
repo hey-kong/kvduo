@@ -283,7 +283,10 @@ __global__ void load_cache_to_device_buffer_kernel(
     full_resident_accesses = 0;
   }
   __syncthreads();
-  if (enable_full_lookup) {
+  // A non-zero dynamic hot view identifies a mixed request.  Do not pre-probe
+  // those requests: the general resolver already performs the same full-table
+  // lookup, so probing them here would double top-k reads and touch atomics.
+  if (enable_full_lookup && hot_buffer_size == 0) {
     for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
       const int32_t token_idx = req_top_k_tokens[i];
       if (token_idx < 0 || token_idx >= seq_len) {

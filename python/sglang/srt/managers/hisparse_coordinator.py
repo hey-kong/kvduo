@@ -239,6 +239,10 @@ class HiSparseCoordinator:
             self._kvduo_stats_pending = False
             self._kvduo_stats_pending_owners = {}
             self._active_kvduo_reqs = {}
+            # Requests enter this set exactly when pressure first demotes a full
+            # page.  It avoids rescanning every active mixed request and every
+            # layer at each CUDA graph replay once the mandatory 2K tier exists.
+            self._kvduo_pending_hot_minimum = set()
             self._kvduo_host_valid_len = [0] * max_num_req_slots
             self._pending_kvduo_host_valid = []
             self._kvduo_pressure_protected = None
@@ -278,6 +282,7 @@ class HiSparseCoordinator:
             self.kvduo_swap_status = None
             self.kvduo_resolver_stats = None
             self._active_kvduo_reqs = None
+            self._kvduo_pending_hot_minimum = None
             self._kvduo_host_valid_len = None
             self._pending_kvduo_host_valid = None
             self._kvduo_pressure_protected = None
@@ -1720,18 +1725,30 @@ class HiSparseCoordinator:
             if poll_due and not self._kvduo_stats_pending and stats_cpu is None:
                 self._schedule_kvduo_stats_snapshot()
 
-        if req_pool_indices_cpu is None:
-            # Compatibility fallback for direct/unit-test callers. Runtime paths
-            # pass ScheduleBatch's existing CPU mirror and avoid this D2H read.
-            req_pool_indices_cpu = req_pool_indices.to(device="cpu", dtype=torch.int64)
-        requested = set(
-            req_pool_indices_cpu.tolist()
-            if isinstance(req_pool_indices_cpu, torch.Tensor)
-            else req_pool_indices_cpu
-        )
-        requested.update(
-            req_idx for req_idx in self._active_kvduo_reqs if self._mixed_slots[req_idx]
-        )
+        tracked_pending_minimum = getattr(self, "_kvduo_pending_hot_minimum", None)
+        pending_minimum = tracked_pending_minimum
+        if pending_minimum is None:
+            # Compatibility for focused unit tests that construct the
+            # coordinator with ``__new__``.
+            pending_minimum = {
+                req_idx
+                for req_idx in self._active_kvduo_reqs
+                if self._mixed_slots[req_idx]
+                and any(
+                    int(self.kvduo_req_hot_capacity[layer_id, req_idx]) < 2 * self.top_k
+                    for layer_id in range(self.mem_pool_device.layer_num)
+                )
+            }
+        if not pending_minimum and stats_cpu is None:
+            return
+
+        requested = set(pending_minimum)
+        if stats_cpu is not None:
+            requested.update(
+                req_idx
+                for req_idx in self._active_kvduo_reqs
+                if self._mixed_slots[req_idx]
+            )
 
         initial_mixed = {req_idx for req_idx in requested if self._mixed_slots[req_idx]}
         optional_growth = {
@@ -1772,9 +1789,15 @@ class HiSparseCoordinator:
                     self._ensure_kvduo_hot_capacity_targets(layer_id, targets)
             optional_growth.clear()
             requested.update(
-                req_idx
-                for req_idx in self._active_kvduo_reqs
-                if self._mixed_slots[req_idx]
+                (
+                    self._kvduo_pending_hot_minimum
+                    if tracked_pending_minimum is not None
+                    else (
+                        req_idx
+                        for req_idx in self._active_kvduo_reqs
+                        if self._mixed_slots[req_idx]
+                    )
+                )
             )
             pending = {
                 req_idx
@@ -1806,6 +1829,8 @@ class HiSparseCoordinator:
                     raise RuntimeError(
                         "KVDuo mixed request lacks mandatory 2K capacity before replay"
                     )
+        if getattr(self, "_kvduo_pending_hot_minimum", None) is not None:
+            self._kvduo_pending_hot_minimum.difference_update(requested)
 
     def _grow_kvduo_hot_metadata(self, required_slots: int) -> None:
         """Validate against the immutable, capture-stable resolver metadata."""
@@ -2435,6 +2460,7 @@ class HiSparseCoordinator:
         self._mixed_slots[req.req_pool_idx] = False
         if self.enable_mixed_residency:
             self._active_kvduo_reqs.pop(req.req_pool_idx, None)
+            self._kvduo_pending_hot_minimum.discard(req.req_pool_idx)
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
 
@@ -2551,6 +2577,7 @@ class HiSparseCoordinator:
         self._mixed_slots[req.req_pool_idx] = False
         if self.enable_mixed_residency:
             self._active_kvduo_reqs.pop(req.req_pool_idx, None)
+            self._kvduo_pending_hot_minimum.discard(req.req_pool_idx)
 
     def reclaim_kvduo_full_pages(self, num_tokens: int) -> int:
         """Demote cold request-owned full pages to satisfy decode pressure.
@@ -2650,6 +2677,7 @@ class HiSparseCoordinator:
                 req.kvduo_radix_insert_len, start * self.compress_ratio
             )
             self._mixed_slots[req_idx] = True
+            self._kvduo_pending_hot_minimum.add(req_idx)
         return reclaimed
 
     def swap_in_selected_pages(
