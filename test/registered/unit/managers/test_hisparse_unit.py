@@ -39,6 +39,120 @@ MAX_CONTEXT_LEN = 2048
 
 
 class TestKVDuoPhysicalReclaim(unittest.TestCase):
+    def test_prefix_identities_share_pages_and_compare_exactly(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        class CollidingToken(int):
+            def __hash__(self):
+                return 0
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.page_size = 2
+        coordinator.compress_ratio = 1
+        left = SimpleNamespace(
+            extra_key="tenant", get_fill_ids=lambda: list(range(200))
+        )
+        identities = coordinator._host_prefix_identities(left, 99)
+
+        self.assertEqual(sum(len(identity.tokens) for identity in identities), 200)
+        self.assertIs(identities[-1].parent, identities[-2])
+        self.assertIs(coordinator._host_prefix_identity(left, 99), identities[-1])
+
+        # Matching a second request canonicalizes each parent as it advances,
+        # so every dictionary equality checks only the newly appended page.
+        right = SimpleNamespace(extra_key="tenant", get_fill_ids=MagicMock())
+        records = {identity: identity for identity in identities}
+        right_ids = []
+        fill_ids = list(range(200))
+        for ordinal in range(100):
+            right_ids = coordinator._host_prefix_identities(right, ordinal, fill_ids)
+            right_ids[ordinal] = records[right_ids[ordinal]]
+        self.assertIs(right_ids[-1], identities[-1])
+        right.get_fill_ids.assert_not_called()
+
+        collision_a = SimpleNamespace(
+            extra_key="tenant",
+            get_fill_ids=lambda: [CollidingToken(1), CollidingToken(3)],
+        )
+        collision_b = SimpleNamespace(
+            extra_key="tenant",
+            get_fill_ids=lambda: [CollidingToken(2), CollidingToken(3)],
+        )
+        identity_a = coordinator._host_prefix_identity(collision_a, 0)
+        identity_b = coordinator._host_prefix_identity(collision_b, 0)
+        self.assertEqual(hash(identity_a), hash(identity_b))
+        self.assertNotEqual(identity_a, identity_b)
+
+    def test_full_gpu_match_does_not_build_host_identity(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+        from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
+            KVDuoHostPrefixCache,
+        )
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.enable_mixed_residency = True
+        coordinator.page_size = 2
+        coordinator.compress_ratio = 1
+        coordinator.tp_world_size = 1
+        coordinator.host_prefix_cache = KVDuoHostPrefixCache(0)
+        req = SimpleNamespace(
+            rid="gpu-only",
+            extra_key="tenant",
+            get_fill_ids=lambda: [1, 2, 3, 4, 5],
+            _compute_max_prefix_len=lambda length: length - 1,
+        )
+        match = MatchResult(
+            device_indices=torch.tensor([1, 2, 3, 4]),
+            last_device_node=object(),
+            last_host_node=object(),
+            best_match_node=object(),
+        )
+
+        self.assertIs(coordinator.augment_kvduo_prefix_match(req, match), match)
+        self.assertFalse(hasattr(req, "_kvduo_prefix_identity_state"))
+
+    def test_long_prefix_lru_tie_break_is_fixed_width_and_stable(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
+            HostPrefixRecord,
+            KVDuoHostPrefixCache,
+        )
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.page_size = 1
+        coordinator.compress_ratio = 1
+        token_sets = [list(range(10_000)), [-1, *range(1, 10_000)]]
+        identities = []
+        for tokens in token_sets:
+            req = SimpleNamespace(extra_key="tenant")
+            identities.append(
+                coordinator._host_prefix_identity(req, len(tokens) - 1, tokens)
+            )
+
+        self.assertEqual(len(identities[0].stable_sort_digest), 16)
+        self.assertEqual(len(identities[1].stable_sort_digest), 16)
+        records = [
+            HostPrefixRecord(
+                identity=identity,
+                domains=("main_kv",),
+                host_locations={"main_kv": (index,)},
+                data_versions={"main_kv": (0,)},
+                host_versions={"main_kv": (0,)},
+                cache_reference=True,
+                last_access=7,
+                tie_break_key=(9_999, identity.stable_sort_digest),
+            )
+            for index, identity in enumerate(identities)
+        ]
+        expected = min(records, key=lambda record: record.tie_break_key).identity
+        cache = KVDuoHostPrefixCache(2)
+        # Reverse insertion order so eviction must use the stable tie breaker.
+        for record in reversed(records):
+            cache.insert(record)
+
+        self.assertIs(cache.evict_lru(1)[0].identity, expected)
+
     def test_generic_restore_requires_no_swa_pages(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
@@ -94,13 +208,28 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.full_host_version = torch.full((32,), -1, dtype=torch.int64)
         coordinator.full_last_touch = torch.zeros(32, dtype=torch.int64)
         coordinator.host_prefix_cache = KVDuoHostPrefixCache(8)
-        for ordinal, (identity, locs, touches) in enumerate(
+        fill_call_count = 0
+
+        def get_fill_ids():
+            nonlocal fill_call_count
+            fill_call_count += 1
+            return [1, 2, 3, 4, 5, 6, 7]
+
+        req = SimpleNamespace(
+            rid="restore",
+            extra_key="tenant-a",
+            prefix_indices=torch.tensor([5, 6], dtype=torch.int64),
+            get_fill_ids=get_fill_ids,
+            _compute_max_prefix_len=lambda length: length - 1,
+        )
+        for ordinal, (locs, touches) in enumerate(
             (
-                ((1, "tenant-a", (1, 2)), (20, 21), (7, 8)),
-                ((1, "tenant-a", (1, 2, 3, 4)), (22, 23), (9, 10)),
-                ((1, "tenant-a", (1, 2, 3, 4, 5, 6)), (24, 25), (11, 12)),
+                ((20, 21), (7, 8)),
+                ((22, 23), (9, 10)),
+                ((24, 25), (11, 12)),
             )
         ):
+            identity = coordinator._host_prefix_identity(req, ordinal)
             coordinator.host_prefix_cache.insert(
                 HostPrefixRecord(
                     identity=identity,
@@ -113,22 +242,15 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
                 )
             )
 
-        req = SimpleNamespace(
-            rid="restore",
-            extra_key="tenant-a",
-            prefix_indices=torch.tensor([5, 6], dtype=torch.int64),
-            get_fill_ids=lambda: [1, 2, 3, 4, 5, 6, 7],
-            _compute_max_prefix_len=lambda length: length - 1,
-        )
         gpu_match = MatchResult(
             device_indices=req.prefix_indices,
             last_device_node=object(),
             last_host_node=object(),
             best_match_node=object(),
         )
-        match = coordinator.augment_kvduo_prefix_match(
-            req, gpu_match, max_prefix_len=4
-        )
+        fill_call_count = 0
+        match = coordinator.augment_kvduo_prefix_match(req, gpu_match, max_prefix_len=4)
+        self.assertEqual(fill_call_count, 1)
         self.assertEqual(match.host_hit_length, 2)
         self.assertEqual(match.full_kv_hit_length, 4)
         self.assertEqual(
@@ -221,9 +343,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         empty_gpu_match = gpu_match._replace(
             device_indices=torch.empty(0, dtype=torch.int64)
         )
-        nonmonotonic_matcher = MagicMock(
-            side_effect=[gpu_match, empty_gpu_match]
-        )
+        nonmonotonic_matcher = MagicMock(side_effect=[gpu_match, empty_gpu_match])
         reduce_step = 0
 
         def remote_swa_rematch_misses(value, **kwargs):
@@ -341,9 +461,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         # return its Full and C4 pages when another TP rank rejects allocation.
         self.assertEqual(free_pages, {"full": 4, "swa": 0, "physical": 1})
         self.assertNotEqual(free_pages, before_partial_alloc)
-        rollback = (
-            coordinator.token_to_kv_pool_allocator.rollback_restore_allocation
-        )
+        rollback = coordinator.token_to_kv_pool_allocator.rollback_restore_allocation
         rollback.assert_called_once()
         self.assertTrue(
             torch.equal(
@@ -352,13 +470,13 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             )
         )
         host_record = coordinator.host_prefix_cache.records[
-            (1, "tenant-a", (1, 2, 3, 4))
+            coordinator._host_prefix_identity(req, 1)
         ]
         self.assertIn(req.rid, host_record.request_references)
         self.assertNotIn(
             req.rid,
             coordinator.host_prefix_cache.records[
-                (1, "tenant-a", (1, 2, 3, 4, 5, 6))
+                coordinator._host_prefix_identity(req, 2)
             ].request_references,
         )
         self.assertEqual(host_record.restore_pins, 0)
@@ -380,7 +498,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         self.assertEqual(coordinator.full_last_touch[10:12].tolist(), [9, 10])
         self.assertEqual(
             coordinator.host_prefix_cache.records[
-                (1, "tenant-a", (1, 2, 3, 4))
+                coordinator._host_prefix_identity(req, 1)
             ].restore_pins,
             0,
         )
@@ -537,6 +655,49 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "mandatory 2K"):
             coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
 
+    def test_graph_prepare_ignores_incidental_misses(self):
+        """A sparse miss signal cannot cascade through every optional tier."""
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.enable_mixed_residency = True
+        coordinator.decode_producer_stream = None
+        coordinator.top_k = 2
+        coordinator.mem_pool_device = SimpleNamespace(layer_num=1)
+        owner = object()
+        coordinator._active_kvduo_reqs = {0: owner}
+        coordinator._mixed_slots = [True]
+        coordinator.kvduo_stats_poll_interval = 1
+        coordinator._kvduo_replay_count = 0
+        coordinator.kvduo_resolver_stats = torch.tensor([[[1, 100]]], dtype=torch.int32)
+        coordinator.kvduo_req_hot_capacity = torch.tensor([[4]], dtype=torch.int64)
+        coordinator._ensure_kvduo_hot_capacity_targets = MagicMock()
+
+        coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
+
+        coordinator._ensure_kvduo_hot_capacity_targets.assert_not_called()
+
+    def test_optional_hot_growth_never_reclaims_full_pages(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.page_size = 4
+        coordinator.top_k = 2
+        coordinator.device_buffer_size = 32
+        coordinator._mixed_slots = [True]
+        coordinator.kvduo_req_hot_capacity = torch.tensor([[4]], dtype=torch.int64)
+        coordinator._kvduo_free_layer_pages = [set()]
+        physical = SimpleNamespace(available_size=MagicMock(return_value=0))
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            hisparse_attn_allocator=physical
+        )
+        coordinator._reclaim_for_physical_allocation = MagicMock()
+
+        coordinator._ensure_kvduo_hot_capacity_targets(0, {0: 8}, allow_reclaim=False)
+
+        coordinator._reclaim_for_physical_allocation.assert_not_called()
+        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[0, 0]), 4)
+
     def test_graph_prepare_rechecks_batch_requests_demoted_by_pressure(self):
         """A full batch peer demoted during growth receives 2K before replay."""
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -551,15 +712,14 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator._mixed_slots = [True, False]
         coordinator.kvduo_stats_poll_interval = 1
         coordinator._kvduo_replay_count = 0
-        coordinator.kvduo_resolver_stats = torch.tensor(
-            [[[1, 4], [0, 4]]], dtype=torch.int32
-        )
-        coordinator.kvduo_req_hot_capacity = torch.tensor([[4, 0]], dtype=torch.int64)
+        coordinator.kvduo_resolver_stats = torch.zeros((1, 2, 2), dtype=torch.int32)
+        coordinator.kvduo_req_hot_capacity = torch.tensor([[0, 0]], dtype=torch.int64)
         targets = []
 
         def allocate(_, requested_capacities):
             targets.append(dict(requested_capacities))
             if len(targets) == 1:
+                coordinator.kvduo_req_hot_capacity[0, 0] = 4
                 coordinator._mixed_slots[1] = True
             else:
                 coordinator.kvduo_req_hot_capacity[0, 1] = 4
@@ -569,7 +729,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator.prepare_kvduo_graph_replay(torch.tensor([0, 1]))
 
-        self.assertEqual(targets, [{0: 8}, {1: 4}])
+        self.assertEqual(targets, [{0: 4}, {1: 4}])
         self.assertEqual(int(coordinator.kvduo_req_hot_capacity[0, 1]), 4)
 
     def test_graph_prepare_polls_growth_every_eight_replays(self):
