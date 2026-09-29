@@ -1893,7 +1893,7 @@ class HiSparseCoordinator:
                     # Optional space must have enough observations to plausibly
                     # amortize one Top-k tier and a meaningful miss fraction.
                     # Hashing/replay noise or a handful of cold-start misses
-                    # therefore cannot repeatedly double 2K into 16K.
+                    # therefore cannot repeatedly grow the tier up to 16K.
                     if (
                         current > 0
                         and current < 16 * self.top_k
@@ -1902,8 +1902,11 @@ class HiSparseCoordinator:
                         and host_misses
                         >= valid_accesses * KVDUO_OPTIONAL_GROWTH_MIN_MISS_RATE
                     ):
+                        # Grow linearly by 2K per observation window
+                        # (2K -> 4K -> 6K -> ... -> 16K) so one request cannot
+                        # consume exponentially larger tiers under pressure.
                         optional_growth[(layer_id, req_idx)] = min(
-                            current * 2, 16 * self.top_k
+                            current + 2 * self.top_k, 16 * self.top_k
                         )
 
         # Pressure reclamation can demote another active request. Iterate to a

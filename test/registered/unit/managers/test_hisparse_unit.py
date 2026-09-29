@@ -677,6 +677,39 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator._ensure_kvduo_hot_capacity_targets.assert_not_called()
 
+    def test_graph_prepare_grows_hot_capacity_linearly_and_stops_at_16k(self):
+        """Optional tiers advance by 2K rather than doubling."""
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.enable_mixed_residency = True
+        coordinator.decode_producer_stream = None
+        coordinator.device = "cpu"
+        coordinator.top_k = 2
+        coordinator.mem_pool_device = SimpleNamespace(layer_num=1)
+        owner = object()
+        coordinator._active_kvduo_reqs = {0: owner}
+        coordinator._mixed_slots = [True]
+        coordinator.kvduo_stats_poll_interval = 1
+        coordinator._kvduo_replay_count = 0
+        coordinator.kvduo_resolver_stats = torch.tensor([[[2, 2]]], dtype=torch.int32)
+        coordinator.kvduo_req_hot_capacity = torch.tensor([[8]], dtype=torch.int64)
+        coordinator._ensure_kvduo_hot_capacity_targets = MagicMock(return_value=True)
+
+        coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
+
+        self.assertEqual(
+            coordinator._ensure_kvduo_hot_capacity_targets.call_args.args[1],
+            {0: 12},
+        )
+
+        coordinator._ensure_kvduo_hot_capacity_targets.reset_mock()
+        coordinator.kvduo_req_hot_capacity[0, 0] = 32
+        coordinator.kvduo_resolver_stats[0, 0] = torch.tensor([2, 2])
+        coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
+
+        coordinator._ensure_kvduo_hot_capacity_targets.assert_not_called()
+
     def test_optional_hot_growth_never_reclaims_full_pages(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
