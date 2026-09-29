@@ -55,6 +55,33 @@ def test_whole_hot_page_cross_layer_addressing_and_attention_read():
     assert [backing[address] for address in addresses] == values
 
 
+def test_prefill_layer_local_and_decode_global_address_spaces_do_not_mix():
+    geometry = KVDuoHotPageGeometry(2, 4, 32)
+    local_slot = 6
+
+    # Prefill receives a layer-local tensor and the same local index must select
+    # different data in two logical layers.
+    layer_views = [[None] * 32 for _ in range(2)]
+    layer_views[0][local_slot] = "prefill-layer-0"
+    layer_views[1][local_slot] = "prefill-layer-1"
+    assert [view[local_slot] for view in layer_views] == [
+        "prefill-layer-0",
+        "prefill-layer-1",
+    ]
+
+    # Decode consumes one flat address space: a FULL hit is rebased to the
+    # logical layer while a HOT hit can target another storage-layer fragment.
+    flat = [None] * 64
+    full_layer_1 = geometry.layer_slot_stride + local_slot
+    hot_cross_layer = geometry.encode(page_start=8, logical_slot=7)
+    flat[full_layer_1] = "decode-full-layer-1"
+    flat[hot_cross_layer] = "decode-hot-storage-layer-1"
+    assert [flat[i] for i in (full_layer_1, hot_cross_layer)] == [
+        "decode-full-layer-1",
+        "decode-hot-storage-layer-1",
+    ]
+
+
 def test_hot_geometry_bounds_and_explicit_page_states():
     geometry = KVDuoHotPageGeometry(2, 4, 32)
     with pytest.raises(IndexError):

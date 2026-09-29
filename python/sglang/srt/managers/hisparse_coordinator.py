@@ -1683,31 +1683,42 @@ class HiSparseCoordinator:
             if allow_reclaim:
                 raise RuntimeError("KVDuo whole-page HOT allocation failed")
             return
-        starts = iter(int(page[0]) for page in physical.view(-1, self.page_size))
+        # This allocation path runs outside graph replay. Fetch all page
+        # identities with one D2H synchronization, then construct every flat
+        # C4 address on-device. Converting individual scalars would synchronize
+        # once per physical page.
+        physical_pages = physical.view(-1, self.page_size)
+        page_starts_device = physical_pages[:, 0].to(torch.int64)
+        page_starts = page_starts_device.to(device="cpu").tolist()
         layer_stride = getattr(self.mem_pool_device, "flat_layer_slot_stride", 0)
+        storage_offsets = (
+            torch.arange(
+                self.hot_storage_layers, dtype=torch.int64, device=self.device
+            )
+            * layer_stride
+        )
+        within_page = torch.arange(
+            self.page_size, dtype=torch.int64, device=self.device
+        )
+        all_page_locs = (
+            page_starts_device[:, None, None]
+            + storage_offsets[None, :, None]
+            + within_page[None, None, :]
+        ).reshape(pages_needed, K)
+        next_page = 0
         for req_idx, current, target, grow in requests:
-            chunks = []
-            for _ in range(grow // K):
-                start = next(starts)
-                owner = (req_idx, layer_id)
+            req_idx = int(req_idx)
+            request_page_count = grow // K
+            for start in page_starts[next_page : next_page + request_page_count]:
+                owner = (int(layer_id), req_idx)
                 if start in self._kvduo_hot_page_owners:
                     raise RuntimeError("KVDuo physical page already has an owner")
                 self._kvduo_hot_page_owners[start] = owner
                 self._kvduo_req_layer_pages.setdefault(owner, []).append(start)
-                chunks.append(
-                    torch.cat(
-                        [
-                            torch.arange(
-                                storage_layer * layer_stride + start,
-                                storage_layer * layer_stride + start + self.page_size,
-                                dtype=torch.int64,
-                                device=self.device,
-                            )
-                            for storage_layer in range(self.hot_storage_layers)
-                        ]
-                    )
-                )
-            page_locs = torch.cat(chunks)
+            page_locs = all_page_locs[
+                next_page : next_page + request_page_count
+            ].reshape(-1)
+            next_page += request_page_count
             self.req_device_buffer_token_locs[layer_id, req_idx, current:target] = (
                 page_locs.to(torch.int32)
             )
@@ -1723,6 +1734,8 @@ class HiSparseCoordinator:
             )
             self.kvduo_req_hot_capacity[layer_id, req_idx] = target
             self.kvduo_req_hot_capacity_gpu[layer_id, req_idx] = target
+        if next_page != pages_needed:
+            raise RuntimeError("KVDuo HOT allocation did not consume every page")
 
     def _consume_kvduo_stats_snapshot(self):
         """Return a completed asynchronous statistics snapshot, if available."""
@@ -1940,7 +1953,7 @@ class HiSparseCoordinator:
             return
         starts = []
         for layer_id in range(self.mem_pool_device.layer_num):
-            owner = (req_idx, layer_id)
+            owner = (layer_id, req_idx)
             for start in self._kvduo_req_layer_pages.pop(owner, []):
                 if self._kvduo_hot_page_owners.pop(start, None) != owner:
                     raise RuntimeError("KVDuo whole-page ownership mismatch")
@@ -1960,40 +1973,40 @@ class HiSparseCoordinator:
     def _evict_kvduo_hot_fragment(
         self, layer_id: int, req_idx: int, page_index: int
     ) -> None:
-        """Drop one layer page without moving any KV payload."""
+        """Drop one whole HOT physical page without moving any KV payload."""
         pages = self._kvduo_req_layer_pages[(layer_id, req_idx)]
         last_index = len(pages) - 1
         victim_start = pages[page_index]
-        slot = page_index * self.page_size
-        last_slot = last_index * self.page_size
+        slot = page_index * self.hot_page_size
+        last_slot = last_index * self.hot_page_size
         if page_index != last_index:
             # Only page-table metadata moves. The surviving KV payload stays at
             # its original physical addresses carried by token_locs.
             self.req_device_buffer_tokens[
-                layer_id, req_idx, slot : slot + self.page_size
+                layer_id, req_idx, slot : slot + self.hot_page_size
             ] = self.req_device_buffer_tokens[
-                layer_id, req_idx, last_slot : last_slot + self.page_size
+                layer_id, req_idx, last_slot : last_slot + self.hot_page_size
             ].clone()
             self.req_device_buffer_token_locs[
-                layer_id, req_idx, slot : slot + self.page_size
+                layer_id, req_idx, slot : slot + self.hot_page_size
             ] = self.req_device_buffer_token_locs[
-                layer_id, req_idx, last_slot : last_slot + self.page_size
+                layer_id, req_idx, last_slot : last_slot + self.hot_page_size
             ].clone()
             self.hot_page_last_touch[layer_id, req_idx, page_index] = (
                 self.hot_page_last_touch[layer_id, req_idx, last_index]
             )
             pages[page_index] = pages[last_index]
         self.req_device_buffer_tokens[
-            layer_id, req_idx, last_slot : last_slot + self.page_size
+            layer_id, req_idx, last_slot : last_slot + self.hot_page_size
         ] = -1
         self.req_device_buffer_token_locs[
-            layer_id, req_idx, last_slot : last_slot + self.page_size
+            layer_id, req_idx, last_slot : last_slot + self.hot_page_size
         ] = -1
         self.hot_page_last_touch[layer_id, req_idx, last_index] = 0
         pages.pop()
         if not pages:
             del self._kvduo_req_layer_pages[(layer_id, req_idx)]
-        owner = (req_idx, layer_id)
+        owner = (layer_id, req_idx)
         if self._kvduo_hot_page_owners.pop(victim_start, None) != owner:
             raise RuntimeError("KVDuo whole-page ownership mismatch")
         self.token_to_kv_pool_allocator.free_hisparse_indices(

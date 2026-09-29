@@ -1642,7 +1642,7 @@ class DeepseekV4AttnBackend(
                 # at any storage layer, so FlashMLA must see the flat backing.
                 if self.hisparse_coordinator is not None and getattr(
                     self.hisparse_coordinator, "enable_mixed_residency", False
-                ):
+                ) and forward_batch.forward_mode.is_decode():
                     extra_k_cache = token_to_kv_pool.c4_kv_pool.get_flat_key_buffer()
                 extra_indices = core_attn_metadata.c4_sparse_page_indices
                 extra_topk_lengths = core_attn_metadata.c4_sparse_topk_lengths
