@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[4]
 COORDINATOR = ROOT / "python/sglang/srt/managers/hisparse_coordinator.py"
 BACKEND = ROOT / "python/sglang/srt/layers/attention/deepseek_v4_backend.py"
+SCHEDULER = ROOT / "python/sglang/srt/managers/scheduler.py"
 
 
 def _method_source(path: Path, class_name: str, method_name: str) -> str:
