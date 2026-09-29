@@ -151,6 +151,13 @@ class HiSparseCoordinator:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.top_k = top_k
         self.device_buffer_size = device_buffer_size
+        # ``server_args.device`` intentionally contains only the device type
+        # (for example, ``"cuda"``).  Do not use that unindexed value for
+        # stream/event selection: on a scheduler worker thread it resolves to
+        # that thread's current device, which starts as logical GPU 0.  The
+        # already allocated request-pool tensor carries the authoritative TP
+        # rank index (``cuda:0``, ``cuda:1``, ...).
+        device = req_to_token_pool.req_to_token.device
         self.device = device
         self.swap_in_block_size = swap_in_block_size
         self.tail_protected_pages = tail_protected_pages
@@ -312,7 +319,11 @@ class HiSparseCoordinator:
                 device="cpu",
                 pin_memory=is_pin_memory_available(device),
             )
-            self._kvduo_stats_stream = device_module.Stream()
+            # CUDA's current device is thread-local.  The scheduler can enter
+            # this path from a worker thread whose default is logical GPU 0;
+            # an unqualified Stream/current_stream would then create a stray
+            # CUDA context on TP0's GPU in every TP process.
+            self._kvduo_stats_stream = device_module.Stream(device=device)
             self._kvduo_stats_snapshot_ready_event = device_module.Event()
             self._kvduo_stats_event = device_module.Event()
             self._kvduo_stats_pending = False
@@ -367,8 +378,8 @@ class HiSparseCoordinator:
             self.host_prefix_cache = None
             self._req_host_prefix_records = None
 
-        self.write_staging_stream = device_module.Stream()
-        self.decode_backup_stream = device_module.Stream()
+        self.write_staging_stream = device_module.Stream(device=device)
+        self.decode_backup_stream = device_module.Stream(device=device)
         self.ack_staging_queue: List[HiSparseAct] = []
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
@@ -1082,7 +1093,8 @@ class HiSparseCoordinator:
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
-        start_event.record()
+        schedule_stream = device_module.current_stream(self.device)
+        start_event.record(schedule_stream)
         with device_module.stream(self.write_staging_stream):
             start_event.wait(self.write_staging_stream)
             self.mem_pool_host.backup_from_device_all_layer(
@@ -1091,7 +1103,7 @@ class HiSparseCoordinator:
                 device_indices,
                 io_backend="kernel",
             )
-            finish_event.record()
+            finish_event.record(self.write_staging_stream)
             if host_indices.is_cuda:
                 host_indices.record_stream(self.write_staging_stream)
             if device_indices.is_cuda:
@@ -1916,11 +1928,12 @@ class HiSparseCoordinator:
         }
         self._kvduo_stats_snapshot.copy_(self.kvduo_resolver_stats)
         self.kvduo_resolver_stats.zero_()
-        self._kvduo_stats_snapshot_ready_event.record()
+        schedule_stream = device_module.current_stream(self.device)
+        self._kvduo_stats_snapshot_ready_event.record(schedule_stream)
         with device_module.stream(self._kvduo_stats_stream):
             self._kvduo_stats_stream.wait_event(self._kvduo_stats_snapshot_ready_event)
             self._kvduo_stats_host.copy_(self._kvduo_stats_snapshot, non_blocking=True)
-            self._kvduo_stats_event.record()
+            self._kvduo_stats_event.record(self._kvduo_stats_stream)
         self._kvduo_stats_pending = True
 
     def prepare_kvduo_graph_replay(
@@ -1938,7 +1951,9 @@ class HiSparseCoordinator:
         if not self.enable_mixed_residency or req_pool_indices.numel() == 0:
             return
         if self.decode_producer_stream is not None:
-            device_module.current_stream().wait_stream(self.decode_producer_stream)
+            device_module.current_stream(self.device).wait_stream(
+                self.decode_producer_stream
+            )
         # Unit tests construct a minimal coordinator with ``__new__``. Keep that
         # path synchronous while production GPU coordinators use the pre-created
         # pinned snapshot and side stream.
@@ -2194,7 +2209,9 @@ class HiSparseCoordinator:
         if not self.enable_mixed_residency or num_tokens <= 0:
             return 0
         if self.decode_producer_stream is not None:
-            device_module.current_stream().wait_stream(self.decode_producer_stream)
+            device_module.current_stream(self.device).wait_stream(
+                self.decode_producer_stream
+            )
         protected = getattr(self, "_kvduo_hot_pressure_protected", set())
         candidates = []
         for (layer_id, req_idx), pages in self._kvduo_req_layer_pages.items():
@@ -2425,7 +2442,7 @@ class HiSparseCoordinator:
         valid = torch.all(logical_locs >= 0) & torch.all(device_locs > 0)
         if not bool(valid.item()):
             raise RuntimeError("KVDuo sealed page lost full residency before backup")
-        schedule_stream = device_module.current_stream()
+        schedule_stream = device_module.current_stream(self.device)
         with device_module.stream(self.decode_backup_stream):
             self.decode_backup_stream.wait_stream(schedule_stream)
             if self.decode_producer_stream is not None:
@@ -2436,7 +2453,7 @@ class HiSparseCoordinator:
                 device_locs,
                 io_backend="kernel",
             )
-            self._backup_done_event.record()
+            self._backup_done_event.record(self.decode_backup_stream)
             if host_locs.is_cuda:
                 host_locs.record_stream(self.decode_backup_stream)
             if device_locs.is_cuda:
@@ -2517,7 +2534,7 @@ class HiSparseCoordinator:
         host_locs = torch.cat(host_locs_list)
 
         self.wait_for_pending_backup()
-        schedule_stream = device_module.current_stream()
+        schedule_stream = device_module.current_stream(self.device)
         with device_module.stream(self.decode_backup_stream):
             self.decode_backup_stream.wait_stream(schedule_stream)
             if self.decode_producer_stream is not None:
@@ -2528,7 +2545,7 @@ class HiSparseCoordinator:
                 device_locs,
                 io_backend="kernel",
             )
-            self._backup_done_event.record()
+            self._backup_done_event.record(self.decode_backup_stream)
             if host_locs.is_cuda:
                 host_locs.record_stream(self.decode_backup_stream)
             if backup_req_indices.is_cuda:
@@ -2542,7 +2559,7 @@ class HiSparseCoordinator:
     def wait_for_pending_backup(self) -> None:
         if not self._has_pending_backup:
             return
-        self._backup_done_event.wait(device_module.current_stream())
+        self._backup_done_event.wait(device_module.current_stream(self.device))
         self._has_pending_backup = False
         if self.enable_mixed_residency:
             for (
@@ -2729,7 +2746,9 @@ class HiSparseCoordinator:
     def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
-            device_module.current_stream().wait_stream(self.decode_producer_stream)
+            device_module.current_stream(self.device).wait_stream(
+                self.decode_producer_stream
+            )
         self.wait_for_pending_backup()
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
@@ -2845,7 +2864,9 @@ class HiSparseCoordinator:
         if not self.enable_mixed_residency or num_tokens <= 0:
             return 0
         if self.decode_producer_stream is not None:
-            device_module.current_stream().wait_stream(self.decode_producer_stream)
+            device_module.current_stream(self.device).wait_stream(
+                self.decode_producer_stream
+            )
         self.wait_for_pending_backup()
         candidate_pages = []
         candidate_meta = []
