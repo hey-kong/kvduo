@@ -1415,6 +1415,17 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
+        # ``self.device`` is the unindexed server device type.  CUDA's current
+        # device is thread-local, and the scheduler/event-loop thread is not
+        # necessarily the ModelRunner initialization thread that called
+        # set_device().  Recover the rank-indexed device from an allocated
+        # tensor before creating any scheduler-owned streams.
+        self.rank_device = self.req_to_token_pool.req_to_token.device
+        if is_cuda() or _is_hip:
+            self.device_module.set_device(self.rank_device)
+        self._stream_device_kwargs = (
+            {"device": self.rank_device} if is_cuda() or _is_hip else {}
+        )
 
         # FutureMap is always-on: input_ids relay used in both modes.
         # Workers without the spec_v2_attn_backends override fall back to
@@ -1459,7 +1470,9 @@ class Scheduler(
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
-        self.copy_stream: CudaStream = self.device_module.Stream()
+        self.copy_stream: CudaStream = self.device_module.Stream(
+            **self._stream_device_kwargs
+        )
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
         )
@@ -1645,7 +1658,15 @@ class Scheduler(
             dispatch_event_loop(self)
             return
 
-        self.schedule_stream = self.device_module.Stream(priority=0)
+        # run_event_loop may be invoked on a different host thread from model
+        # initialization.  Establish that thread's CUDA device explicitly;
+        # otherwise every TP process defaults to logical GPU 0 as soon as an
+        # unqualified CUDA API is reached during request processing.
+        if is_cuda() or _is_hip:
+            self.device_module.set_device(self.rank_device)
+        self.schedule_stream = self.device_module.Stream(
+            priority=0, **self._stream_device_kwargs
+        )
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         elif is_cuda() or _is_hip:
@@ -1658,7 +1679,9 @@ class Scheduler(
                 self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream
                 and _redraws < 64
             ):
-                self.schedule_stream = self.device_module.Stream(priority=0)
+                self.schedule_stream = self.device_module.Stream(
+                    priority=0, **self._stream_device_kwargs
+                )
                 _redraws += 1
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.

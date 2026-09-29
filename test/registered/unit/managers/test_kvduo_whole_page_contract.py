@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[4]
 COORDINATOR = ROOT / "python/sglang/srt/managers/hisparse_coordinator.py"
 BACKEND = ROOT / "python/sglang/srt/layers/attention/deepseek_v4_backend.py"
+SCHEDULER = ROOT / "python/sglang/srt/managers/scheduler.py"
 
 
 def _method_source(path: Path, class_name: str, method_name: str) -> str:
@@ -158,3 +159,15 @@ def test_cuda_streams_are_bound_to_the_tensor_parallel_device():
     assert "_kvduo_stats_snapshot_ready_event.record(schedule_stream)" in stats
     assert "_kvduo_stats_event.record(self._kvduo_stats_stream)" in stats
     assert ".record()" not in source
+
+
+def test_scheduler_thread_sets_its_rank_device_before_creating_streams():
+    overlap = _method_source(SCHEDULER, "Scheduler", "init_overlap")
+    event_loop = _method_source(SCHEDULER, "Scheduler", "run_event_loop")
+
+    assert "self.rank_device = self.req_to_token_pool.req_to_token.device" in overlap
+    assert "self.device_module.set_device(self.rank_device)" in overlap
+    assert "self.device_module.Stream()" not in overlap
+    assert "self.device_module.set_device(self.rank_device)" in event_loop
+    assert "**self._stream_device_kwargs" in event_loop
+    assert "self.device_module.Stream(priority=0)" not in event_loop
