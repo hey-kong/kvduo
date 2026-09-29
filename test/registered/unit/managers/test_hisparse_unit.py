@@ -118,6 +118,47 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         self.assertIs(coordinator.augment_kvduo_prefix_match(req, match), match)
         self.assertFalse(hasattr(req, "_kvduo_prefix_identity_state"))
 
+    def test_long_prefix_lru_tie_break_is_fixed_width_and_stable(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
+            HostPrefixRecord,
+            KVDuoHostPrefixCache,
+        )
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.page_size = 1
+        coordinator.compress_ratio = 1
+        token_sets = [list(range(10_000)), [-1, *range(1, 10_000)]]
+        identities = []
+        for tokens in token_sets:
+            req = SimpleNamespace(extra_key="tenant")
+            identities.append(
+                coordinator._host_prefix_identity(req, len(tokens) - 1, tokens)
+            )
+
+        self.assertEqual(len(identities[0].stable_sort_digest), 16)
+        self.assertEqual(len(identities[1].stable_sort_digest), 16)
+        records = [
+            HostPrefixRecord(
+                identity=identity,
+                domains=("main_kv",),
+                host_locations={"main_kv": (index,)},
+                data_versions={"main_kv": (0,)},
+                host_versions={"main_kv": (0,)},
+                cache_reference=True,
+                last_access=7,
+                tie_break_key=(9_999, identity.stable_sort_digest),
+            )
+            for index, identity in enumerate(identities)
+        ]
+        expected = min(records, key=lambda record: record.tie_break_key).identity
+        cache = KVDuoHostPrefixCache(2)
+        # Reverse insertion order so eviction must use the stable tie breaker.
+        for record in reversed(records):
+            cache.insert(record)
+
+        self.assertIs(cache.evict_lru(1)[0].identity, expected)
+
     def test_generic_restore_requires_no_swa_pages(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 

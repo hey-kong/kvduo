@@ -1,5 +1,6 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
+import hashlib
 import logging
 from typing import List, NamedTuple, Sequence, Union
 
@@ -59,6 +60,20 @@ def _kvduo_stable_sort_atom(value):
     return (type(value).__qualname__, repr(value))
 
 
+def _kvduo_stable_sort_digest(parent_digest: bytes, namespace, tokens) -> bytes:
+    """Build a fixed-width, process-stable digest used only for LRU ordering."""
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(parent_digest)
+    namespace_bytes = repr(_kvduo_stable_sort_atom(namespace)).encode("utf-8")
+    digest.update(len(namespace_bytes).to_bytes(8, "big"))
+    digest.update(namespace_bytes)
+    for token in tokens:
+        token_bytes = str(int(token)).encode("ascii")
+        digest.update(len(token_bytes).to_bytes(8, "big"))
+        digest.update(token_bytes)
+    return digest.digest()
+
+
 class _KVDuoPrefixIdentity:
     """An exact, persistent identity for one page-aligned token prefix.
 
@@ -67,16 +82,16 @@ class _KVDuoPrefixIdentity:
     ``__eq__`` still walks and compares every chunk when hashes collide.
     """
 
-    __slots__ = ("namespace", "parent", "tokens", "_hash", "stable_sort_key")
+    __slots__ = ("namespace", "parent", "tokens", "_hash", "stable_sort_digest")
 
     def __init__(self, namespace, parent, tokens):
         self.namespace = namespace
         self.parent = parent
         self.tokens = tokens
         self._hash = hash((namespace, hash(parent), tokens))
-        self.stable_sort_key = (
-            parent.stable_sort_key if parent is not None else (),
-            _kvduo_stable_sort_atom(namespace),
+        self.stable_sort_digest = _kvduo_stable_sort_digest(
+            parent.stable_sort_digest if parent is not None else b"",
+            namespace,
             tokens,
         )
 
@@ -1023,7 +1038,7 @@ class HiSparseCoordinator:
                     model_touches={"main_kv": touch},
                     cache_reference=True,
                     last_access=int(self.full_touch_clock[0]),
-                    tie_break_key=(ordinal, identity.stable_sort_key),
+                    tie_break_key=(ordinal, identity.stable_sort_digest),
                 )
                 self.host_prefix_cache.insert(record)
                 retained.update(locations)
