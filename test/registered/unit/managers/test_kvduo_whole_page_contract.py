@@ -107,7 +107,7 @@ def test_batched_addresses_match_the_per_slot_reference_for_many_requests():
     assert broadcast_shape_order[2 * k :] == reference[2 * k :]
 
     growth = _method_source(
-        COORDINATOR, "HiSparseCoordinator", "_materialize_kvduo_hot_growth"
+        COORDINATOR, "HiSparseCoordinator", "_materialize_kvduo_hot_growth_batch"
     )
     assert "int(page[0])" not in growth
     assert 'to(device="cpu").tolist()' in growth
@@ -115,3 +115,21 @@ def test_batched_addresses_match_the_per_slot_reference_for_many_requests():
     assert "storage_offsets[None, :, None]" in growth
     assert "within_page[None, None, :]" in growth
     assert "next_page" in growth
+
+
+def test_graph_prepare_batches_a_whole_capacity_round():
+    prepare = _method_source(
+        COORDINATOR, "HiSparseCoordinator", "prepare_kvduo_graph_replay"
+    )
+    assert "_ensure_kvduo_hot_capacity_targets_batch(targets)" in prepare
+    assert "(layer_id, req_idx): self.min_hot_pages" in prepare
+
+    batch = _method_source(
+        COORDINATOR,
+        "HiSparseCoordinator",
+        "_materialize_kvduo_hot_growth_batch",
+    )
+    # One allocation and one page-number D2H read serve all request/layer pairs.
+    assert batch.count("allocator.alloc(physical_slots)") == 1
+    assert batch.count('to(device="cpu").tolist()') == 1
+    assert "for layer_id, req_idx, current, target, grow in requests" in batch
