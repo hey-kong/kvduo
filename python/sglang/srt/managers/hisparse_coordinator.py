@@ -198,16 +198,26 @@ class HiSparseCoordinator:
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
         if self.enable_mixed_residency:
-            # KVDuo's resolver has one compiled, capture-stable metadata width.
-            # This is deliberately not a physical KV reservation.
-            max_hot_capacity = 16 * top_k
+            # A KVDuo physical page is the same page number across every C4
+            # storage layer.  A HOT(request, logical_layer) owner may use all
+            # of those fragments through global flat C4 locations.
+            self.hot_storage_layers = (
+                self.mem_pool_device.layer_num if self.is_dsv4_hisparse else 1
+            )
+            self.hot_page_size = self.hot_storage_layers * self.page_size
+            self.min_hot_pages = (top_k + self.hot_page_size - 1) // self.hot_page_size
+            if self.min_hot_pages > 8:
+                raise ValueError(
+                    f"KVDuo top_k={top_k} needs {self.min_hot_pages} full pages; "
+                    "the per-layer hot-cache limit is 8 pages"
+                )
+            # Fixed graph metadata covers the promised 1K..8K physical pages.
+            max_hot_capacity = 8 * self.hot_page_size
             if max_hot_capacity > torch.iinfo(torch.int16).max:
                 raise ValueError(
-                    "KVDuo 16K capacity exceeds the int16 resolver slot type"
+                    "KVDuo 8-page capacity exceeds the int16 resolver slot type"
                 )
-            self.device_buffer_size = (
-                (max_hot_capacity + self.page_size - 1) // self.page_size
-            ) * self.page_size
+            self.device_buffer_size = max_hot_capacity
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -316,12 +326,9 @@ class HiSparseCoordinator:
             self._pending_kvduo_host_valid = []
             self._kvduo_pressure_protected = None
             self._kvduo_hot_pressure_protected = set()
-            # Physical buffers are layer-first.  A carrier reserves one row
-            # page from the legacy cross-layer allocator; ownership of each
-            # layer fragment is then tracked independently.  Consequently a
-            # hot page can be reused/released for one layer without affecting
-            # the same row range in other layers.  A carrier is returned to the
-            # legacy allocator only after every layer fragment is free.
+            # One page number has exactly one state: FREE, FULL (the normal
+            # allocator), or HOT(request, logical_layer).  There are no
+            # independently-owned layer fragments.
             self.kvduo_req_hot_capacity = torch.zeros(
                 (self.mem_pool_device.layer_num, max_num_req_slots),
                 dtype=torch.int64,
@@ -332,10 +339,7 @@ class HiSparseCoordinator:
                 dtype=torch.int32,
                 device=device,
             )
-            self._kvduo_hot_carriers = {}
-            self._kvduo_free_layer_pages = [
-                set() for _ in range(self.mem_pool_device.layer_num)
-            ]
+            self._kvduo_hot_page_owners = {}
             self._kvduo_req_layer_pages = {}
             self.host_prefix_cache = KVDuoHostPrefixCache(self.mem_pool_host.size)
             self._req_host_prefix_records = [set() for _ in range(max_num_req_slots)]
@@ -358,8 +362,7 @@ class HiSparseCoordinator:
             self._kvduo_hot_pressure_protected = None
             self.kvduo_req_hot_capacity = None
             self.kvduo_req_hot_capacity_gpu = None
-            self._kvduo_hot_carriers = None
-            self._kvduo_free_layer_pages = None
+            self._kvduo_hot_page_owners = None
             self._kvduo_req_layer_pages = None
             self.host_prefix_cache = None
             self._req_host_prefix_records = None
@@ -378,8 +381,8 @@ class HiSparseCoordinator:
         layer_num = self.mem_pool_device.layer_num
         if self.enable_mixed_residency:
             max_hot_pages = (
-                self.device_buffer_size + self.page_size - 1
-            ) // self.page_size
+                self.device_buffer_size + self.hot_page_size - 1
+            ) // self.hot_page_size
             self.hot_page_last_touch = torch.zeros(
                 (layer_num, max_num_req_slots, max_hot_pages),
                 dtype=torch.int64,
@@ -1507,10 +1510,8 @@ class HiSparseCoordinator:
         The backing metadata has a fixed address for CUDA graph replay, but no
         physical KV slot is owned until this method sees a valid Top-k entry
         whose full mapping is absent.  Capacity grows by allocator pages and is
-        owned independently by ``(request, layer)``.  A small carrier layer
-        adapts the legacy cross-layer row allocator to the layer-first physical
-        layout without allowing a future full-page allocation to alias a hot
-        fragment.
+        owned exclusively by ``(request, logical_layer)``.  Each allocation
+        spans all physical storage-layer fragments for that page number.
 
         This is a control-plane allocation boundary.  It intentionally performs
         one batched device-to-host copy of the required capacities before a
@@ -1528,7 +1529,7 @@ class HiSparseCoordinator:
         non_full = valid & (logical >= 0) & (full_locs <= 0)
         req_cpu = req_pool_indices.to(device="cpu", dtype=torch.int64)
 
-        page_size = self.page_size
+        page_size = self.hot_page_size
         demand = []
         max_required = self.device_buffer_size
         for row, req_idx in enumerate(req_cpu.tolist()):
@@ -1543,13 +1544,15 @@ class HiSparseCoordinator:
                 new_misses = int(selected.numel())
             required_slots = occupied + new_misses
             if allocate_mixed_minimum and self._mixed_slots[req_idx]:
-                required_slots = max(required_slots, 2 * self.top_k)
+                required_slots = max(
+                    required_slots, self.min_hot_pages * self.hot_page_size
+                )
             required_slots = max(
                 required_slots,
                 (requested_capacities or {}).get(req_idx, 0),
             )
             mandatory_slots = (
-                2 * self.top_k
+                self.min_hot_pages * self.hot_page_size
                 if self._mixed_slots[req_idx] and current == 0
                 else int(selected.numel())
             )
@@ -1557,14 +1560,15 @@ class HiSparseCoordinator:
             max_required = max(max_required, required_slots)
 
         if max_required > self.device_buffer_size:
-            raise RuntimeError("KVDuo attention workset exceeds fixed 16K metadata")
+            raise RuntimeError("KVDuo attention workset exceeds fixed 8-page metadata")
         requests = []
         for req_idx, current, required_slots, _ in demand:
             if not required_slots:
                 continue
             tiers = [
-                ((multiplier * self.top_k + page_size - 1) // page_size) * page_size
-                for multiplier in (2, 4, 8, 16)
+                ((multiplier * self.hot_page_size + page_size - 1) // page_size)
+                * page_size
+                for multiplier in range(1, 9)
             ]
             target = next((tier for tier in tiers if tier >= required_slots), tiers[-1])
             # Capacity changes one tier at a graph boundary. A failed growth is
@@ -1606,17 +1610,19 @@ class HiSparseCoordinator:
         """
         if not requested_capacities:
             return
-        page_size = self.page_size
-        minimum_target = ((2 * self.top_k + page_size - 1) // page_size) * page_size
+        page_size = self.hot_page_size
+        minimum_target = self.min_hot_pages * page_size
         requests = []
         mandatory_targets = {}
         for req_idx, required_slots in requested_capacities.items():
             if required_slots > self.device_buffer_size:
-                raise RuntimeError("KVDuo hot target exceeds fixed 16K metadata")
+                raise RuntimeError("KVDuo hot target exceeds fixed 8-page metadata")
             current = int(self.kvduo_req_hot_capacity[layer_id, req_idx])
             target = ((required_slots + page_size - 1) // page_size) * page_size
             if target > self.device_buffer_size:
-                raise RuntimeError("KVDuo page-aligned target exceeds fixed 16K metadata")
+                raise RuntimeError(
+                    "KVDuo page-aligned target exceeds fixed 8-page metadata"
+                )
             if target <= current:
                 continue
             requests.append((req_idx, current, target, target - current))
@@ -1640,40 +1646,24 @@ class HiSparseCoordinator:
         protected_logical,
         allow_reclaim: bool = True,
     ) -> None:
-        """Allocate layer-hot pages for precomputed targets without tag readback."""
+        """Allocate whole physical pages to HOT(request, logical_layer).
+
+        One allocator page contributes ``layer_num * page_size`` logical hot
+        slots.  Slot ``j`` is encoded as a global C4 location at storage layer
+        ``j // page_size`` and offset ``j % page_size`` for the allocated page.
+        """
         if not requests:
             return
-        page_size = self.page_size
-        total_grow = sum(grow for _, _, _, grow in requests)
-        pages_needed = total_grow // page_size
-        free_pages = self._kvduo_free_layer_pages[layer_id]
-        if not allow_reclaim:
-            allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
-            available_pages = len(free_pages) + allocator.available_size() // page_size
-            admitted = []
-            for request in requests:
-                request_pages = request[3] // page_size
-                if request_pages <= available_pages:
-                    admitted.append(request)
-                    available_pages -= request_pages
-            requests = admitted
-            if not requests:
-                return
-            total_grow = sum(grow for _, _, _, grow in requests)
-            pages_needed = total_grow // page_size
-        missing_carriers = max(0, pages_needed - len(free_pages))
-        if missing_carriers:
-            carrier_slots = missing_carriers * page_size
-            if not allow_reclaim:
-                physical = (
-                    self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
-                        carrier_slots
-                    )
-                )
-                if physical is None:
-                    return
-            else:
-                physical = None
+        K = self.hot_page_size
+        requests = [r for r in requests if r[3] > 0]
+        pages_needed = sum(grow // K for _, _, _, grow in requests)
+        physical_slots = pages_needed * self.page_size
+        if physical_slots == 0:
+            return
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        if not allow_reclaim and allocator.available_size() < physical_slots:
+            return
+        if allow_reclaim:
             self._kvduo_pressure_protected = protected_logical
             self._kvduo_hot_pressure_protected = {
                 (layer_id, int(req_idx), page_index)
@@ -1682,94 +1672,53 @@ class HiSparseCoordinator:
                     len(self._kvduo_req_layer_pages.get((layer_id, int(req_idx)), ()))
                 )
             }
-            reserved_free_starts = sorted(free_pages)[
-                : min(pages_needed, len(free_pages))
-            ]
-            for start in reserved_free_starts:
-                for owner_layer, owner_req in enumerate(
-                    self._kvduo_hot_carriers[start]
-                ):
-                    if owner_req is None:
-                        continue
-                    owner_pages = self._kvduo_req_layer_pages.get(
-                        (owner_layer, int(owner_req)), ()
-                    )
-                    if start in owner_pages:
-                        self._kvduo_hot_pressure_protected.add(
-                            (owner_layer, int(owner_req), owner_pages.index(start))
-                        )
             try:
-                if allow_reclaim:
-                    pressure = self._reclaim_for_physical_allocation(carrier_slots)
-                    if pressure.action is not KVDuoPressureAction.SUCCESS:
-                        requests = [
-                            (req_idx, current, target, target - current)
-                            for req_idx, target in mandatory_targets.items()
-                            if (
-                                current := int(
-                                    self.kvduo_req_hot_capacity[layer_id, req_idx]
-                                )
-                            )
-                            < target
-                        ]
-                        if not requests:
-                            return
-                        total_grow = sum(grow for _, _, _, grow in requests)
-                        pages_needed = total_grow // page_size
-                        missing_carriers = max(0, pages_needed - len(free_pages))
-                        carrier_slots = missing_carriers * page_size
-                        pressure = self._reclaim_for_physical_allocation(carrier_slots)
-                        self._require_allocation_ready(pressure)
-                    missing_carriers = max(0, pages_needed - len(free_pages))
-                    carrier_slots = missing_carriers * page_size
-                    if carrier_slots:
-                        pressure = self._reclaim_for_physical_allocation(carrier_slots)
-                        self._require_allocation_ready(pressure)
-                    physical = (
-                        self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
-                            carrier_slots
-                        )
-                        if carrier_slots
-                        else torch.empty(0, dtype=torch.int64, device=self.device)
-                    )
+                pressure = self._reclaim_for_physical_allocation(physical_slots)
+                self._require_allocation_ready(pressure)
             finally:
                 self._kvduo_pressure_protected = None
                 self._kvduo_hot_pressure_protected = set()
-            if physical is None:
-                raise RuntimeError(
-                    "KVDuo layer-page carrier allocation failed after pressure plan"
-                )
-            for carrier in physical.view(-1, page_size):
-                start = int(carrier[0])
-                if start in self._kvduo_hot_carriers:
-                    raise RuntimeError("KVDuo hot carrier aliases existing ownership")
-                self._kvduo_hot_carriers[start] = [
-                    None
-                ] * self.mem_pool_device.layer_num
-                for domain in range(self.mem_pool_device.layer_num):
-                    self._kvduo_free_layer_pages[domain].add(start)
-
+        physical = allocator.alloc(physical_slots)
+        if physical is None:
+            if allow_reclaim:
+                raise RuntimeError("KVDuo whole-page HOT allocation failed")
+            return
+        # This allocation path runs outside graph replay. Fetch all page
+        # identities with one D2H synchronization, then construct every flat
+        # C4 address on-device. Converting individual scalars would synchronize
+        # once per physical page.
+        physical_pages = physical.view(-1, self.page_size)
+        page_starts_device = physical_pages[:, 0].to(torch.int64)
+        page_starts = page_starts_device.to(device="cpu").tolist()
+        layer_stride = getattr(self.mem_pool_device, "flat_layer_slot_stride", 0)
+        storage_offsets = (
+            torch.arange(
+                self.hot_storage_layers, dtype=torch.int64, device=self.device
+            )
+            * layer_stride
+        )
+        within_page = torch.arange(
+            self.page_size, dtype=torch.int64, device=self.device
+        )
+        all_page_locs = (
+            page_starts_device[:, None, None]
+            + storage_offsets[None, :, None]
+            + within_page[None, None, :]
+        ).reshape(pages_needed, K)
+        next_page = 0
         for req_idx, current, target, grow in requests:
-            chunks = []
-            for _ in range(grow // page_size):
-                start = min(self._kvduo_free_layer_pages[layer_id])
-                self._kvduo_free_layer_pages[layer_id].remove(start)
-                owners = self._kvduo_hot_carriers[start]
-                if owners[layer_id] is not None:
-                    raise RuntimeError("KVDuo layer page is already owned")
-                owners[layer_id] = req_idx
-                self._kvduo_req_layer_pages.setdefault((layer_id, req_idx), []).append(
-                    start
-                )
-                chunks.append(
-                    torch.arange(
-                        start,
-                        start + page_size,
-                        dtype=torch.int64,
-                        device=self.device,
-                    )
-                )
-            page_locs = torch.cat(chunks)
+            req_idx = int(req_idx)
+            request_page_count = grow // K
+            for start in page_starts[next_page : next_page + request_page_count]:
+                owner = (int(layer_id), req_idx)
+                if start in self._kvduo_hot_page_owners:
+                    raise RuntimeError("KVDuo physical page already has an owner")
+                self._kvduo_hot_page_owners[start] = owner
+                self._kvduo_req_layer_pages.setdefault(owner, []).append(start)
+            page_locs = all_page_locs[
+                next_page : next_page + request_page_count
+            ].reshape(-1)
+            next_page += request_page_count
             self.req_device_buffer_token_locs[layer_id, req_idx, current:target] = (
                 page_locs.to(torch.int32)
             )
@@ -1778,16 +1727,15 @@ class HiSparseCoordinator:
             self.lru_slots[layer_id, req_idx, :target] = torch.cat(
                 [
                     torch.arange(
-                        current,
-                        target,
-                        dtype=torch.int16,
-                        device=self.device,
+                        current, target, dtype=torch.int16, device=self.device
                     ),
                     old_lru,
                 ]
             )
             self.kvduo_req_hot_capacity[layer_id, req_idx] = target
             self.kvduo_req_hot_capacity_gpu[layer_id, req_idx] = target
+        if next_page != pages_needed:
+            raise RuntimeError("KVDuo HOT allocation did not consume every page")
 
     def _consume_kvduo_stats_snapshot(self):
         """Return a completed asynchronous statistics snapshot, if available."""
@@ -1826,7 +1774,7 @@ class HiSparseCoordinator:
 
         This is intentionally host-side and must run only after the preceding
         producer stream is complete.  Fully resident requests retain capacity
-        zero; newly mixed requests atomically acquire their page-aligned 2K
+        zero; newly mixed requests atomically acquire their whole-page minimum
         tier before the next resolver replay.
         """
         if not self.enable_mixed_residency or req_pool_indices.numel() == 0:
@@ -1863,7 +1811,8 @@ class HiSparseCoordinator:
                 for req_idx in self._active_kvduo_reqs
                 if self._mixed_slots[req_idx]
                 and any(
-                    int(self.kvduo_req_hot_capacity[layer_id, req_idx]) < 2 * self.top_k
+                    int(self.kvduo_req_hot_capacity[layer_id, req_idx])
+                    < self.min_hot_pages * self.hot_page_size
                     for layer_id in range(self.mem_pool_device.layer_num)
                 )
             }
@@ -1896,7 +1845,7 @@ class HiSparseCoordinator:
                     # therefore cannot repeatedly grow the tier up to 16K.
                     if (
                         current > 0
-                        and current < 16 * self.top_k
+                        and current < 8 * self.hot_page_size
                         and valid_accesses > 0
                         and host_misses >= self.top_k
                         and host_misses
@@ -1906,12 +1855,11 @@ class HiSparseCoordinator:
                         # (2K -> 4K -> 6K -> ... -> 16K) so one request cannot
                         # consume exponentially larger tiers under pressure.
                         optional_growth[(layer_id, req_idx)] = min(
-                            current + 2 * self.top_k, 16 * self.top_k
+                            current + self.hot_page_size, 8 * self.hot_page_size
                         )
 
         # Pressure reclamation can demote another active request. Iterate to a
-        # capacity fixed point so every mixed request has 2K in every storage
-        # group. Optional growth is handled only after this invariant holds.
+        # capacity fixed point so every mixed request has its minimum whole-page capacity in every logical layer. Optional growth is handled only after this invariant holds.
         pending = initial_mixed
         while True:
             mixed = sorted(pending)
@@ -1927,7 +1875,7 @@ class HiSparseCoordinator:
                 for req_idx in mixed:
                     current = int(self.kvduo_req_hot_capacity[layer_id, req_idx])
                     if current == 0:
-                        targets[req_idx] = 2 * self.top_k
+                        targets[req_idx] = self.min_hot_pages * self.hot_page_size
                 if targets:
                     self._ensure_kvduo_hot_capacity_targets(layer_id, targets)
             requested.update(
@@ -1946,7 +1894,8 @@ class HiSparseCoordinator:
                 for req_idx in requested
                 if self._mixed_slots[req_idx]
                 and any(
-                    int(self.kvduo_req_hot_capacity[layer_id, req_idx]) < 2 * self.top_k
+                    int(self.kvduo_req_hot_capacity[layer_id, req_idx])
+                    < self.min_hot_pages * self.hot_page_size
                     for layer_id in range(self.mem_pool_device.layer_num)
                 )
             }
@@ -1967,7 +1916,10 @@ class HiSparseCoordinator:
             if not self._mixed_slots[req_idx]:
                 continue
             for layer_id in range(self.mem_pool_device.layer_num):
-                if int(self.kvduo_req_hot_capacity[layer_id, req_idx]) < 2 * self.top_k:
+                if (
+                    int(self.kvduo_req_hot_capacity[layer_id, req_idx])
+                    < self.min_hot_pages * self.hot_page_size
+                ):
                     raise RuntimeError(
                         "KVDuo mixed request lacks mandatory 2K capacity before replay"
                     )
@@ -1993,35 +1945,27 @@ class HiSparseCoordinator:
     def _grow_kvduo_hot_metadata(self, required_slots: int) -> None:
         """Validate against the immutable, capture-stable resolver metadata."""
         if required_slots > self.device_buffer_size:
-            raise RuntimeError("KVDuo hot metadata cannot grow beyond fixed 16K")
+            raise RuntimeError("KVDuo hot metadata cannot grow beyond fixed 8-page")
 
     def _release_kvduo_layer_hot_pages(self, req_idx: int) -> None:
-        """Release request-private hot pages at single-layer page granularity."""
+        """Return every HOT page of a request directly to the common allocator."""
         if not self.enable_mixed_residency:
             return
-        coalesce = set()
+        starts = []
         for layer_id in range(self.mem_pool_device.layer_num):
-            for start in self._kvduo_req_layer_pages.pop((layer_id, req_idx), []):
-                owners = self._kvduo_hot_carriers[start]
-                if owners[layer_id] != req_idx:
-                    raise RuntimeError("KVDuo layer-page ownership mismatch")
-                owners[layer_id] = None
-                self._kvduo_free_layer_pages[layer_id].add(start)
-                if all(owner is None for owner in owners):
-                    coalesce.add(start)
+            owner = (layer_id, req_idx)
+            for start in self._kvduo_req_layer_pages.pop(owner, []):
+                if self._kvduo_hot_page_owners.pop(start, None) != owner:
+                    raise RuntimeError("KVDuo whole-page ownership mismatch")
+                starts.append(start)
             self.kvduo_req_hot_capacity[layer_id, req_idx] = 0
             self.kvduo_req_hot_capacity_gpu[layer_id, req_idx] = 0
-
-        # Returning a carrier to the legacy allocator is safe only when no
-        # layer fragment remains owned.  Until then, other requests may reuse
-        # each free layer fragment independently.
-        if coalesce:
-            indices = []
-            for start in sorted(coalesce):
-                for layer_pages in self._kvduo_free_layer_pages:
-                    layer_pages.remove(start)
-                del self._kvduo_hot_carriers[start]
-                indices.extend(range(start, start + self.page_size))
+        if starts:
+            indices = [
+                i
+                for start in sorted(starts)
+                for i in range(start, start + self.page_size)
+            ]
             self.token_to_kv_pool_allocator.free_hisparse_indices(
                 torch.tensor(indices, dtype=torch.int64, device=self.device)
             )
@@ -2029,42 +1973,50 @@ class HiSparseCoordinator:
     def _evict_kvduo_hot_fragment(
         self, layer_id: int, req_idx: int, page_index: int
     ) -> None:
-        """Drop one layer page without moving any KV payload."""
+        """Drop one whole HOT physical page without moving any KV payload."""
         pages = self._kvduo_req_layer_pages[(layer_id, req_idx)]
         last_index = len(pages) - 1
         victim_start = pages[page_index]
-        slot = page_index * self.page_size
-        last_slot = last_index * self.page_size
+        slot = page_index * self.hot_page_size
+        last_slot = last_index * self.hot_page_size
         if page_index != last_index:
             # Only page-table metadata moves. The surviving KV payload stays at
             # its original physical addresses carried by token_locs.
             self.req_device_buffer_tokens[
-                layer_id, req_idx, slot : slot + self.page_size
+                layer_id, req_idx, slot : slot + self.hot_page_size
             ] = self.req_device_buffer_tokens[
-                layer_id, req_idx, last_slot : last_slot + self.page_size
+                layer_id, req_idx, last_slot : last_slot + self.hot_page_size
             ].clone()
             self.req_device_buffer_token_locs[
-                layer_id, req_idx, slot : slot + self.page_size
+                layer_id, req_idx, slot : slot + self.hot_page_size
             ] = self.req_device_buffer_token_locs[
-                layer_id, req_idx, last_slot : last_slot + self.page_size
+                layer_id, req_idx, last_slot : last_slot + self.hot_page_size
             ].clone()
             self.hot_page_last_touch[layer_id, req_idx, page_index] = (
                 self.hot_page_last_touch[layer_id, req_idx, last_index]
             )
             pages[page_index] = pages[last_index]
         self.req_device_buffer_tokens[
-            layer_id, req_idx, last_slot : last_slot + self.page_size
+            layer_id, req_idx, last_slot : last_slot + self.hot_page_size
         ] = -1
         self.req_device_buffer_token_locs[
-            layer_id, req_idx, last_slot : last_slot + self.page_size
+            layer_id, req_idx, last_slot : last_slot + self.hot_page_size
         ] = -1
         self.hot_page_last_touch[layer_id, req_idx, last_index] = 0
         pages.pop()
         if not pages:
             del self._kvduo_req_layer_pages[(layer_id, req_idx)]
-        owners = self._kvduo_hot_carriers[victim_start]
-        owners[layer_id] = None
-        self._kvduo_free_layer_pages[layer_id].add(victim_start)
+        owner = (layer_id, req_idx)
+        if self._kvduo_hot_page_owners.pop(victim_start, None) != owner:
+            raise RuntimeError("KVDuo whole-page ownership mismatch")
+        self.token_to_kv_pool_allocator.free_hisparse_indices(
+            torch.arange(
+                victim_start,
+                victim_start + self.page_size,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        )
         new_capacity = last_slot
         self.kvduo_req_hot_capacity[layer_id, req_idx] = new_capacity
         self.kvduo_req_hot_capacity_gpu[layer_id, req_idx] = new_capacity
@@ -2087,7 +2039,7 @@ class HiSparseCoordinator:
         protected = getattr(self, "_kvduo_hot_pressure_protected", set())
         candidates = []
         for (layer_id, req_idx), pages in self._kvduo_req_layer_pages.items():
-            minimum_pages = (2 * self.top_k + self.page_size - 1) // self.page_size
+            minimum_pages = self.min_hot_pages
             for page_index, start in enumerate(pages):
                 if len(pages) <= minimum_pages:
                     continue
@@ -2110,26 +2062,13 @@ class HiSparseCoordinator:
             pages = self._kvduo_req_layer_pages.get((layer_id, req_idx))
             if pages is None or start not in pages:
                 continue
-            minimum_pages = (2 * self.top_k + self.page_size - 1) // self.page_size
+            minimum_pages = self.min_hot_pages
             if len(pages) <= minimum_pages:
                 continue
             self._evict_kvduo_hot_fragment(layer_id, req_idx, pages.index(start))
-            owners = self._kvduo_hot_carriers[start]
-            if all(owner is None for owner in owners):
-                for layer_pages in self._kvduo_free_layer_pages:
-                    layer_pages.remove(start)
-                del self._kvduo_hot_carriers[start]
-                self.token_to_kv_pool_allocator.free_hisparse_indices(
-                    torch.arange(
-                        start,
-                        start + self.page_size,
-                        dtype=torch.int64,
-                        device=self.device,
-                    )
-                )
-                reclaimed += self.page_size
-                if reclaimed >= num_tokens:
-                    break
+            reclaimed += self.page_size
+            if reclaimed >= num_tokens:
+                break
         return reclaimed
 
     def has_ongoing_staging(self) -> bool:
@@ -2863,7 +2802,11 @@ class HiSparseCoordinator:
             host_cache_locs=self.req_to_host_pool,
             device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
             host_cache=self.mem_pool_host.kv_buffer[layer_id],
-            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            device_buffer=(
+                self.mem_pool_device.get_flat_key_buffer()
+                if self.enable_mixed_residency and self.is_dsv4_hisparse
+                else self.mem_pool_device.kv_buffer[layer_id]
+            ),
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
             seq_lens=compressed_seq_lens,
@@ -2871,7 +2814,7 @@ class HiSparseCoordinator:
             item_size_bytes=self.item_size_bytes,
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
-            page_size=self.page_size if self.enable_mixed_residency else 1,
+            page_size=self.hot_page_size if self.enable_mixed_residency else 1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
             req_hot_buffer_sizes=(
@@ -2913,6 +2856,11 @@ class HiSparseCoordinator:
             ),
             touch_clock=(
                 self.full_touch_clock if self.enable_mixed_residency else None
+            ),
+            full_location_base=(
+                layer_id * self.mem_pool_device.flat_layer_slot_stride
+                if self.enable_mixed_residency and self.is_dsv4_hisparse
+                else 0
             ),
         )
         if self.enable_mixed_residency:

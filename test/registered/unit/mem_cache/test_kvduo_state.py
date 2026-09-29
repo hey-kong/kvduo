@@ -22,6 +22,8 @@ KVDuoEntryVersionState = STATE.KVDuoEntryVersionState
 KVDuoFullPageState = STATE.KVDuoFullPageState
 KVDuoHotCapacity = STATE.KVDuoHotCapacity
 KVDuoHotPageAllocator = STATE.KVDuoHotPageAllocator
+KVDuoHotPageGeometry = STATE.KVDuoHotPageGeometry
+KVDuoPhysicalPageKind = STATE.KVDuoPhysicalPageKind
 KVDuoPagePinState = STATE.KVDuoPagePinState
 KVDuoPageResidency = STATE.KVDuoPageResidency
 KVDuoPressureResult = STATE.KVDuoPressureResult
@@ -34,6 +36,57 @@ KVDuoResidencyCatalog = STATE.KVDuoResidencyCatalog
 KVDuoTailRotation = STATE.KVDuoTailRotation
 execute_kvduo_pressure_plan = STATE.execute_kvduo_pressure_plan
 plan_kvduo_allocation = STATE.plan_kvduo_allocation
+
+
+def test_whole_hot_page_cross_layer_addressing_and_attention_read():
+    geometry = KVDuoHotPageGeometry(21, 64, 64 * 11)
+    page_start = 3 * 64
+    slots = (0, 63, 64, 1343)
+    addresses = [geometry.encode(page_start, slot) for slot in slots]
+    assert geometry.slots_per_page == 1344
+    assert addresses == [192, 255, 896, 14335]
+
+    # Swap-in writes and sparse attention gathers the same flat backing.  In
+    # particular slots 64 and 1343 are not copied into logical layer zero.
+    backing = [None] * (21 * geometry.layer_slot_stride)
+    values = ["kv0", "kv63", "kv64", "kv1343"]
+    for address, value in zip(addresses, values):
+        backing[address] = value
+    assert [backing[address] for address in addresses] == values
+
+
+def test_prefill_layer_local_and_decode_global_address_spaces_do_not_mix():
+    geometry = KVDuoHotPageGeometry(2, 4, 32)
+    local_slot = 6
+
+    # Prefill receives a layer-local tensor and the same local index must select
+    # different data in two logical layers.
+    layer_views = [[None] * 32 for _ in range(2)]
+    layer_views[0][local_slot] = "prefill-layer-0"
+    layer_views[1][local_slot] = "prefill-layer-1"
+    assert [view[local_slot] for view in layer_views] == [
+        "prefill-layer-0",
+        "prefill-layer-1",
+    ]
+
+    # Decode consumes one flat address space: a FULL hit is rebased to the
+    # logical layer while a HOT hit can target another storage-layer fragment.
+    flat = [None] * 64
+    full_layer_1 = geometry.layer_slot_stride + local_slot
+    hot_cross_layer = geometry.encode(page_start=8, logical_slot=7)
+    flat[full_layer_1] = "decode-full-layer-1"
+    flat[hot_cross_layer] = "decode-hot-storage-layer-1"
+    assert [flat[i] for i in (full_layer_1, hot_cross_layer)] == [
+        "decode-full-layer-1",
+        "decode-hot-storage-layer-1",
+    ]
+
+
+def test_hot_geometry_bounds_and_explicit_page_states():
+    geometry = KVDuoHotPageGeometry(2, 4, 32)
+    with pytest.raises(IndexError):
+        geometry.encode(0, geometry.slots_per_page)
+    assert {kind.name for kind in KVDuoPhysicalPageKind} == {"FREE", "FULL", "HOT"}
 
 
 def make_page(page_id, *, gpu=True, host=True):
