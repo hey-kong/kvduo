@@ -42,15 +42,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
     def test_prefix_identities_share_pages_and_compare_exactly(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
-        class CollidingToken:
-            def __init__(self, value):
-                self.value = value
-
+        class CollidingToken(int):
             def __hash__(self):
                 return 0
-
-            def __eq__(self, other):
-                return isinstance(other, CollidingToken) and self.value == other.value
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.page_size = 2
@@ -78,11 +72,11 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         collision_a = SimpleNamespace(
             extra_key="tenant",
-            get_fill_ids=lambda: [CollidingToken("a"), CollidingToken("tail")],
+            get_fill_ids=lambda: [CollidingToken(1), CollidingToken(3)],
         )
         collision_b = SimpleNamespace(
             extra_key="tenant",
-            get_fill_ids=lambda: [CollidingToken("b"), CollidingToken("tail")],
+            get_fill_ids=lambda: [CollidingToken(2), CollidingToken(3)],
         )
         identity_a = coordinator._host_prefix_identity(collision_a, 0)
         identity_b = coordinator._host_prefix_identity(collision_b, 0)
