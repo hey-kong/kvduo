@@ -16,6 +16,56 @@ DomainIdentity = Hashable
 OwnerIdentity = Hashable
 
 
+class KVDuoPhysicalPageKind(Enum):
+    """Exclusive ownership state of a complete KVDuo C4 physical page."""
+
+    FREE = auto()
+    FULL = auto()
+    HOT = auto()
+
+
+@dataclass(frozen=True)
+class KVDuoPhysicalPageOwner:
+    """Owner tag; HOT is the only state carrying request/layer identity."""
+
+    kind: KVDuoPhysicalPageKind
+    request: Optional[int] = None
+    logical_layer: Optional[int] = None
+
+    def __post_init__(self):
+        has_identity = self.request is not None or self.logical_layer is not None
+        if self.kind is KVDuoPhysicalPageKind.HOT:
+            if self.request is None or self.logical_layer is None:
+                raise ValueError("HOT page requires (request, logical_layer)")
+        elif has_identity:
+            raise ValueError("FREE/FULL page cannot carry a hot owner identity")
+
+
+@dataclass(frozen=True)
+class KVDuoHotAddressSpace:
+    """Runtime-derived storage-layer-major addressing for complete hot pages."""
+
+    storage_layers: int
+    compressed_page_size: int
+    slots_per_storage_layer: int
+
+    def __post_init__(self):
+        if min(self.storage_layers, self.compressed_page_size) <= 0:
+            raise ValueError("KVDuo hot address dimensions must be positive")
+        if self.slots_per_storage_layer < self.compressed_page_size:
+            raise ValueError("storage layer is smaller than one compressed page")
+
+    @property
+    def slots_per_page(self) -> int:
+        return self.storage_layers * self.compressed_page_size
+
+    def encode(self, page_start: int, logical_slot: int) -> int:
+        if not 0 <= logical_slot < self.slots_per_page:
+            raise IndexError("KVDuo logical hot slot is outside its physical page")
+        storage_layer, offset = divmod(logical_slot, self.compressed_page_size)
+        return storage_layer * self.slots_per_storage_layer + page_start + offset
+
+
 @dataclass(frozen=True)
 class KVDuoWritebackTicket:
     """Version captured when an asynchronous host writeback is submitted."""

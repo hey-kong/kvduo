@@ -323,3 +323,53 @@ def test_hot_hit_refreshes_slot_and_page_lru_without_allocating():
     assert len(calls) == 1
     assert allocator.pages[20].last_touch == 9
     assert allocator.pages[20].slots[0].last_touch == 9
+
+
+def test_complete_hot_page_cross_layer_addressing():
+    """A DSv4-sized hot page exposes all 21*64 slots to one logical owner."""
+    space = STATE.KVDuoHotAddressSpace(
+        storage_layers=21,
+        compressed_page_size=64,
+        slots_per_storage_layer=4096,
+    )
+    assert space.slots_per_page == 1344
+    assert [space.encode(128, slot) for slot in (0, 63, 64, 1343)] == [
+        128,
+        191,
+        4096 + 128,
+        20 * 4096 + 128 + 63,
+    ]
+    with pytest.raises(IndexError):
+        space.encode(128, 1344)
+
+
+def test_complete_hot_page_values_are_visible_through_flat_view():
+    """Models swap-in and attention sharing the same layer-major backing."""
+    torch = pytest.importorskip("torch")
+    space = STATE.KVDuoHotAddressSpace(21, 64, 256)
+    backing = torch.zeros((21, 256), dtype=torch.int64)
+    flat = backing.reshape(-1)
+    values = (11, 22, 33, 44)
+    for slot, value in zip((0, 63, 64, 1343), values):
+        flat[space.encode(64, slot)] = value
+    assert [int(flat[space.encode(64, slot)]) for slot in (0, 63, 64, 1343)] == list(
+        values
+    )
+    # The boundary slots really landed in storage layers 0, 1, and 20.
+    assert (int(backing[0, 64]), int(backing[1, 64]), int(backing[20, 127])) == (
+        11,
+        33,
+        44,
+    )
+
+
+def test_physical_page_owner_states_are_exclusive():
+    kind = STATE.KVDuoPhysicalPageKind
+    owner = STATE.KVDuoPhysicalPageOwner
+    assert owner(kind.FREE).kind is kind.FREE
+    assert owner(kind.FULL).kind is kind.FULL
+    assert owner(kind.HOT, 7, 3) == owner(kind.HOT, 7, 3)
+    with pytest.raises(ValueError, match="requires"):
+        owner(kind.HOT)
+    with pytest.raises(ValueError, match="cannot carry"):
+        owner(kind.FULL, 7, 3)

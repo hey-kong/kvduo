@@ -977,9 +977,9 @@ class DeepseekSparseAttnBackend(
                         )
                     ]
                 )
-                assert page_table_1_flattened.shape[0] == sum(
-                    indexer_seq_lens_cpu
-                ), f"{page_table_1_flattened.shape[0] = } must be the same as {sum(indexer_seq_lens_cpu) = }"
+                assert page_table_1_flattened.shape[0] == sum(indexer_seq_lens_cpu), (
+                    f"{page_table_1_flattened.shape[0] = } must be the same as {sum(indexer_seq_lens_cpu) = }"
+                )
 
                 # Validate indices when logical tokens exceed physical capacity
                 # This is likely to be triggered by PP with high kv reuse & parallelism
@@ -1935,9 +1935,9 @@ class DeepseekSparseAttnBackend(
         if self.use_mha:
             assert k is not None and v is not None
             assert q_rope is None, "MHA_ONE_SHOT path should not pass q_rope"
-            assert (
-                layer.tp_k_head_num == layer.tp_q_head_num > 1
-            ), "MHA_ONE_SHOT requires dense multi-head config"
+            assert layer.tp_k_head_num == layer.tp_q_head_num > 1, (
+                "MHA_ONE_SHOT requires dense multi-head config"
+            )
             return self._forward_standard_mha(
                 q=q,
                 k=k,
@@ -1950,6 +1950,15 @@ class DeepseekSparseAttnBackend(
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if (
+            self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.enable_mixed_residency
+            and self.hisparse_coordinator.is_dsv4_hisparse
+        ):
+            # page_table_1 uses storage-layer-major global C4 locations for
+            # HOT pages (and base-adjusted FULL hits), so FlashMLA must consume
+            # the zero-copy view spanning every C4 storage layer.
+            kv_cache = self.hisparse_coordinator.mem_pool_device.get_kvduo_flat_buffer()
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -2233,6 +2242,12 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if (
+            self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.enable_mixed_residency
+            and self.hisparse_coordinator.is_dsv4_hisparse
+        ):
+            kv_cache = self.hisparse_coordinator.mem_pool_device.get_kvduo_flat_buffer()
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -2872,8 +2887,8 @@ class DeepseekSparseAttnBackend(
 
         # Verify batch sizes match (length of cu_seqlens should be batch_size + 1)
         assert len(cu_seqlens_q) == len(cu_seqlens_k), (
-            f"batch_size mismatch: cu_seqlens_q has {len(cu_seqlens_q)-1} requests, "
-            f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
+            f"batch_size mismatch: cu_seqlens_q has {len(cu_seqlens_q) - 1} requests, "
+            f"cu_seqlens_k has {len(cu_seqlens_k) - 1} requests"
         )
 
         # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
@@ -3130,9 +3145,9 @@ class DeepseekSparseAttnBackend(
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert q_rope is not None, "For FP8 path q_rope should not be None."
             assert k_rope is not None, "For FP8 path k_rope should not be None."
-            assert (
-                cos_sin_cache is not None
-            ), "For FP8 path cos_sin_cache should not be None."
+            assert cos_sin_cache is not None, (
+                "For FP8 path cos_sin_cache should not be None."
+            )
 
             rope_positions = forward_batch.positions
             if dsa_use_prefill_cp(forward_batch):
@@ -3167,9 +3182,9 @@ class DeepseekSparseAttnBackend(
 
             # Save KV cache if requested
         if save_kv_cache:
-            assert (
-                k is not None and k_rope is not None
-            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            assert k is not None and k_rope is not None, (
+                "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            )
             cache_loc = (
                 forward_batch.out_cache_loc
                 if not layer.is_cross_attention
@@ -3417,7 +3432,6 @@ class DeepseekSparseAttnBackend(
 
 
 class DeepseekSparseAttnMultiStepBackend:
-
     # Per-step draft decode replays from precomputed GPU metadata; opt out so
     # decide_needs_cpu_seq_lens' OR over the backends stays False.
     needs_cpu_seq_lens: bool = False

@@ -88,12 +88,15 @@ class DeepSeekV4SingleKVPool(KVCache):
                 if self.custom_mem_pool
                 else nullcontext()
             ):
-                self.kv_buffer = [
-                    self.create_buffer(
-                        num_pages=(self.size + self.page_size + 1) // self.page_size,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                # Keep C4 layers in one allocation.  Per-layer users retain the
+                # old list interface, while KVDuo can address a whole physical
+                # page across storage layers without copying it back to the
+                # logical layer selected by attention.
+                num_pages = (self.size + self.page_size + 1) // self.page_size
+                self._kv_backing = self.create_buffer(
+                    num_pages=self.layer_num * num_pages
+                ).view(self.layer_num, num_pages, -1)
+                self.kv_buffer = list(self._kv_backing.unbind(0))
 
     def get_bytes_per_token(self) -> int:
         dim_per_token = (
@@ -167,7 +170,6 @@ class DeepSeekV4SingleKVPool(KVCache):
 
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
-
     def __init__(
         self,
         size: int,
@@ -200,6 +202,18 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
             device=self.device,
         )
         self.compress_ratio = 4
+
+    @property
+    def slots_per_layer(self) -> int:
+        return self._kv_backing.shape[1] * self.page_size
+
+    def get_kvduo_flat_buffer(self) -> torch.Tensor:
+        """Return the zero-copy storage-layer-major view used by sparse attention."""
+        flat = self._kv_backing.flatten(0, 1)
+        return flat.view(self.dtype) if self.store_dtype != self.dtype else flat
+
+    def encode_kvduo_loc(self, storage_layer: int, loc: int) -> int:
+        return storage_layer * self.slots_per_layer + loc
 
     def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
         self.full_to_hisparse_device_index_mapping = (
@@ -453,7 +467,6 @@ class DeepSeekV4UnifiedKVPool:
 
 
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
-
     def __init__(
         self,
         max_num_reqs: int,
@@ -974,9 +987,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         compress_state_pool = self.compress_state_pools[layer_id]
-        assert (
-            compress_state_pool is not None
-        ), "Only c4/c128 layers have attention states."
+        assert compress_state_pool is not None, (
+            "Only c4/c128 layers have attention states."
+        )
         return compress_state_pool
 
     def get_online_c128_mtp_state_slot_offset(self) -> int:
@@ -1045,9 +1058,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
-        assert (
-            indexer_compress_state_pool is not None
-        ), "Only c4 layers have indexer states."
+        assert indexer_compress_state_pool is not None, (
+            "Only c4 layers have indexer states."
+        )
         return indexer_compress_state_pool
 
     def _swa_local_layer_id(self, layer_id: int) -> int:
