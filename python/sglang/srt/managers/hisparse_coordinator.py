@@ -50,6 +50,15 @@ KVDUO_STATS_POLL_INTERVAL = 8
 KVDUO_OPTIONAL_GROWTH_MIN_MISS_RATE = 0.125
 
 
+def _kvduo_stable_sort_atom(value):
+    """Return an address-free ordering key for supported prefix-key values."""
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return (type(value).__name__, value)
+    if isinstance(value, (tuple, list)):
+        return (type(value).__name__, tuple(_kvduo_stable_sort_atom(v) for v in value))
+    return (type(value).__qualname__, repr(value))
+
+
 class _KVDuoPrefixIdentity:
     """An exact, persistent identity for one page-aligned token prefix.
 
@@ -58,13 +67,18 @@ class _KVDuoPrefixIdentity:
     ``__eq__`` still walks and compares every chunk when hashes collide.
     """
 
-    __slots__ = ("namespace", "parent", "tokens", "_hash")
+    __slots__ = ("namespace", "parent", "tokens", "_hash", "stable_sort_key")
 
     def __init__(self, namespace, parent, tokens):
         self.namespace = namespace
         self.parent = parent
         self.tokens = tokens
         self._hash = hash((namespace, hash(parent), tokens))
+        self.stable_sort_key = (
+            parent.stable_sort_key if parent is not None else (),
+            _kvduo_stable_sort_atom(namespace),
+            tokens,
+        )
 
     def __hash__(self):
         return self._hash
@@ -436,9 +450,10 @@ class HiSparseCoordinator:
             ),
         )
 
-    def _host_prefix_identities(self, req: Req, page_ordinal: int):
+    def _host_prefix_identities(self, req: Req, page_ordinal: int, fill_ids=None):
         """Build exact page identities once, sharing all preceding token pages."""
-        fill_ids = req.get_fill_ids()
+        if fill_ids is None:
+            fill_ids = req.get_fill_ids()
         page_tokens = self.page_size * self.compress_ratio
         namespace = (self.compress_ratio, getattr(req, "extra_key", None))
         state = getattr(req, "_kvduo_prefix_identity_state", None)
@@ -460,8 +475,8 @@ class HiSparseCoordinator:
             )
         return identities
 
-    def _host_prefix_identity(self, req: Req, page_ordinal: int):
-        return self._host_prefix_identities(req, page_ordinal)[page_ordinal]
+    def _host_prefix_identity(self, req: Req, page_ordinal: int, fill_ids=None):
+        return self._host_prefix_identities(req, page_ordinal, fill_ids)[page_ordinal]
 
     def augment_kvduo_prefix_match(
         self,
@@ -484,7 +499,8 @@ class HiSparseCoordinator:
         req.kvduo_host_prefix_records = set()
         gpu_len = len(match_result.device_indices)
         page_tokens = self.page_size * self.compress_ratio
-        max_prefix = req._compute_max_prefix_len(len(req.get_fill_ids()))
+        fill_ids = req.get_fill_ids()
+        max_prefix = req._compute_max_prefix_len(len(fill_ids))
         if max_prefix_len is not None:
             # Preserve the cache's own match cap. In particular, DeepSeek V4's
             # unified SWA cache holds back a trailing window for re-prefill;
@@ -494,10 +510,16 @@ class HiSparseCoordinator:
         host_end = gpu_len // page_tokens * page_tokens
         first_host_page = gpu_len // page_tokens
         for ordinal in range(first_host_page, max_prefix // page_tokens):
-            identity = self._host_prefix_identity(req, ordinal)
+            identity = self._host_prefix_identity(req, ordinal, fill_ids)
             record = self.host_prefix_cache.records.get(identity)
             if record is None or not record.fully_valid:
                 break
+            # Canonicalize the chain as it matches. The next page then compares
+            # only its own token chunk; its parent is pointer-identical to the
+            # cached record instead of re-walking the historical prefix.
+            self._host_prefix_identities(req, ordinal, fill_ids)[ordinal] = (
+                record.identity
+            )
             host_end = (ordinal + 1) * page_tokens
 
         # GPU and host eviction are rank-local. Coordinate the final reusable
@@ -806,11 +828,12 @@ class HiSparseCoordinator:
             host_locs = []
             versions = []
             touches = []
+            fill_ids = req.get_fill_ids()
             first_page = prefix_len // (self.page_size * self.compress_ratio)
             page_count = host_hit_length // (self.page_size * self.compress_ratio)
             for ordinal in range(first_page, first_page + page_count):
                 record = self.host_prefix_cache.records[
-                    self._host_prefix_identity(req, ordinal)
+                    self._host_prefix_identity(req, ordinal, fill_ids)
                 ]
                 if not record.fully_valid:
                     raise RuntimeError(
@@ -911,11 +934,14 @@ class HiSparseCoordinator:
             return 0
         owner = (req.rid, req.req_pool_idx)
         attached = 0
+        fill_ids = req.get_fill_ids()
         for ordinal in range(host_len // self.page_size):
-            identity = self._host_prefix_identity(req, ordinal)
+            identities = self._host_prefix_identities(req, ordinal, fill_ids)
+            identity = identities[ordinal]
             record = self.host_prefix_cache.records.get(identity)
             if record is None or not record.fully_valid:
                 break
+            identities[ordinal] = record.identity
             locations = record.host_locations["main_kv"]
             start = ordinal * self.page_size
             self.req_to_host_pool[req.req_pool_idx, start : start + self.page_size] = (
@@ -979,8 +1005,10 @@ class HiSparseCoordinator:
         versions_cpu = versions.cpu().tolist()
         touches_cpu = touches.cpu().tolist()
         retained = set()
+        fill_ids = req.get_fill_ids()
         for ordinal, start in enumerate(range(0, valid_len, self.page_size)):
-            identity = self._host_prefix_identity(req, ordinal)
+            identities = self._host_prefix_identities(req, ordinal, fill_ids)
+            identity = identities[ordinal]
             locations = tuple(host_locs_cpu[start : start + self.page_size])
             version = tuple(versions_cpu[start : start + self.page_size])
             touch = tuple(touches_cpu[start : start + self.page_size])
@@ -995,11 +1023,12 @@ class HiSparseCoordinator:
                     model_touches={"main_kv": touch},
                     cache_reference=True,
                     last_access=int(self.full_touch_clock[0]),
-                    tie_break_key=(ordinal, repr(identity)),
+                    tie_break_key=(ordinal, identity.stable_sort_key),
                 )
                 self.host_prefix_cache.insert(record)
                 retained.update(locations)
             else:
+                identities[ordinal] = existing.identity
                 # Existing shared storage remains authoritative; this request's
                 # duplicate physical page is intentionally not retained.
                 retained.update(existing.host_locations["main_kv"])

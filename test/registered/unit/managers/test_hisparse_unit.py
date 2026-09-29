@@ -64,6 +64,18 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         self.assertIs(identities[-1].parent, identities[-2])
         self.assertIs(coordinator._host_prefix_identity(left, 99), identities[-1])
 
+        # Matching a second request canonicalizes each parent as it advances,
+        # so every dictionary equality checks only the newly appended page.
+        right = SimpleNamespace(extra_key="tenant", get_fill_ids=MagicMock())
+        records = {identity: identity for identity in identities}
+        right_ids = []
+        fill_ids = list(range(200))
+        for ordinal in range(100):
+            right_ids = coordinator._host_prefix_identities(right, ordinal, fill_ids)
+            right_ids[ordinal] = records[right_ids[ordinal]]
+        self.assertIs(right_ids[-1], identities[-1])
+        right.get_fill_ids.assert_not_called()
+
         collision_a = SimpleNamespace(
             extra_key="tenant",
             get_fill_ids=lambda: [CollidingToken("a"), CollidingToken("tail")],
@@ -161,11 +173,18 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.full_host_version = torch.full((32,), -1, dtype=torch.int64)
         coordinator.full_last_touch = torch.zeros(32, dtype=torch.int64)
         coordinator.host_prefix_cache = KVDuoHostPrefixCache(8)
+        fill_call_count = 0
+
+        def get_fill_ids():
+            nonlocal fill_call_count
+            fill_call_count += 1
+            return [1, 2, 3, 4, 5, 6, 7]
+
         req = SimpleNamespace(
             rid="restore",
             extra_key="tenant-a",
             prefix_indices=torch.tensor([5, 6], dtype=torch.int64),
-            get_fill_ids=lambda: [1, 2, 3, 4, 5, 6, 7],
+            get_fill_ids=get_fill_ids,
             _compute_max_prefix_len=lambda length: length - 1,
         )
         for ordinal, (locs, touches) in enumerate(
@@ -194,7 +213,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             last_host_node=object(),
             best_match_node=object(),
         )
+        fill_call_count = 0
         match = coordinator.augment_kvduo_prefix_match(req, gpu_match, max_prefix_len=4)
+        self.assertEqual(fill_call_count, 1)
         self.assertEqual(match.host_hit_length, 2)
         self.assertEqual(match.full_kv_hit_length, 4)
         self.assertEqual(

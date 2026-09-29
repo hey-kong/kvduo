@@ -109,7 +109,6 @@ class KVDuoHostPrefixCache:
             key=lambda record: (
                 record.last_access,
                 record.tie_break_key,
-                repr(record.identity),
             ),
         )
         victims = []
