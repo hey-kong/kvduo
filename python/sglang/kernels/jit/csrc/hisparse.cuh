@@ -225,7 +225,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t page_size,
-    int64_t item_size_bytes) {
+    int64_t item_size_bytes,
+    int64_t full_location_base) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
@@ -301,7 +302,7 @@ __global__ void load_cache_to_device_buffer_kernel(
         req_top_k_device_locs[i] = -1;
         atomicMax(&swap_status[rid], 1);
       } else if (full_loc > 0) {
-        req_top_k_device_locs[i] = static_cast<int32_t>(full_loc);
+        req_top_k_device_locs[i] = static_cast<int32_t>(full_loc + full_location_base);
         atomicAdd(&full_resident_accesses, 1);
         atomicMax(
             reinterpret_cast<unsigned long long*>(&full_last_touch[logical_loc]),
@@ -411,9 +412,9 @@ __global__ void load_cache_to_device_buffer_kernel(
           reinterpret_cast<unsigned long long*>(&full_last_touch[logical_loc]),
           static_cast<unsigned long long>(touch_clock[0]));
       s_top_k_tokens[i] = TOKEN_HIT;
-      req_top_k_device_locs[i] = static_cast<int32_t>(full_loc);
+      req_top_k_device_locs[i] = static_cast<int32_t>(full_loc + full_location_base);
       atomicAdd(&s_full_hits, 1);
-    } else if (token_idx == newest_token) {
+    } else if (!enable_full_lookup && token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
@@ -726,7 +727,8 @@ void load_cache_to_device_buffer(
     bool enable_full_lookup,
     bool enable_dynamic_hot_view,
     int64_t page_size,
-    int64_t item_size_bytes) {
+    int64_t item_size_bytes,
+    int64_t full_location_base) {
   using namespace host;
 
   const auto stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(stream_ptr));
@@ -776,7 +778,8 @@ void load_cache_to_device_buffer(
         top_k_tokens_stride,
         top_k_device_locs_stride,
         page_size,
-        item_size_bytes);
+        item_size_bytes,
+        full_location_base);
   };
 
   if (seq_is_i64 && rpi_is_i64) {

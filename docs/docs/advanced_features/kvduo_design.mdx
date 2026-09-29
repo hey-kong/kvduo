@@ -14,9 +14,17 @@ KVDuo 是面向原生稀疏注意力模型的 KV Cache 管理方案。它优先�
 KVDuo 在主稀疏 KV 物理池中复用两种 GPU 存储：
 
 - **完整页（full page）**：跨所有稀疏 attention layer 保存一段连续上下文的完整 KV。逻辑位置通过 full-to-physical 映射找到它。
-- **热页片段（hot page fragment）**：归属一个 `(request, layer)`，保存 resolver 最近需要的条目。
+- **热页（hot page）**：整张物理页独占归属一个 `(request, logical_layer)`，保存 resolver 最近需要的条目。
 
-底层 allocator 仍按跨 layer 的物理页分配 carrier。KVDuo 在 carrier 上逐 layer 记录所有权，因此空闲 layer 片段可独立复用；只有所有 layer 片段都空闲后，carrier 才整体返回 allocator。热页与完整页共享物理地址空间，但所有权不会重叠。
+同一页号在所有 C4 存储层上的片段共同组成 KVDuo 的一张物理页。物理页始终处于 `FREE`、`FULL` 或 `HOT(request, logical_layer)` 三种互斥状态之一。KVDuo 不再使用 carrier，也不会把同一页号的不同存储层片段分配给不同请求。HOT 页释放后会整页返回通用 allocator，可立即用于新的 FULL 页或另一个 HOT 所有者。
+
+一张 HOT 页的逻辑容量在运行期计算：
+
+```text
+K = C4 存储层数 × C4 压缩页大小
+```
+
+DeepSeek-V4-Flash-0731 有 21 个 C4 存储层，每层片段包含 64 个槽位，因此一张 HOT 页提供 `K = 21 × 64 = 1344` 个槽位。这里的“物理页”是 KVDuo 对相同页号的管理单位，不要求这些存储层片段位于同一张 CUDA 硬件页。
 
 ```mermaid
 flowchart LR
@@ -56,7 +64,7 @@ decode 新页、host 前缀恢复或必需热页即将分配时，KVDuo 按实�
 2. 排除 Radix 前缀、当前分配显式保护的位置、请求最新的 `tail_protected_pages` 个页、未写满页，以及 host version 不是最新 data version 的页。
 3. 按页内条目的最大最近访问时间执行全局页级 LRU；相同时间使用 request 和页偏移稳定排序。
 4. 清除被选页的 full 映射并将物理页返回 allocator；对应请求从此进入混合驻留。
-5. 完整页不足时，再按 LRU 回收**高于必需下限**的热页片段。必需的 `2 × top_k` 容量不会作为普通热页牺牲。
+5. 完整页不足时，再按 LRU 回收**高于必需下限**的完整 HOT 页。缩容、元数据搬移和容量更新均以 `K` 个逻辑槽位为步长；归还底层 allocator 时则使用该 allocator 的基础页索引范围。
 
 一次真实物理分配只有在压力计划重新检查为 `SUCCESS` 后才能继续。无法取得所需页时会返回明确的压力原因或终止该分配，不会带着部分更新的元数据继续执行。
 
@@ -65,16 +73,30 @@ decode 新页、host 前缀恢复或必需热页即将分配时，KVDuo 按实�
 模型为每层产生 top-k 逻辑位置后，resolver 按以下顺序解析：
 
 - **full hit**：逻辑位置仍有完整页映射，直接使用该物理地址。
-- **hot hit**：复用当前 `(request, layer)` 热集合中的条目，并更新 LRU。
-- **host miss**：从该位置的 pinned host 副本载入一个 layer 的 KV，优先使用空槽，否则替换最旧热条目。
+- **hot hit**：复用当前 `(request, logical_layer)` 独占热页中的条目，并更新 LRU。
+- **host miss**：从该逻辑层的 pinned host 副本载入 KV，优先使用空槽，否则替换最旧热条目；换入目标可以位于该 HOT 页的任意 C4 存储层片段。
 
-请求在首次完整页降级前保持零热页容量。进入混合驻留后，下一次 graph replay 前必须为每个 storage group 建立至少 `2 × top_k`、按页对齐的容量；压力处理如果又降级了其他请求，控制面会迭代到所有混合请求都满足此不变量。
+HOT 页将一个逻辑层的槽位 `j ∈ [0, K)` 编码到连续 C4 backing 中：
 
-resolver 元数据的地址与最大宽度固定为 `16 × top_k`，以保持 CUDA graph 稳定，但物理页仍按需获取：
+```text
+storage_layer = j // compressed_page_size
+offset        = j % compressed_page_size
+flat_location = storage_layer * layer_stride + page_start + offset
+```
 
-- 工作集立即需要更多槽位时，从 `2K`、`4K`、`8K`、`16K` tier 中前进一步。
-- 控制面每 8 次 replay 异步快照 host miss/valid access 计数。观察窗口内 host miss 至少为 `top_k` 且 miss rate 至少为 12.5% 时，才尝试按 `2K` 线性增长（`2K → 4K → 6K → … → 16K`）。
-- 统计驱动的可选扩容只使用已有空闲 layer 片段或空闲物理 carrier，不会为了可选收益回收完整页。
+Host KV 仍按原逻辑层读取；只有 GPU 换入目标通过上述编码分散到不同 C4 存储层。decode resolver 对 FULL 命中加入当前逻辑层的 flat base，对 HOT 员中直接返回全局位置，因此两者可以在同一个索引表中交给 attention。非 decode prefill 的索引仍相对于当前逻辑层，所以普通 FlashMLA prefill 和独立的大 prefill 稀疏路径继续读取 `get_extra_key_buffer(layer_id)`；只有 decode 使用覆盖所有 C4 存储层的扁平 backing。
+
+请求在首次完整页降级前保持零热页容量。进入混合驻留后，下一次 graph replay 前必须为每个逻辑层建立至少 `ceil(top_k / K)` 张 HOT 页。容量只按 `1K、2K、…、8K` 扩缩，不再以 `2 × top_k` 定义分配单位。例如 DeepSeek-V4-Flash-0731 的模型选择宽度为 512 时，一张 1344 槽 HOT 页已经足够；如果 `top_k > K`，则分配足够的整页容量，超过 `8K` 时启动失败并给出明确错误。
+
+resolver 元数据预先固定为最多 `8K` 个槽位，以保持 CUDA Graph 的指针和形状稳定，但物理页仍按需获取。扩缩容只在 graph replay 之外的允许边界修改映射：
+
+- 工作集立即需要更多槽位时，目标容量向上取整到下一张完整 HOT 页。
+- 控制面每 8 次 replay 异步快照 host miss/valid access 计数。观察窗口内 host miss 至少为 `top_k` 且 miss rate 至少为 12.5% 时，才尝试增加一张 HOT 页。
+- 统计驱动的可选扩容只使用 allocator 中已有的空闲完整物理页，不会为了可选收益回收 FULL 页。
+
+页首索引在分配边界批量取回 CPU，最多产生一次必要的 GPU→CPU 同步；GPU 通过页首、存储层偏移和页内偏移的广播批量生成全局位置。CUDA Graph replay 本身不会引入 CPU 同步。
+
+KVDuo 不为 newest token 暗中保留第九张 HOT 页。混合驻留时，新 token 通过正常的 FULL/HOT 位置解析进入上述容量；旧 HiSparse 路径的额外槽位不计入 KVDuo 的 HOT 页承诺。
 
 ## Host 前缀缓存与恢复
 
@@ -95,8 +117,10 @@ Tensor parallel 场景下，各 rank 的 GPU 与 host 淘汰可能不同。KVDuo
 当前实现依赖以下不变量：
 
 - 只有完整、页对齐、host 副本版本最新且未受保护的 full page 可以回收。
-- 完整驻留请求不持有投机热页；混合请求在 replay 前必须拥有必需的 `2K` 热容量。
-- full page 优先于可选 hot page 成为压力牺牲者；热页不能缩到必需下限以下。
+- 每张物理页只有一个 `FREE`、`FULL` 或 `HOT(request, logical_layer)` 状态；不同请求或逻辑层不能共享同一页的存储层片段。
+- 完整驻留请求不持有投机热页；混合请求在 replay 前必须拥有至少 `ceil(top_k / K)` 张完整 HOT 页。
+- FULL 页优先于可选 HOT 页成为压力牺牲者；HOT 容量不能缩到必需整页下限以下，且最多为八张页。
+- prefill 的层内索引只读取当前逻辑层 view；decode 的 FULL/HOT 全局索引只读取扁平 C4 backing。
 - prefix restore 期间源 host record 被 pin，发布前不能被淘汰。
 - KVDuo 只解决主稀疏 KV 物理池压力；其他资源短缺仍由对应 allocator 或 scheduler 处理。
 
@@ -132,7 +156,7 @@ python3 -m sglang.launch_server \
 
 | 参数 | 默认值 | 作用 |
 | --- | ---: | --- |
-| `top_k` | `2048` | 每层 resolver 返回的条目数；模型提供 `index_topk` 时以模型配置为准。 |
+| `top_k` | `2048` | 每层 resolver 返回的选择宽度，不决定单页大小。实际最小 HOT 页数为 `ceil(top_k / K)`；DeepSeek-V4-Flash-0731 的模型 `index_topk` 为 512。 |
 | `host_to_device_ratio` | `2` | host pool 相对 device pool 的容量比例。 |
 | `swap_in_block_size` | `960` | resolver CUDA thread block 的线程数，不是一次 H2D 搬运的 KV 条目数；范围为 1–1024。 |
 | `tail_protected_pages` | `2` | 每个请求不参与完整页回收的最新页数量。 |
@@ -147,7 +171,7 @@ KVDuo 要求启用 RadixTree，且不能与 `--enable-hisparse`、`--enable-hier
 
 - token throughput、TTFT、TPOT 和端到端延迟；
 - retract/preemption 与重复 prefill token 数；
-- 完整页、按 layer 热页片段、carrier 和 host pool 的占用；
+- FULL 页、按 `(request, logical_layer)` 独占的完整 HOT 页和 host pool 的占用；
 - full/hot/host 命中分布、resolver host miss rate 和 H2D 带宽；
 - 因主 KV 之外的资源不足导致的 admission 失败。
 

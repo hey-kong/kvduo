@@ -16,6 +16,41 @@ DomainIdentity = Hashable
 OwnerIdentity = Hashable
 
 
+class KVDuoPhysicalPageKind(Enum):
+    """Exclusive state of one cross-storage-layer physical page number."""
+
+    FREE = auto()
+    FULL = auto()
+    HOT = auto()
+
+
+@dataclass(frozen=True)
+class KVDuoHotPageGeometry:
+    """Runtime-derived addressing geometry for a whole KVDuo HOT page."""
+
+    storage_layers: int
+    compressed_page_size: int
+    layer_slot_stride: int
+
+    def __post_init__(self) -> None:
+        if (
+            min(self.storage_layers, self.compressed_page_size, self.layer_slot_stride)
+            <= 0
+        ):
+            raise ValueError("KVDuo hot-page geometry dimensions must be positive")
+
+    @property
+    def slots_per_page(self) -> int:
+        return self.storage_layers * self.compressed_page_size
+
+    def encode(self, page_start: int, logical_slot: int) -> int:
+        """Encode HOT(page, slot) into the flat layer/page/offset backing."""
+        if page_start < 0 or not 0 <= logical_slot < self.slots_per_page:
+            raise IndexError("KVDuo hot-page address is outside the physical page")
+        storage_layer, offset = divmod(logical_slot, self.compressed_page_size)
+        return storage_layer * self.layer_slot_stride + page_start + offset
+
+
 @dataclass(frozen=True)
 class KVDuoWritebackTicket:
     """Version captured when an asynchronous host writeback is submitted."""
