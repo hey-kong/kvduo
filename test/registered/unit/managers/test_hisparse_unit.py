@@ -880,6 +880,119 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         self.assertEqual(coordinator._kvduo_req_layer_pages, {})
         self.assertTrue(torch.all(coordinator.kvduo_req_hot_capacity == 0))
 
+    def _make_batched_hot_failure_coordinator(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.device = "cpu"
+        coordinator.page_size = 1
+        coordinator.hot_storage_layers = 1
+        coordinator.hot_page_size = 1
+        coordinator.device_buffer_size = 8
+        coordinator.mem_pool_device = SimpleNamespace(
+            layer_num=2, flat_layer_slot_stride=32
+        )
+        coordinator.kvduo_req_hot_capacity = torch.zeros((2, 1), dtype=torch.int64)
+        coordinator.kvduo_req_hot_capacity_gpu = torch.zeros((2, 1), dtype=torch.int32)
+        coordinator.req_device_buffer_token_locs = torch.full(
+            (2, 1, 8), -1, dtype=torch.int32
+        )
+        coordinator.req_device_buffer_tokens = torch.full(
+            (2, 1, 8), -1, dtype=torch.int32
+        )
+        coordinator.lru_slots = torch.arange(8, dtype=torch.int16).repeat(2, 1, 1)
+        coordinator._kvduo_req_layer_pages = {}
+        coordinator._kvduo_hot_page_owners = {}
+        physical = torch.tensor([1, 2], dtype=torch.int64)
+        allocator = SimpleNamespace(
+            alloc=MagicMock(return_value=physical),
+            available_size=MagicMock(return_value=2),
+        )
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            hisparse_attn_allocator=allocator,
+            free_hisparse_indices=MagicMock(),
+        )
+        return coordinator, allocator, physical
+
+    def _assert_batched_hot_failure_rolled_back(self, coordinator, physical):
+        coordinator.token_to_kv_pool_allocator.free_hisparse_indices.assert_called_once()
+        self.assertIs(
+            coordinator.token_to_kv_pool_allocator.free_hisparse_indices.call_args.args[0],
+            physical,
+        )
+        self.assertEqual(coordinator._kvduo_req_layer_pages, {})
+        self.assertEqual(coordinator._kvduo_hot_page_owners, {})
+        self.assertTrue(torch.all(coordinator.kvduo_req_hot_capacity == 0))
+        self.assertTrue(torch.all(coordinator.kvduo_req_hot_capacity_gpu == 0))
+        self.assertTrue(torch.all(coordinator.req_device_buffer_token_locs == -1))
+        self.assertTrue(torch.all(coordinator.req_device_buffer_tokens == -1))
+        self.assertTrue(
+            torch.equal(
+                coordinator.lru_slots,
+                torch.arange(8, dtype=torch.int16).repeat(2, 1, 1),
+            )
+        )
+
+    def test_batched_hot_address_construction_failure_frees_pages(self):
+        coordinator, allocator, physical = self._make_batched_hot_failure_coordinator()
+
+        with patch(
+            "sglang.srt.managers.hisparse_coordinator.torch.arange",
+            side_effect=RuntimeError("injected address failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "injected address failure"):
+                coordinator._ensure_kvduo_hot_capacity_targets_batch(
+                    {(0, 0): 1, (1, 0): 1}, allow_reclaim=False
+                )
+
+        allocator.alloc.assert_called_once_with(2)
+        self._assert_batched_hot_failure_rolled_back(coordinator, physical)
+
+    def test_batched_hot_second_layer_staging_failure_frees_pages(self):
+        coordinator, allocator, physical = self._make_batched_hot_failure_coordinator()
+        original_cat = torch.cat
+        calls = 0
+
+        def fail_second_cat(tensors):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected second layer staging failure")
+            return original_cat(tensors)
+
+        with patch(
+            "sglang.srt.managers.hisparse_coordinator.torch.cat",
+            side_effect=fail_second_cat,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "injected second layer staging failure"
+            ):
+                coordinator._ensure_kvduo_hot_capacity_targets_batch(
+                    {(0, 0): 1, (1, 0): 1}, allow_reclaim=False
+                )
+
+        self.assertEqual(calls, 2)
+        allocator.alloc.assert_called_once_with(2)
+        self._assert_batched_hot_failure_rolled_back(coordinator, physical)
+
+    def test_batched_hot_second_owner_failure_rolls_back_first_pair(self):
+        coordinator, allocator, physical = self._make_batched_hot_failure_coordinator()
+
+        class FailSecondOwner(dict):
+            def __setitem__(self, key, value):
+                if key == 2:
+                    raise RuntimeError("injected second owner failure")
+                super().__setitem__(key, value)
+
+        coordinator._kvduo_hot_page_owners = FailSecondOwner()
+        with self.assertRaisesRegex(RuntimeError, "injected second owner failure"):
+            coordinator._ensure_kvduo_hot_capacity_targets_batch(
+                {(0, 0): 1, (1, 0): 1}, allow_reclaim=False
+            )
+
+        allocator.alloc.assert_called_once_with(2)
+        self._assert_batched_hot_failure_rolled_back(coordinator, physical)
+
     def test_graph_prepare_polls_growth_every_eight_replays(self):
         """Miss statistics accumulate without affecting mandatory worksets."""
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
