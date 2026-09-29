@@ -1742,69 +1742,158 @@ class HiSparseCoordinator:
             if allow_reclaim:
                 raise RuntimeError("KVDuo whole-page HOT allocation failed")
             return
-        # This allocation path runs outside graph replay. Fetch all page
-        # identities with one D2H synchronization, then construct every flat
-        # C4 address on-device. Converting individual scalars would synchronize
-        # once per physical page.
-        physical_pages = physical.view(-1, self.page_size)
-        page_starts_device = physical_pages[:, 0].to(torch.int64)
-        page_starts = page_starts_device.to(device="cpu").tolist()
-        layer_stride = getattr(self.mem_pool_device, "flat_layer_slot_stride", 0)
-        storage_offsets = (
-            torch.arange(self.hot_storage_layers, dtype=torch.int64, device=self.device)
-            * layer_stride
-        )
-        within_page = torch.arange(
-            self.page_size, dtype=torch.int64, device=self.device
-        )
-        all_page_locs = (
-            page_starts_device[:, None, None]
-            + storage_offsets[None, :, None]
-            + within_page[None, None, :]
-        ).reshape(pages_needed, K)
-        # Validate the complete transaction before publishing any owner or
-        # capacity.  In particular, an allocator failure or duplicate page can
-        # never leave a prefix of request/layer metadata committed.
-        if len(page_starts) != pages_needed or len(set(page_starts)) != pages_needed:
-            self.token_to_kv_pool_allocator.free_hisparse_indices(physical)
-            raise RuntimeError("KVDuo HOT allocation returned invalid physical pages")
-        if any(start in self._kvduo_hot_page_owners for start in page_starts):
-            self.token_to_kv_pool_allocator.free_hisparse_indices(physical)
-            raise RuntimeError("KVDuo physical page already has an owner")
-        for layer_id, req_idx, current, _, _ in requests:
-            if int(self.kvduo_req_hot_capacity[layer_id, req_idx]) != current:
-                self.token_to_kv_pool_allocator.free_hisparse_indices(physical)
-                raise RuntimeError("KVDuo HOT capacity changed during allocation")
+        # Staging can allocate CUDA tensors; do all of it before publishing any
+        # ownership or capacity. A failure after allocator.alloc must return the
+        # acquired physical pages, including failures in address construction.
+        staged = []
+        published = []
+        safe_to_free = True
+        try:
+            # This control path is outside graph replay. Read all page numbers
+            # with one D2H synchronization, then construct flat C4 locations.
+            physical_pages = physical.view(-1, self.page_size)
+            page_starts_device = physical_pages[:, 0].to(torch.int64)
+            page_starts = page_starts_device.to(device="cpu").tolist()
+            if len(page_starts) != pages_needed:
+                raise RuntimeError(
+                    "KVDuo HOT allocation returned invalid physical pages"
+                )
+            if len(set(page_starts)) != pages_needed or any(
+                start in self._kvduo_hot_page_owners for start in page_starts
+            ):
+                # The allocator returned a page that may still be owned. Do
+                # not put suspect indices back on its free list a second time.
+                safe_to_free = False
+                raise RuntimeError(
+                    "KVDuo HOT allocation returned an owned or duplicate page"
+                )
+            for layer_id, req_idx, current, _, _ in requests:
+                if int(self.kvduo_req_hot_capacity[layer_id, req_idx]) != current:
+                    raise RuntimeError("KVDuo HOT capacity changed during allocation")
 
-        next_page = 0
-        for layer_id, req_idx, current, target, grow in requests:
-            req_idx = int(req_idx)
-            request_page_count = grow // K
-            for start in page_starts[next_page : next_page + request_page_count]:
-                owner = (int(layer_id), req_idx)
-                self._kvduo_hot_page_owners[start] = owner
-                self._kvduo_req_layer_pages.setdefault(owner, []).append(start)
-            page_locs = all_page_locs[
-                next_page : next_page + request_page_count
-            ].reshape(-1)
-            next_page += request_page_count
-            self.req_device_buffer_token_locs[layer_id, req_idx, current:target] = (
-                page_locs.to(torch.int32)
+            layer_stride = getattr(self.mem_pool_device, "flat_layer_slot_stride", 0)
+            storage_offsets = (
+                torch.arange(
+                    self.hot_storage_layers, dtype=torch.int64, device=self.device
+                )
+                * layer_stride
             )
-            self.req_device_buffer_tokens[layer_id, req_idx, current:target] = -1
-            old_lru = self.lru_slots[layer_id, req_idx, :current].clone()
-            self.lru_slots[layer_id, req_idx, :target] = torch.cat(
-                [
-                    torch.arange(
-                        current, target, dtype=torch.int16, device=self.device
-                    ),
-                    old_lru,
-                ]
+            within_page = torch.arange(
+                self.page_size, dtype=torch.int64, device=self.device
             )
-            self.kvduo_req_hot_capacity[layer_id, req_idx] = target
-            self.kvduo_req_hot_capacity_gpu[layer_id, req_idx] = target
-        if next_page != pages_needed:
-            raise RuntimeError("KVDuo HOT allocation did not consume every page")
+            all_page_locs = (
+                page_starts_device[:, None, None]
+                + storage_offsets[None, :, None]
+                + within_page[None, None, :]
+            ).reshape(pages_needed, K)
+
+            next_page = 0
+            for layer_id, req_idx, current, target, grow in requests:
+                owner = (int(layer_id), int(req_idx))
+                request_page_count = grow // K
+                starts = page_starts[next_page : next_page + request_page_count]
+                page_locs = all_page_locs[
+                    next_page : next_page + request_page_count
+                ].reshape(-1).to(torch.int32)
+                next_page += request_page_count
+                previous_lru = self.lru_slots[layer_id, req_idx, :target].clone()
+                staged.append(
+                    (
+                        owner,
+                        current,
+                        target,
+                        starts,
+                        page_locs,
+                        torch.cat(
+                            [
+                                torch.arange(
+                                    current,
+                                    target,
+                                    dtype=torch.int16,
+                                    device=self.device,
+                                ),
+                                previous_lru[:current],
+                            ]
+                        ),
+                        self.req_device_buffer_token_locs[
+                            layer_id, req_idx, current:target
+                        ].clone(),
+                        self.req_device_buffer_tokens[
+                            layer_id, req_idx, current:target
+                        ].clone(),
+                        previous_lru,
+                        list(self._kvduo_req_layer_pages.get(owner, ())),
+                    )
+                )
+            if next_page != pages_needed:
+                raise RuntimeError("KVDuo HOT allocation did not consume every page")
+
+            for entry in staged:
+                (
+                    (layer_id, req_idx),
+                    current,
+                    target,
+                    starts,
+                    page_locs,
+                    new_lru,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = entry
+                # Record the pair before its first write so even an exception
+                # halfway through publication restores this pair as well.
+                published.append(entry)
+                self.req_device_buffer_token_locs[
+                    layer_id, req_idx, current:target
+                ] = page_locs
+                self.req_device_buffer_tokens[layer_id, req_idx, current:target] = -1
+                self.lru_slots[layer_id, req_idx, :target] = new_lru
+                self.kvduo_req_hot_capacity_gpu[layer_id, req_idx] = target
+                self.kvduo_req_hot_capacity[layer_id, req_idx] = target
+                self._kvduo_req_layer_pages.setdefault((layer_id, req_idx), []).extend(
+                    starts
+                )
+                for start in starts:
+                    self._kvduo_hot_page_owners[start] = (layer_id, req_idx)
+        except Exception:
+            try:
+                for (
+                    (layer_id, req_idx),
+                    current,
+                    target,
+                    starts,
+                    _,
+                    _,
+                    previous_locs,
+                    previous_tokens,
+                    previous_lru,
+                    previous_pages,
+                ) in reversed(published):
+                    self.req_device_buffer_token_locs[
+                        layer_id, req_idx, current:target
+                    ] = previous_locs
+                    self.req_device_buffer_tokens[
+                        layer_id, req_idx, current:target
+                    ] = previous_tokens
+                    self.lru_slots[layer_id, req_idx, :target] = previous_lru
+                    self.kvduo_req_hot_capacity_gpu[layer_id, req_idx] = current
+                    self.kvduo_req_hot_capacity[layer_id, req_idx] = current
+                    if previous_pages:
+                        self._kvduo_req_layer_pages[layer_id, req_idx] = previous_pages
+                    else:
+                        self._kvduo_req_layer_pages.pop((layer_id, req_idx), None)
+                    for start in starts:
+                        self._kvduo_hot_page_owners.pop(start, None)
+            except Exception as rollback_error:
+                # Retain the physical allocation if a GPU write cannot be
+                # rolled back; freeing it could leave a live address dangling.
+                raise RuntimeError(
+                    "KVDuo HOT transaction rollback failed"
+                ) from rollback_error
+            if safe_to_free:
+                self.token_to_kv_pool_allocator.free_hisparse_indices(physical)
+            raise
 
     def _consume_kvduo_stats_snapshot(self):
         """Return a completed asynchronous statistics snapshot, if available."""
