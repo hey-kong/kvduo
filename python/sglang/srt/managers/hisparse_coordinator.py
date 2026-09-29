@@ -47,6 +47,46 @@ _is_hip = is_hip()
 logger = logging.getLogger(__name__)
 
 KVDUO_STATS_POLL_INTERVAL = 8
+KVDUO_OPTIONAL_GROWTH_MIN_MISS_RATE = 0.125
+
+
+class _KVDuoPrefixIdentity:
+    """An exact, persistent identity for one page-aligned token prefix.
+
+    Each page adds only its own tokens and points at the preceding page.  The
+    cached hash makes dictionary lookup constant-time in the usual case, while
+    ``__eq__`` still walks and compares every chunk when hashes collide.
+    """
+
+    __slots__ = ("namespace", "parent", "tokens", "_hash")
+
+    def __init__(self, namespace, parent, tokens):
+        self.namespace = namespace
+        self.parent = parent
+        self.tokens = tokens
+        self._hash = hash((namespace, hash(parent), tokens))
+
+    def __hash__(self):
+        return self._hash
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        if not isinstance(other, _KVDuoPrefixIdentity) or self._hash != other._hash:
+            return False
+        left = self
+        right = other
+        while left is not right:
+            if (
+                left is None
+                or right is None
+                or left.namespace != right.namespace
+                or left.tokens != right.tokens
+            ):
+                return False
+            left = left.parent
+            right = right.parent
+        return True
 
 
 class HiSparseAct(NamedTuple):
@@ -396,17 +436,32 @@ class HiSparseCoordinator:
             ),
         )
 
-    def _host_prefix_identity(self, req: Req, page_ordinal: int):
+    def _host_prefix_identities(self, req: Req, page_ordinal: int):
+        """Build exact page identities once, sharing all preceding token pages."""
         fill_ids = req.get_fill_ids()
-        token_end = min(
-            len(fill_ids),
-            (page_ordinal + 1) * self.page_size * self.compress_ratio,
-        )
-        return (
-            self.compress_ratio,
-            getattr(req, "extra_key", None),
-            tuple(fill_ids[:token_end]),
-        )
+        page_tokens = self.page_size * self.compress_ratio
+        namespace = (self.compress_ratio, getattr(req, "extra_key", None))
+        state = getattr(req, "_kvduo_prefix_identity_state", None)
+        if state is None or state[0] != namespace:
+            identities = []
+            req._kvduo_prefix_identity_state = (namespace, identities)
+        else:
+            identities = state[1]
+        while len(identities) <= page_ordinal:
+            ordinal = len(identities)
+            token_start = ordinal * page_tokens
+            token_end = min(len(fill_ids), token_start + page_tokens)
+            identities.append(
+                _KVDuoPrefixIdentity(
+                    namespace,
+                    identities[-1] if identities else None,
+                    tuple(fill_ids[token_start:token_end]),
+                )
+            )
+        return identities
+
+    def _host_prefix_identity(self, req: Req, page_ordinal: int):
+        return self._host_prefix_identities(req, page_ordinal)[page_ordinal]
 
     def augment_kvduo_prefix_match(
         self,
@@ -437,22 +492,12 @@ class HiSparseCoordinator:
             max_prefix = min(max_prefix, max_prefix_len)
         max_prefix = max_prefix // page_tokens * page_tokens
         host_end = gpu_len // page_tokens * page_tokens
-        pages = []
-        for ordinal in range(max_prefix // page_tokens):
+        first_host_page = gpu_len // page_tokens
+        for ordinal in range(first_host_page, max_prefix // page_tokens):
             identity = self._host_prefix_identity(req, ordinal)
             record = self.host_prefix_cache.records.get(identity)
-            gpu_full = (ordinal + 1) * page_tokens <= gpu_len
-            if not gpu_full and (record is None or not record.fully_valid):
+            if record is None or not record.fully_valid:
                 break
-            pages.append(
-                KVDuoPrefixPageView(
-                    identity=identity,
-                    domains=("main_kv",),
-                    gpu_full_domains=(
-                        frozenset({"main_kv"}) if gpu_full else frozenset()
-                    ),
-                )
-            )
             host_end = (ordinal + 1) * page_tokens
 
         # GPU and host eviction are rank-local. Coordinate the final reusable
@@ -480,16 +525,28 @@ class HiSparseCoordinator:
                         "KVDuo TP GPU prefix lengths diverged without a common "
                         "host-covered extension or common-prefix matcher"
                     )
-                return self._converge_common_gpu_match(
-                    min_gpu_len, common_gpu_matcher
-                )
+                return self._converge_common_gpu_match(min_gpu_len, common_gpu_matcher)
             return match_result
         host_end = common_host_end
-        pages = pages[: host_end // page_tokens]
+        # Identity construction is unnecessary for a pure GPU hit.  Once a
+        # host extension is confirmed, reuse the persistent chain already
+        # built during probing to classify both GPU and host pages.
+        page_identities = self._host_prefix_identities(req, host_end // page_tokens - 1)
+        pages = [
+            KVDuoPrefixPageView(
+                identity=page_identities[ordinal],
+                domains=("main_kv",),
+                gpu_full_domains=(
+                    frozenset({"main_kv"})
+                    if (ordinal + 1) * page_tokens <= gpu_len
+                    else frozenset()
+                ),
+            )
+            for ordinal in range(host_end // page_tokens)
+        ]
         identities = []
-        first_host_page = gpu_len // page_tokens
         for ordinal in range(first_host_page, host_end // page_tokens):
-            identity = self._host_prefix_identity(req, ordinal)
+            identity = page_identities[ordinal]
             self.host_prefix_cache.acquire(identity, req.rid, 0)
             identities.append(identity)
         # Repeated scheduling matches are idempotent because request references
@@ -578,9 +635,7 @@ class HiSparseCoordinator:
                     logical_allocator.swa_available_size() // allocator.page_size
                 )
             else:
-                full_before = (
-                    logical_allocator.available_size() // allocator.page_size
-                )
+                full_before = logical_allocator.available_size() // allocator.page_size
                 swa_before = 0
             physical_before = physical_allocator.available_size() // self.page_size
             full_initial = full_before
@@ -633,9 +688,7 @@ class HiSparseCoordinator:
                     physical_before = (
                         physical_allocator.available_size() // self.page_size
                     )
-            local_ready = (
-                full_before >= logical_pages and swa_before >= swa_pages
-            )
+            local_ready = full_before >= logical_pages and swa_before >= swa_pages
             if self.tp_world_size > 1:
                 ready = torch.tensor(
                     int(local_ready), dtype=torch.int32, device=self.device
@@ -1495,7 +1548,11 @@ class HiSparseCoordinator:
         )
 
     def _ensure_kvduo_hot_capacity_targets(
-        self, layer_id: int, requested_capacities: dict[int, int]
+        self,
+        layer_id: int,
+        requested_capacities: dict[int, int],
+        *,
+        allow_reclaim: bool = True,
     ) -> None:
         """Materialize CPU-known capacity targets without inspecting GPU tags."""
         if not requested_capacities:
@@ -1527,6 +1584,7 @@ class HiSparseCoordinator:
             mandatory_targets,
             requested_capacities,
             None,
+            allow_reclaim=allow_reclaim,
         )
 
     def _materialize_kvduo_hot_growth(
@@ -1536,6 +1594,7 @@ class HiSparseCoordinator:
         mandatory_targets: dict[int, int],
         protected_req_indices,
         protected_logical,
+        allow_reclaim: bool = True,
     ) -> None:
         """Allocate layer-hot pages for precomputed targets without tag readback."""
         if not requests:
@@ -1544,9 +1603,33 @@ class HiSparseCoordinator:
         total_grow = sum(grow for _, _, _, grow in requests)
         pages_needed = total_grow // page_size
         free_pages = self._kvduo_free_layer_pages[layer_id]
+        if not allow_reclaim:
+            allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+            available_pages = len(free_pages) + allocator.available_size() // page_size
+            admitted = []
+            for request in requests:
+                request_pages = request[3] // page_size
+                if request_pages <= available_pages:
+                    admitted.append(request)
+                    available_pages -= request_pages
+            requests = admitted
+            if not requests:
+                return
+            total_grow = sum(grow for _, _, _, grow in requests)
+            pages_needed = total_grow // page_size
         missing_carriers = max(0, pages_needed - len(free_pages))
         if missing_carriers:
             carrier_slots = missing_carriers * page_size
+            if not allow_reclaim:
+                physical = (
+                    self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
+                        carrier_slots
+                    )
+                )
+                if physical is None:
+                    return
+            else:
+                physical = None
             self._kvduo_pressure_protected = protected_logical
             self._kvduo_hot_pressure_protected = {
                 (layer_id, int(req_idx), page_index)
@@ -1572,38 +1655,39 @@ class HiSparseCoordinator:
                             (owner_layer, int(owner_req), owner_pages.index(start))
                         )
             try:
-                pressure = self._reclaim_for_physical_allocation(carrier_slots)
-                if pressure.action is not KVDuoPressureAction.SUCCESS:
-                    requests = [
-                        (req_idx, current, target, target - current)
-                        for req_idx, target in mandatory_targets.items()
-                        if (
-                            current := int(
-                                self.kvduo_req_hot_capacity[layer_id, req_idx]
+                if allow_reclaim:
+                    pressure = self._reclaim_for_physical_allocation(carrier_slots)
+                    if pressure.action is not KVDuoPressureAction.SUCCESS:
+                        requests = [
+                            (req_idx, current, target, target - current)
+                            for req_idx, target in mandatory_targets.items()
+                            if (
+                                current := int(
+                                    self.kvduo_req_hot_capacity[layer_id, req_idx]
+                                )
                             )
-                        )
-                        < target
-                    ]
-                    if not requests:
-                        return
-                    total_grow = sum(grow for _, _, _, grow in requests)
-                    pages_needed = total_grow // page_size
+                            < target
+                        ]
+                        if not requests:
+                            return
+                        total_grow = sum(grow for _, _, _, grow in requests)
+                        pages_needed = total_grow // page_size
+                        missing_carriers = max(0, pages_needed - len(free_pages))
+                        carrier_slots = missing_carriers * page_size
+                        pressure = self._reclaim_for_physical_allocation(carrier_slots)
+                        self._require_allocation_ready(pressure)
                     missing_carriers = max(0, pages_needed - len(free_pages))
                     carrier_slots = missing_carriers * page_size
-                    pressure = self._reclaim_for_physical_allocation(carrier_slots)
-                    self._require_allocation_ready(pressure)
-                missing_carriers = max(0, pages_needed - len(free_pages))
-                carrier_slots = missing_carriers * page_size
-                if carrier_slots:
-                    pressure = self._reclaim_for_physical_allocation(carrier_slots)
-                    self._require_allocation_ready(pressure)
-                physical = (
-                    self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
-                        carrier_slots
+                    if carrier_slots:
+                        pressure = self._reclaim_for_physical_allocation(carrier_slots)
+                        self._require_allocation_ready(pressure)
+                    physical = (
+                        self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
+                            carrier_slots
+                        )
+                        if carrier_slots
+                        else torch.empty(0, dtype=torch.int64, device=self.device)
                     )
-                    if carrier_slots
-                    else torch.empty(0, dtype=torch.int64, device=self.device)
-                )
             finally:
                 self._kvduo_pressure_protected = None
                 self._kvduo_hot_pressure_protected = set()
@@ -1751,22 +1835,36 @@ class HiSparseCoordinator:
             )
 
         initial_mixed = {req_idx for req_idx in requested if self._mixed_slots[req_idx]}
-        optional_growth = {
-            (layer_id, req_idx): min(
-                int(self.kvduo_req_hot_capacity[layer_id, req_idx]) * 2,
-                16 * self.top_k,
-            )
-            for req_idx in initial_mixed
-            for layer_id in range(self.mem_pool_device.layer_num)
-            if stats_cpu is not None
-            and stats_owners.get(req_idx) is self._active_kvduo_reqs.get(req_idx)
-            and int(self.kvduo_req_hot_capacity[layer_id, req_idx]) > 0
-            and int(stats_cpu[layer_id, req_idx, 0]) > 0
-        }
+        optional_growth = {}
+        if stats_cpu is not None:
+            for req_idx in initial_mixed:
+                if stats_owners.get(req_idx) is not self._active_kvduo_reqs.get(
+                    req_idx
+                ):
+                    continue
+                for layer_id in range(self.mem_pool_device.layer_num):
+                    current = int(self.kvduo_req_hot_capacity[layer_id, req_idx])
+                    host_misses = int(stats_cpu[layer_id, req_idx, 0])
+                    valid_accesses = int(stats_cpu[layer_id, req_idx, 1])
+                    # Optional space must have enough observations to plausibly
+                    # amortize one Top-k tier and a meaningful miss fraction.
+                    # Hashing/replay noise or a handful of cold-start misses
+                    # therefore cannot repeatedly double 2K into 16K.
+                    if (
+                        current > 0
+                        and current < 16 * self.top_k
+                        and valid_accesses > 0
+                        and host_misses >= self.top_k
+                        and host_misses
+                        >= valid_accesses * KVDUO_OPTIONAL_GROWTH_MIN_MISS_RATE
+                    ):
+                        optional_growth[(layer_id, req_idx)] = min(
+                            current * 2, 16 * self.top_k
+                        )
 
         # Pressure reclamation can demote another active request. Iterate to a
         # capacity fixed point so every mixed request has 2K in every storage
-        # group. Historical optional growth is consumed on the first pass only.
+        # group. Optional growth is handled only after this invariant holds.
         pending = initial_mixed
         while True:
             mixed = sorted(pending)
@@ -1783,11 +1881,8 @@ class HiSparseCoordinator:
                     current = int(self.kvduo_req_hot_capacity[layer_id, req_idx])
                     if current == 0:
                         targets[req_idx] = 2 * self.top_k
-                    elif (layer_id, req_idx) in optional_growth:
-                        targets[req_idx] = optional_growth[layer_id, req_idx]
                 if targets:
                     self._ensure_kvduo_hot_capacity_targets(layer_id, targets)
-            optional_growth.clear()
             requested.update(
                 (
                     self._kvduo_pending_hot_minimum
@@ -1831,6 +1926,22 @@ class HiSparseCoordinator:
                     )
         if getattr(self, "_kvduo_pending_hot_minimum", None) is not None:
             self._kvduo_pending_hot_minimum.difference_update(requested)
+
+        # Optional growth consumes only already-free layer fragments or
+        # physical carrier pages. It must never reclaim a complete page (which
+        # could in turn make another request mixed) for a speculative benefit.
+        for layer_id in range(self.mem_pool_device.layer_num):
+            targets = {
+                req_idx: target
+                for (target_layer, req_idx), target in optional_growth.items()
+                if target_layer == layer_id
+                and self._mixed_slots[req_idx]
+                and stats_owners.get(req_idx) is self._active_kvduo_reqs.get(req_idx)
+            }
+            if targets:
+                self._ensure_kvduo_hot_capacity_targets(
+                    layer_id, targets, allow_reclaim=False
+                )
 
     def _grow_kvduo_hot_metadata(self, required_slots: int) -> None:
         """Validate against the immutable, capture-stable resolver metadata."""
