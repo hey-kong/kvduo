@@ -133,3 +133,28 @@ def test_graph_prepare_batches_a_whole_capacity_round():
     assert batch.count("allocator.alloc(physical_slots)") == 1
     assert batch.count('to(device="cpu").tolist()') == 1
     assert "for layer_id, req_idx, current, target, grow in requests" in batch
+
+
+def test_cuda_streams_are_bound_to_the_tensor_parallel_device():
+    source = COORDINATOR.read_text()
+    init = _method_source(COORDINATOR, "HiSparseCoordinator", "__init__")
+    staging = _method_source(
+        COORDINATOR, "HiSparseCoordinator", "admit_request_into_staging"
+    )
+    stats = _method_source(
+        COORDINATOR, "HiSparseCoordinator", "_schedule_kvduo_stats_snapshot"
+    )
+
+    # CUDA's current device is thread-local.  A scheduler worker starts on
+    # logical device zero, so implicit stream selection would make every TP
+    # process establish an otherwise unused context on TP0's GPU.
+    assert "device = req_to_token_pool.req_to_token.device" in init
+    assert "device_module.Stream()" not in init
+    assert init.count("device_module.Stream(device=device)") == 3
+    assert "device_module.current_stream()" not in source
+    assert "device_module.current_stream(self.device)" in source
+    assert "start_event.record(schedule_stream)" in staging
+    assert "finish_event.record(self.write_staging_stream)" in staging
+    assert "_kvduo_stats_snapshot_ready_event.record(schedule_stream)" in stats
+    assert "_kvduo_stats_event.record(self._kvduo_stats_stream)" in stats
+    assert ".record()" not in source
