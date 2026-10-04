@@ -96,11 +96,12 @@ Host KV 仍按原逻辑层读取；只有 GPU 换入目标通过上述编码分�
 
 resolver 元数据预先固定为最多 `8K` 个槽位，以保持 CUDA Graph 的指针和形状稳定，但物理页仍按需获取。扩缩容只在 graph replay 之外的允许边界修改映射：
 
-- 工作集立即需要更多槽位时，目标容量向上取整到下一张完整 HOT 页。
-- 控制面每 8 次 replay 异步快照 host miss/valid access 计数。观察窗口内 host miss 至少为 `top_k` 且 miss rate 至少为 12.5% 时，才尝试增加一张 HOT 页。
-- 统计驱动的可选扩容只使用 allocator 中已有的空闲完整物理页，不会为了可选收益回收 FULL 页。
+- 请求首次进入混合驻留后，下一次 replay 前补足 `ceil(top_k / K) × K` 的最低容量；`top_k ≤ K` 时为一张 HOT 页。
+- 每轮新的 top-k H2D 换入若空槽不足、需要替换已有 HOT 条目，resolver 为该 `(request, logical_layer)` 记录一次容量不足事件。空槽足够、纯 HOT 命中或纯 FULL 命中不触发扩容；同一轮的多个 miss 只产生一次事件。
+- 控制面在紧接着的下一次 replay 前消费事件，每次尝试增加一张 HOT 页，最多 `8K`。扩容只使用 allocator 已有的空闲完整物理页，不依赖累计 miss 数或 miss rate，也不会为扩容回收 FULL 页。
+- 当前轮先在已有容量内用条目 LRU 完成换入。达到 `8K` 或空闲页不足时保持已有容量；批次中只有部分对象能取得空闲页时，仍为这些对象扩容。受阻的事件不会延迟重试，后续新的容量不足 H2D 事件可以再次发起扩容。
 
-页首索引在分配边界批量取回 CPU，最多产生一次必要的 GPU→CPU 同步；GPU 通过页首、存储层偏移和页内偏移的广播批量生成全局位置。CUDA Graph replay 本身不会引入 CPU 同步。
+混合驻留时，每次 replay 前在图外同步读取容量不足事件，确保事件在下一次 replay 前处理；物理页分配后，页首索引批量取回 CPU。GPU 通过页首、存储层偏移和页内偏移的广播批量生成全局位置。CUDA Graph 内部保持固定地址，不执行物理页分配或 CPU 同步。
 
 KVDuo 不为 newest token 暗中保留第九张 HOT 页。混合驻留时，新 token 通过正常的 FULL/HOT 位置解析进入上述容量；旧 HiSparse 路径的额外槽位不计入 KVDuo 的 HOT 页承诺。
 

@@ -503,289 +503,205 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             0,
         )
 
-    def test_hot_pages_are_allocated_only_for_non_full_topk(self):
-        """A full hit owns no hot page; the first host workset grows by a page."""
+    def test_hot_growth_shrink_and_reuse_preserve_other_layer_metadata(self):
+        """HOT pages return to the physical allocator and can be acquired again."""
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
-        coordinator.page_size = 4
-        coordinator.device_buffer_size = 16
         coordinator.device = "cpu"
-        coordinator.req_to_full_lookup = torch.tensor(
-            [[1, 2, 3, 4, 5, 6, 7, 8]], dtype=torch.int64
-        )
-        coordinator.mem_pool_device = SimpleNamespace(
-            layer_num=2,
-            full_to_hisparse_device_index_mapping=torch.tensor(
-                [0, 11, 12, 0, 0, 0, 0, 0, 0], dtype=torch.int64
-            ),
-        )
-        coordinator.req_device_buffer_size = torch.zeros(1, dtype=torch.int64)
-        coordinator.req_device_buffer_size_gpu = torch.zeros(1, dtype=torch.int32)
+        coordinator.page_size = 4
+        coordinator.hot_storage_layers = 1
+        coordinator.hot_page_size = 4
+        coordinator.min_hot_pages = 1
+        coordinator.device_buffer_size = 32
+        coordinator.mem_pool_device = SimpleNamespace(layer_num=2)
+        coordinator._mixed_slots = [True]
         coordinator.kvduo_req_hot_capacity = torch.zeros((2, 1), dtype=torch.int64)
         coordinator.kvduo_req_hot_capacity_gpu = torch.zeros((2, 1), dtype=torch.int32)
-        coordinator.req_to_device_buffer = torch.zeros((1, 16), dtype=torch.int64)
+        coordinator.hot_page_last_touch = torch.zeros((2, 1, 8), dtype=torch.int64)
         coordinator.req_device_buffer_token_locs = torch.full(
-            (2, 1, 16), -1, dtype=torch.int32
+            (2, 1, 32), -1, dtype=torch.int32
         )
         coordinator.req_device_buffer_tokens = torch.full(
-            (2, 1, 16), -1, dtype=torch.int32
+            (2, 1, 32), -1, dtype=torch.int32
         )
-        coordinator.lru_slots = (
-            torch.arange(16, dtype=torch.int16).view(1, 1, -1).repeat(2, 1, 1)
-        )
-        physical = SimpleNamespace(alloc=MagicMock(return_value=torch.arange(21, 25)))
-        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
-            hisparse_attn_allocator=physical,
-            free_hisparse_indices=MagicMock(),
-        )
-        coordinator._kvduo_hot_carriers = {}
-        coordinator._kvduo_free_layer_pages = [set(), set()]
+        coordinator.lru_slots = torch.arange(32, dtype=torch.int16).repeat(2, 1, 1)
         coordinator._kvduo_req_layer_pages = {}
+        coordinator._kvduo_hot_page_owners = {}
         coordinator._reclaim_for_physical_allocation = MagicMock(
             return_value=SimpleNamespace(action=object())
         )
         coordinator._require_allocation_ready = MagicMock()
-
-        # Positions 0 and 1 are full hits, so no hot allocation is needed.
-        coordinator._ensure_kvduo_hot_workset(
-            torch.tensor([0]), torch.tensor([[0, 1, -1, -1]]), layer_id=1
+        physical = SimpleNamespace(
+            available_size=MagicMock(return_value=4),
+            alloc=MagicMock(return_value=torch.arange(20, 24)),
         )
-        physical.alloc.assert_not_called()
-
-        # Positions 2 and 3 have no full mapping.  Two slots round to one page.
-        coordinator._ensure_kvduo_hot_workset(
-            torch.tensor([0]), torch.tensor([[0, 2, 3, -1]]), layer_id=1
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            hisparse_attn_allocator=physical, free_hisparse_indices=MagicMock()
         )
+
+        coordinator._ensure_kvduo_hot_capacity_targets(1, {0: 4})
         physical.alloc.assert_called_once_with(4)
-        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
-        self.assertTrue(
-            torch.equal(
-                coordinator.req_device_buffer_token_locs[1, 0, :4],
-                torch.arange(21, 25, dtype=torch.int32),
-            )
-        )
-        self.assertTrue(torch.all(coordinator.req_device_buffer_tokens[1, 0, :4] == -1))
-        self.assertTrue(
-            torch.all(coordinator.req_device_buffer_token_locs[0, 0, :4] == -1)
-        )
-
-        # Simulate the resolver publishing the first miss set.  A disjoint
-        # later workset must retain these entries and demand a second page,
-        # rather than treating one Top-k width as a fixed cache quota.
+        self.assertEqual(coordinator._kvduo_hot_page_owners, {20: (1, 0)})
         coordinator.req_device_buffer_tokens[1, 0, :4] = torch.tensor([2, 3, 6, 7])
         physical.alloc.reset_mock()
-        from sglang.srt.mem_cache.sparsity.core.kvduo_state import (
-            KVDuoPressureAction,
-        )
-
-        coordinator._reclaim_for_physical_allocation.return_value = SimpleNamespace(
-            action=KVDuoPressureAction.ERROR
-        )
-        coordinator._ensure_kvduo_hot_workset(
-            torch.tensor([0]), torch.tensor([[4, 5, -1, -1]]), layer_id=1
-        )
+        physical.available_size.return_value = 0
+        coordinator._reclaim_for_physical_allocation.reset_mock()
+        coordinator._ensure_kvduo_hot_capacity_targets(1, {0: 8}, allow_reclaim=False)
         physical.alloc.assert_not_called()
+        coordinator._reclaim_for_physical_allocation.assert_not_called()
         self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
 
-        coordinator._reclaim_for_physical_allocation.return_value = SimpleNamespace(
-            action=KVDuoPressureAction.SUCCESS
+        physical.available_size.return_value = 4
+        physical.alloc.return_value = torch.arange(24, 28)
+        coordinator._ensure_kvduo_hot_capacity_targets(1, {0: 8}, allow_reclaim=False)
+        self.assertEqual(
+            coordinator.lru_slots[1, 0, :8].tolist(), [4, 5, 6, 7, 0, 1, 2, 3]
         )
-        physical.alloc.return_value = torch.arange(25, 29)
-        coordinator._ensure_kvduo_hot_workset(
-            torch.tensor([0]), torch.tensor([[4, 5, 6, 7]]), layer_id=1
-        )
-        physical.alloc.assert_called_once_with(4)
-        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 8)
         self.assertEqual(
             coordinator.req_device_buffer_tokens[1, 0, :4].tolist(), [2, 3, 6, 7]
         )
-        self.assertEqual(
-            coordinator.lru_slots[1, 0, :8].tolist(), [4, 5, 6, 7, 0, 1, 2, 3]
-        )
+        self.assertEqual(coordinator._kvduo_req_layer_pages[(1, 0)], [20, 24])
 
-        # Shrink and reuse the released layer page. The reactivated range must
-        # again be a complete permutation, despite stale values outside the
-        # temporarily reduced active capacity.
         coordinator._evict_kvduo_hot_fragment(1, 0, 1)
         self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
-        physical.alloc.reset_mock()
-        coordinator._ensure_kvduo_hot_workset(
-            torch.tensor([0]), torch.tensor([[4, 5, 6, 7]]), layer_id=1
+        returned = (
+            coordinator.token_to_kv_pool_allocator.free_hisparse_indices.call_args.args[
+                0
+            ]
         )
-        physical.alloc.assert_not_called()
+        self.assertEqual(returned.tolist(), [24, 25, 26, 27])
+        physical.alloc.reset_mock()
+        coordinator._ensure_kvduo_hot_capacity_targets(1, {0: 8}, allow_reclaim=False)
+        physical.alloc.assert_called_once_with(4)
         self.assertEqual(
             coordinator.lru_slots[1, 0, :8].tolist(), [4, 5, 6, 7, 0, 1, 2, 3]
         )
-        self.assertEqual(len(set(coordinator.lru_slots[1, 0, :8].tolist())), 8)
+        self.assertTrue(torch.all(coordinator.req_device_buffer_token_locs[0] == -1))
+        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[0, 0]), 0)
 
-        # Releasing layer 1 does not touch layer 0 metadata.  Once all carrier
-        # fragments are free, the carrier coalesces back to the legacy pool.
         coordinator._release_kvduo_layer_hot_pages(0)
-        coordinator.token_to_kv_pool_allocator.free_hisparse_indices.assert_called_once()
+        self.assertFalse(coordinator._kvduo_hot_page_owners)
+        self.assertTrue(torch.all(coordinator.kvduo_req_hot_capacity == 0))
 
-    def test_graph_prepare_uses_miss_history_and_rejects_zero_capacity(self):
-        """Replay preparation grows from counters and never admits mixed/zero."""
+    def _make_graph_prepare_coordinator(self, layers=1, requests=1):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
         coordinator.decode_producer_stream = None
         coordinator.device = "cpu"
-        coordinator.top_k = 2
-        coordinator.mem_pool_device = SimpleNamespace(layer_num=1)
-        coordinator._active_kvduo_reqs = {0: object()}
-        coordinator._mixed_slots = [True]
-        coordinator.kvduo_stats_poll_interval = 1
-        coordinator._kvduo_replay_count = 0
-        coordinator.kvduo_resolver_stats = torch.tensor([[[3, 4]]], dtype=torch.int32)
-        coordinator.kvduo_req_hot_capacity = torch.tensor([[4]], dtype=torch.int64)
-        coordinator._ensure_kvduo_hot_capacity_targets = MagicMock(return_value=True)
-        coordinator._ensure_kvduo_hot_capacity_targets_batch = MagicMock(
-            return_value=True
-        )
-
-        coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
-
-        self.assertEqual(
-            coordinator._ensure_kvduo_hot_capacity_targets.call_args.args[1],
-            {0: 8},
-        )
-        self.assertTrue(torch.all(coordinator.kvduo_resolver_stats == 0))
-
-        coordinator.kvduo_req_hot_capacity.zero_()
-        with self.assertRaisesRegex(RuntimeError, "mandatory 2K"):
-            coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
-
-    def test_graph_prepare_ignores_incidental_misses(self):
-        """A sparse miss signal cannot cascade through every optional tier."""
-        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-
-        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
-        coordinator.enable_mixed_residency = True
-        coordinator.decode_producer_stream = None
-        coordinator.top_k = 2
-        coordinator.mem_pool_device = SimpleNamespace(layer_num=1)
-        owner = object()
-        coordinator._active_kvduo_reqs = {0: owner}
-        coordinator._mixed_slots = [True]
-        coordinator.kvduo_stats_poll_interval = 1
-        coordinator._kvduo_replay_count = 0
-        coordinator.kvduo_resolver_stats = torch.tensor([[[1, 100]]], dtype=torch.int32)
-        coordinator.kvduo_req_hot_capacity = torch.tensor([[4]], dtype=torch.int64)
-        coordinator._ensure_kvduo_hot_capacity_targets = MagicMock()
-
-        coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
-
-        coordinator._ensure_kvduo_hot_capacity_targets.assert_not_called()
-
-    def test_graph_prepare_grows_hot_capacity_linearly_and_stops_at_16k(self):
-        """Page allocation preserves the 4K -> 6K -> 8K progression."""
-        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-
-        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
-        coordinator.device = "cpu"
-        coordinator.page_size = 2
-        coordinator.top_k = 2
-        coordinator.device_buffer_size = 32
-        coordinator.mem_pool_device = SimpleNamespace(layer_num=1)
-        coordinator._mixed_slots = [True]
-        coordinator.kvduo_req_hot_capacity = torch.tensor([[4]], dtype=torch.int64)
-        coordinator.kvduo_req_hot_capacity_gpu = torch.tensor([[4]], dtype=torch.int32)
-        coordinator.req_device_buffer_token_locs = torch.full(
-            (1, 1, 32), -1, dtype=torch.int32
-        )
-        coordinator.req_device_buffer_tokens = torch.full(
-            (1, 1, 32), -1, dtype=torch.int32
-        )
-        coordinator.lru_slots = torch.arange(32, dtype=torch.int16).view(1, 1, -1)
-        coordinator._kvduo_req_layer_pages = {(0, 0): [10, 12]}
-        coordinator._kvduo_hot_carriers = {start: [0] for start in (10, 12)} | {
-            start: [None] for start in range(14, 44, 2)
-        }
-        coordinator._kvduo_free_layer_pages = [set(range(14, 44, 2))]
-
-        capacities = []
-        physical_page_counts = []
-        for target in (8, 12, 16):
-            coordinator._ensure_kvduo_hot_capacity_targets(0, {0: target})
-            capacities.append(int(coordinator.kvduo_req_hot_capacity[0, 0]))
-            physical_page_counts.append(len(coordinator._kvduo_req_layer_pages[(0, 0)]))
-
-        self.assertEqual(capacities, [8, 12, 16])
-        self.assertEqual(physical_page_counts, [4, 6, 8])
-
-        coordinator._ensure_kvduo_hot_capacity_targets(0, {0: 32})
-        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[0, 0]), 32)
-        self.assertEqual(len(coordinator._kvduo_req_layer_pages[(0, 0)]), 16)
-        with self.assertRaisesRegex(RuntimeError, "exceeds fixed 16K"):
-            coordinator._ensure_kvduo_hot_capacity_targets(0, {0: 36})
-
-    def test_optional_hot_growth_never_reclaims_full_pages(self):
-        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-
-        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.page_size = 4
+        coordinator.hot_page_size = 4
+        coordinator.min_hot_pages = 1
         coordinator.top_k = 2
-        coordinator.device_buffer_size = 32
-        coordinator._mixed_slots = [True]
-        coordinator.kvduo_req_hot_capacity = torch.tensor([[4]], dtype=torch.int64)
-        coordinator._kvduo_free_layer_pages = [set()]
-        physical = SimpleNamespace(available_size=MagicMock(return_value=0))
+        coordinator.mem_pool_device = SimpleNamespace(layer_num=layers)
+        coordinator._active_kvduo_reqs = {i: object() for i in range(requests)}
+        coordinator._mixed_slots = [True] * requests
+        coordinator._kvduo_pending_hot_minimum = set()
+        coordinator.kvduo_resolver_stats = torch.zeros(
+            (layers, requests, 2), dtype=torch.int32
+        )
+        coordinator.kvduo_hot_growth_events = torch.zeros(
+            (layers, requests), dtype=torch.int32
+        )
+        coordinator._kvduo_hot_growth_events_host = torch.empty(
+            (layers, requests), dtype=torch.int32
+        )
+        coordinator.kvduo_req_hot_capacity = torch.full(
+            (layers, requests), 4, dtype=torch.int64
+        )
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
-            hisparse_attn_allocator=physical
-        )
-        coordinator._reclaim_for_physical_allocation = MagicMock()
-
-        coordinator._ensure_kvduo_hot_capacity_targets(0, {0: 8}, allow_reclaim=False)
-
-        coordinator._reclaim_for_physical_allocation.assert_not_called()
-        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[0, 0]), 4)
-
-    def test_graph_prepare_rechecks_batch_requests_demoted_by_pressure(self):
-        """A full batch peer demoted during growth receives 2K before replay."""
-        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-
-        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
-        coordinator.enable_mixed_residency = True
-        coordinator.decode_producer_stream = None
-        coordinator.device = "cpu"
-        coordinator.top_k = 2
-        coordinator.mem_pool_device = SimpleNamespace(layer_num=1)
-        coordinator._active_kvduo_reqs = {0: object(), 1: object(), 2: object()}
-        coordinator._mixed_slots = [True, False, False]
-        coordinator.kvduo_stats_poll_interval = 1
-        coordinator._kvduo_replay_count = 0
-        coordinator.kvduo_resolver_stats = torch.zeros((1, 3, 2), dtype=torch.int32)
-        coordinator.kvduo_req_hot_capacity = torch.tensor(
-            [[0, 0, 0]], dtype=torch.int64
-        )
-        targets = []
-
-        def allocate(_, requested_capacities):
-            targets.append(dict(requested_capacities))
-            if len(targets) == 1:
-                coordinator.kvduo_req_hot_capacity[0, 0] = 4
-                coordinator._mixed_slots[1] = True
-            elif len(targets) == 2:
-                coordinator.kvduo_req_hot_capacity[0, 1] = 4
-                coordinator._mixed_slots[2] = True
-            else:
-                coordinator.kvduo_req_hot_capacity[0, 2] = 4
-            return True
-
-        coordinator._ensure_kvduo_hot_capacity_targets_batch = MagicMock(
-            side_effect=lambda targets: allocate(
-                None, {req_idx: target for (_, req_idx), target in targets.items()}
+            hisparse_attn_allocator=SimpleNamespace(
+                available_size=MagicMock(return_value=128)
             )
         )
 
+        def allocate(targets, *, allow_reclaim=True):
+            for (layer_id, req_idx), capacity in targets.items():
+                coordinator.kvduo_req_hot_capacity[layer_id, req_idx] = capacity
+
+        coordinator._ensure_kvduo_hot_capacity_targets_batch = MagicMock(
+            side_effect=allocate
+        )
+        return coordinator
+
+    def test_graph_prepare_uses_capacity_events_and_rejects_zero_capacity(self):
+        coordinator = self._make_graph_prepare_coordinator()
+        coordinator.kvduo_resolver_stats[0, 0] = torch.tensor([1, 100])
+        coordinator.kvduo_hot_growth_events[0, 0] = 1
+
+        coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
+
+        coordinator._ensure_kvduo_hot_capacity_targets_batch.assert_called_once_with(
+            {(0, 0): 8}, allow_reclaim=False
+        )
+        self.assertTrue(torch.all(coordinator.kvduo_hot_growth_events == 0))
+        coordinator.kvduo_req_hot_capacity.zero_()
+        coordinator._kvduo_pending_hot_minimum.add(0)
+        coordinator._ensure_kvduo_hot_capacity_targets_batch.side_effect = None
+        with self.assertRaisesRegex(RuntimeError, "mandatory HOT capacity"):
+            coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
+
+    def test_graph_prepare_ignores_miss_statistics_without_capacity_events(self):
+        coordinator = self._make_graph_prepare_coordinator()
+        coordinator.kvduo_resolver_stats[0, 0] = torch.tensor([100, 100])
+
+        coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
+
+        coordinator._ensure_kvduo_hot_capacity_targets_batch.assert_not_called()
+        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[0, 0]), 4)
+
+    def test_graph_prepare_grows_one_page_per_event_and_stops_at_8k(self):
+        coordinator = self._make_graph_prepare_coordinator()
+        capacities = []
+        for _ in range(9):
+            coordinator.kvduo_hot_growth_events[0, 0] = 1
+            coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
+            capacities.append(int(coordinator.kvduo_req_hot_capacity[0, 0]))
+
+        self.assertEqual(capacities, [8, 12, 16, 20, 24, 28, 32, 32, 32])
+
+    def test_h2d_growth_without_free_pages_retains_current_capacity(self):
+        coordinator = self._make_graph_prepare_coordinator()
+        coordinator.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size.return_value = (
+            0
+        )
+        coordinator.kvduo_hot_growth_events[0, 0] = 1
+
+        coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
+
+        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[0, 0]), 4)
+        coordinator._ensure_kvduo_hot_capacity_targets_batch.assert_called_once_with(
+            {}, allow_reclaim=False
+        )
+
+    def test_graph_prepare_rechecks_batch_requests_demoted_by_pressure(self):
+        """A full batch peer demoted during admission receives K before replay."""
+        coordinator = self._make_graph_prepare_coordinator(requests=3)
+        coordinator._mixed_slots = [True, False, False]
+        coordinator._kvduo_pending_hot_minimum = {0}
+        coordinator.kvduo_req_hot_capacity.zero_()
+        targets = []
+
+        def allocate(requested, *, allow_reclaim=True):
+            if not requested:
+                return
+            targets.append(dict(requested))
+            for (layer_id, req_idx), target in requested.items():
+                coordinator.kvduo_req_hot_capacity[layer_id, req_idx] = target
+            next_req = len(targets)
+            if next_req < 3:
+                coordinator._mixed_slots[next_req] = True
+                coordinator._kvduo_pending_hot_minimum.add(next_req)
+
+        coordinator._ensure_kvduo_hot_capacity_targets_batch.side_effect = allocate
         coordinator.prepare_kvduo_graph_replay(torch.tensor([0, 1, 2]))
 
-        self.assertEqual(targets, [{0: 4}, {1: 4}, {2: 4}])
-        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[0, 1]), 4)
-        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[0, 2]), 4)
+        self.assertEqual(targets, [{(0, 0): 4}, {(0, 1): 4}, {(0, 2): 4}])
+        self.assertTrue(torch.all(coordinator.kvduo_req_hot_capacity == 4))
+        self.assertFalse(coordinator._kvduo_pending_hot_minimum)
 
     def test_graph_prepare_batches_two_requests_across_21_layers(self):
         """One fixed-point round uses one allocation and one page-id read."""
@@ -807,9 +723,11 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator._active_kvduo_reqs = {0: object(), 1: object()}
         coordinator._mixed_slots = [True, True]
         coordinator._kvduo_pending_hot_minimum = {0, 1}
-        coordinator.kvduo_stats_poll_interval = 8
-        coordinator._kvduo_replay_count = 0
         coordinator.kvduo_resolver_stats = torch.zeros((21, 2, 2), dtype=torch.int32)
+        coordinator.kvduo_hot_growth_events = torch.zeros((21, 2), dtype=torch.int32)
+        coordinator._kvduo_hot_growth_events_host = torch.empty(
+            (21, 2), dtype=torch.int32
+        )
         coordinator.kvduo_req_hot_capacity = torch.zeros((21, 2), dtype=torch.int64)
         coordinator.kvduo_req_hot_capacity_gpu = torch.zeros((21, 2), dtype=torch.int32)
         coordinator.req_device_buffer_token_locs = torch.full(
@@ -993,63 +911,31 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         allocator.alloc.assert_called_once_with(2)
         self._assert_batched_hot_failure_rolled_back(coordinator, physical)
 
-    def test_graph_prepare_polls_growth_every_eight_replays(self):
-        """Miss statistics accumulate without affecting mandatory worksets."""
-        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-
-        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
-        coordinator.enable_mixed_residency = True
-        coordinator.decode_producer_stream = None
-        coordinator.device = "cpu"
-        coordinator.top_k = 2
-        coordinator.mem_pool_device = SimpleNamespace(layer_num=1)
-        owner = object()
-        coordinator._active_kvduo_reqs = {0: owner}
-        coordinator._mixed_slots = [True]
-        coordinator.kvduo_stats_poll_interval = 8
-        coordinator._kvduo_replay_count = 0
-        coordinator.kvduo_resolver_stats = torch.tensor([[[3, 4]]], dtype=torch.int32)
-        coordinator.kvduo_req_hot_capacity = torch.tensor([[4]], dtype=torch.int64)
-        coordinator._ensure_kvduo_hot_capacity_targets = MagicMock(return_value=True)
-
-        for _ in range(7):
-            coordinator.prepare_kvduo_graph_replay(
-                torch.tensor([99]), req_pool_indices_cpu=torch.tensor([0])
-            )
-        coordinator._ensure_kvduo_hot_capacity_targets.assert_not_called()
-        self.assertEqual(int(coordinator.kvduo_resolver_stats[0, 0, 0]), 3)
+    def test_graph_prepare_consumes_capacity_event_on_next_replay(self):
+        coordinator = self._make_graph_prepare_coordinator()
+        coordinator.kvduo_hot_growth_events[0, 0] = 1
 
         coordinator.prepare_kvduo_graph_replay(
             torch.tensor([99]), req_pool_indices_cpu=torch.tensor([0])
         )
-        self.assertEqual(
-            coordinator._ensure_kvduo_hot_capacity_targets.call_args.args[1],
-            {0: 8},
+
+        coordinator._ensure_kvduo_hot_capacity_targets_batch.assert_called_once_with(
+            {(0, 0): 8}, allow_reclaim=False
         )
-        self.assertTrue(torch.all(coordinator.kvduo_resolver_stats == 0))
+        self.assertTrue(torch.all(coordinator.kvduo_hot_growth_events == 0))
+        coordinator._ensure_kvduo_hot_capacity_targets_batch.reset_mock()
+        for _ in range(8):
+            coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
+        coordinator._ensure_kvduo_hot_capacity_targets_batch.assert_not_called()
 
     def test_graph_prepare_skips_steady_state_capacity_scan(self):
-        """Established hot tiers add no per-layer Python work per replay."""
-        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-
-        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
-        coordinator.enable_mixed_residency = True
-        coordinator.decode_producer_stream = None
-        coordinator.top_k = 2
-        coordinator.mem_pool_device = SimpleNamespace(layer_num=64)
-        coordinator._active_kvduo_reqs = {0: object()}
-        coordinator._mixed_slots = [True]
-        coordinator._kvduo_pending_hot_minimum = set()
-        coordinator.kvduo_stats_poll_interval = 8
-        coordinator._kvduo_replay_count = 0
-        coordinator.kvduo_resolver_stats = torch.zeros((64, 1, 2), dtype=torch.int32)
-        # Any layer/capacity scan would fail this test before reaching a mock.
+        """Without a capacity event, HOT tiers need no per-layer Python scan."""
+        coordinator = self._make_graph_prepare_coordinator(layers=64)
         coordinator.kvduo_req_hot_capacity = None
-        coordinator._ensure_kvduo_hot_capacity_targets = MagicMock()
 
         coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
 
-        coordinator._ensure_kvduo_hot_capacity_targets.assert_not_called()
+        coordinator._ensure_kvduo_hot_capacity_targets_batch.assert_not_called()
 
     def test_reclaims_only_dedicated_physical_shortfall(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator

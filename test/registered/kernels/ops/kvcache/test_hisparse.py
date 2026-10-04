@@ -416,6 +416,109 @@ def test_kvduo_full_resident_fast_path_skips_empty_hot_view() -> None:
     assert torch.equal(resolver_stats.cpu(), torch.tensor([[0, 3]], dtype=torch.int32))
 
 
+@pytest.mark.parametrize(
+    "cached, selected, capacity, expected_events",
+    [
+        ([-1, -1, -1, -1], [3, 6], 2, 0),
+        ([1, -1, -1, -1], [1, 3], 2, 0),
+        ([1, 4, -1, -1], [1, 4], 2, 0),
+        ([1, 4, -1, -1], [3, -1], 2, 1),
+        ([1, 4, -1, -1], [3, 6], 2, 1),
+        ([1, -1, -1, -1], [3, 6], 2, 1),
+        ([1, 4, 2, 5], [3, 6], 4, 0),
+    ],
+)
+def test_kvduo_h2d_capacity_event_and_lru_fallback(
+    cached, selected, capacity, expected_events
+) -> None:
+    state = _long_case()
+    state["device_buffer_tokens"][0, :4] = torch.tensor(
+        cached, dtype=torch.int32, device=DEVICE
+    )
+    # Empty slots precede occupied ones in the active LRU permutation.
+    slots = sorted(range(capacity), key=lambda i: cached[i] >= 0)
+    state["lru_slots"][0, :capacity] = torch.tensor(
+        slots, dtype=torch.int16, device=DEVICE
+    )
+    top_k = torch.tensor([selected], dtype=torch.int32, device=DEVICE)
+    out = torch.full_like(top_k, -1)
+    events = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    versions = torch.ones(16, dtype=torch.int64, device=DEVICE)
+    status = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    kwargs = dict(
+        **state,
+        top_k_tokens=top_k,
+        top_k_device_locs=out,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([8], dtype=torch.int32, device=DEVICE),
+        item_size_bytes=ITEM_SIZE_BYTES,
+        num_top_k=2,
+        hot_buffer_size=HOT_BUFFER_SIZE,
+        page_size=1,
+        block_size=256,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+        req_hot_buffer_sizes=torch.tensor([capacity], dtype=torch.int32, device=DEVICE),
+        hot_page_last_touch=torch.zeros((1, 4), dtype=torch.int64, device=DEVICE),
+        req_to_logical_token=torch.arange(8, dtype=torch.int64, device=DEVICE).view(
+            1, -1
+        ),
+        full_to_device_loc=torch.zeros(16, dtype=torch.int64, device=DEVICE),
+        full_last_touch=torch.zeros(16, dtype=torch.int64, device=DEVICE),
+        full_data_version=versions,
+        full_host_version=versions.clone(),
+        swap_status=status,
+        resolver_stats=torch.zeros((1, 2), dtype=torch.int32, device=DEVICE),
+        hot_growth_events=events,
+        touch_clock=torch.tensor([7], dtype=torch.int64, device=DEVICE),
+    )
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+
+    assert events.item() == expected_events
+    assert status.item() == 0
+    for index, token in enumerate(selected):
+        location = out[0, index].item()
+        if token < 0:
+            assert location == -1
+        else:
+            assert location >= 0
+            host_location = state["host_cache_locs"][0, token].item()
+            assert torch.equal(
+                state["device_buffer"][location].cpu(),
+                state["host_cache"][host_location],
+            )
+            if token in cached:
+                assert (
+                    location
+                    == state["device_buffer_locs"][0, cached.index(token)].item()
+                )
+    if capacity == HOT_BUFFER_SIZE and expected_events == 0:
+        assert out.cpu().tolist() == [[9, 7]]
+        assert state["device_buffer_tokens"][0, :4].cpu().tolist() == [3, 6, 2, 5]
+
+    # The same workset is now all HOT hits, including after an LRU fallback.
+    events.zero_()
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+    assert events.item() == 0
+
+    # Capture once, then replay a new disjoint selection and a HOT-hit selection.
+    # The event must come from device execution on every replay, without Python
+    # re-running the resolver or reallocating its metadata.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        load_cache_to_device_buffer_mla(**kwargs)
+    events.zero_()
+    top_k.copy_(torch.tensor([[0, 2]], dtype=torch.int32, device=DEVICE))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert events.item() == int(capacity < HOT_BUFFER_SIZE)
+    events.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert events.item() == 0
+
+
 def test_load_cache_to_device_buffer_hits_newest_and_updates_lru() -> None:
     state = _long_case()
 
