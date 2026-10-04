@@ -66,7 +66,8 @@ def test_hicache_replans_chunk_from_actual_empty_restore():
     adder.prefill_max_requests = None
     adder.can_run_list = []
     adder.new_chunked_req = None
-    adder.page_size = 4
+    # Keep the two-token cached prefix aligned to a whole page.
+    adder.page_size = 2
     adder.rem_chunk_tokens = 4
     adder.rem_input_tokens = 100
     adder.rem_total_token_offset = 0
