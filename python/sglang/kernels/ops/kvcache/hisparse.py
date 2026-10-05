@@ -102,6 +102,7 @@ def _load_cache_to_device_buffer_mla(
     resolver_stats: torch.Tensor | None = None,
     touch_clock: torch.Tensor | None = None,
     full_location_base: int = 0,
+    hot_growth_events: torch.Tensor | None = None,
 ) -> None:
     assert hot_buffer_size >= num_top_k, (
         f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
@@ -165,6 +166,12 @@ def _load_cache_to_device_buffer_mla(
         assert req_hot_buffer_sizes.device == top_k_tokens.device
         assert hot_page_last_touch.dtype == torch.int64
         assert hot_page_last_touch.device == top_k_tokens.device
+    if hot_growth_events is not None:
+        assert enable_full_lookup and enable_dynamic_hot_view
+        assert hot_growth_events.dtype == torch.int32
+        assert hot_growth_events.ndim == 1 and hot_growth_events.is_contiguous()
+        assert hot_growth_events.numel() == device_buffer_tokens.size(0)
+        assert hot_growth_events.device == top_k_tokens.device
     module.load_cache_to_device_buffer(
         top_k_tokens.data_ptr(),
         device_buffer_tokens.data_ptr(),
@@ -186,6 +193,7 @@ def _load_cache_to_device_buffer_mla(
         full_host_version.data_ptr() if enable_full_lookup else 0,
         swap_status.data_ptr() if enable_full_lookup else 0,
         resolver_stats.data_ptr() if enable_full_lookup else 0,
+        hot_growth_events.data_ptr() if hot_growth_events is not None else 0,
         touch_clock.data_ptr(),
         torch.cuda.current_stream(top_k_tokens.device).cuda_stream,
         top_k_tokens.size(0),
@@ -235,6 +243,7 @@ def load_cache_to_device_buffer_mla(
     resolver_stats: torch.Tensor | None = None,
     touch_clock: torch.Tensor | None = None,
     full_location_base: int = 0,
+    hot_growth_events: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
     _load_cache_to_device_buffer_mla(
@@ -266,6 +275,7 @@ def load_cache_to_device_buffer_mla(
         resolver_stats=resolver_stats,
         touch_clock=touch_clock,
         full_location_base=full_location_base,
+        hot_growth_events=hot_growth_events,
     )
 
 
@@ -297,6 +307,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     resolver_stats: torch.Tensor | None = None,
     touch_clock: torch.Tensor | None = None,
     full_location_base: int = 0,
+    hot_growth_events: torch.Tensor | None = None,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -328,4 +339,5 @@ def load_cache_to_device_buffer_dsv4_mla(
         resolver_stats=resolver_stats,
         touch_clock=touch_clock,
         full_location_base=full_location_base,
+        hot_growth_events=hot_growth_events,
     )

@@ -213,6 +213,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int64_t* __restrict__ full_host_version,
     int32_t* __restrict__ swap_status,
     int32_t* __restrict__ resolver_stats,
+    int32_t* __restrict__ hot_growth_events,
     const int64_t* __restrict__ touch_clock,
     int64_t req_to_logical_stride,
     int64_t resolver_stats_stride,
@@ -279,9 +280,11 @@ __global__ void load_cache_to_device_buffer_kernel(
   // overwrites the corresponding output entries.
   __shared__ int needs_hot_resolver;
   __shared__ int full_resident_accesses;
+  __shared__ int needs_hot_growth;
   if (tid == 0) {
     needs_hot_resolver = 0;
     full_resident_accesses = 0;
+    needs_hot_growth = 0;
   }
   __syncthreads();
   // A non-zero dynamic hot view identifies a mixed request.  Do not pre-probe
@@ -580,6 +583,13 @@ __global__ void load_cache_to_device_buffer_kernel(
     if (is_miss) {
       int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
       int16_t evict_slot = s_lru_slots_out[hot_buffer_size - 1 - miss_offset];
+      // An H2D miss that consumes an empty slot needs no capacity increase.
+      // Replacing any occupied slot emits exactly one event for this request
+      // and logical layer, regardless of the number of missed entries.
+      if (hot_growth_events != nullptr && hot_buffer_size < HOT_BUFFER_SIZE &&
+          req_device_buffer_tokens[evict_slot] >= 0) {
+        atomicExch(&needs_hot_growth, 1);
+      }
       // Reuse s_top_k_tokens as miss scratch: miss_offset < my_token_idx always
       // holds (hits are skipped), so compacted writes never overrun pending reads.
       s_top_k_tokens[miss_offset] = my_token;
@@ -603,6 +613,9 @@ __global__ void load_cache_to_device_buffer_kernel(
       atomicAdd(&resolver_stats[rid * resolver_stats_stride], total_misses);
       atomicAdd(
           &resolver_stats[rid * resolver_stats_stride + 1], total_misses + s_total_hits + s_full_hits + s_newest_hit);
+      if (hot_growth_events != nullptr && needs_hot_growth) {
+        atomicAdd(&hot_growth_events[rid], 1);
+      }
     }
   }
   __syncthreads();
@@ -711,6 +724,7 @@ void load_cache_to_device_buffer(
     uint64_t full_host_version_ptr,
     uint64_t swap_status_ptr,
     uint64_t resolver_stats_ptr,
+    uint64_t hot_growth_events_ptr,
     uint64_t touch_clock_ptr,
     uint64_t stream_ptr,
     int64_t bs,
@@ -766,6 +780,7 @@ void load_cache_to_device_buffer(
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(full_host_version_ptr)),
         reinterpret_cast<int32_t*>(static_cast<uintptr_t>(swap_status_ptr)),
         reinterpret_cast<int32_t*>(static_cast<uintptr_t>(resolver_stats_ptr)),
+        reinterpret_cast<int32_t*>(static_cast<uintptr_t>(hot_growth_events_ptr)),
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(touch_clock_ptr)),
         req_to_logical_stride,
         resolver_stats_stride,
