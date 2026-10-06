@@ -814,6 +814,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
         if forward_batch.hisparse_coordinator is not None:
             forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
+            if forward_batch.hisparse_coordinator.enable_mixed_residency:
+                forward_batch.hisparse_coordinator.kvduo_hot_tail_ema_observe.zero_()
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)

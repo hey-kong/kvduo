@@ -105,6 +105,20 @@ resolver 元数据预先固定为最多 `8K` 个槽位，以保持 CUDA Graph �
 
 KVDuo 不为 newest token 暗中保留第九张 HOT 页。混合驻留时，新 token 通过正常的 FULL/HOT 位置解析进入上述容量；旧 HiSparse 路径的额外槽位不计入 KVDuo 的 HOT 页承诺。
 
+### 5. LRU 尾部命中 EMA
+
+每个 `(request, logical_layer)` 只维护一个浮点 EMA 得分 `q` 和一个有效观察步数 `T`。当前容量为 `nK` 时，假设缩容到 `m = max(ceil(top_k / K), ceil(n / 2))` 页，可释放页数为 `F = n - m`。`F = 0` 时不更新统计。
+
+resolver 遍历现有 `lru_slots` 时，以本轮更新前的排名识别 LRU 端前 `FK` 个槽位，统计其中的 HOT 命中数 `B`。物理槽位编号不代表 LRU 排名；FULL/tail 直接命中和 H2D miss 不计入 `B`。统计遵循现有 top-k 批次的访问及 LRU 更新规则。
+
+每个实际执行的 decode 步按 `d = B / F` 更新得分。首次有效观察直接设置 `q = d, T = 1`；随后执行 `q = (1 - alpha) * q + alpha * d, T = T + 1`，默认 `alpha = 1 / 64`。没有尾部 HOT 命中的步骤仍以 `d = 0` 正常更新。padding 请求、capture/warmup 的合成请求及解析失败的步骤不形成有效观察。
+
+扩容保留 `q` 和 `T`，下一轮按新容量计算 `F`。缩容或 merge 完成后通过统一重置入口清零该对象的统计；请求结束、撤回或请求槽位复用也会清零。重置在设备 stream 上排在旧 decode producer 之后，避免旧请求的排队计算写入新请求的统计。
+
+得分和步数由 GPU resolver 在固定地址上直接更新，不为 EMA 引入异步 CPU 统计快照，也不增加 GPU→CPU 同步。该阶段提供统计及重置入口，按得分选择回收对象和按条目 LRU 搬运的 merge 算法尚未接入。若后续引入异步 host 统计快照，应用结果前必须验证请求 generation。
+
+得分的单位为“命中条目数／释放页／decode 步”，衡量近期真实 LRU 待截掉区域的贡献。它不模拟缩容后的多步缓存演化，也不保证实际损失的上界或下界。
+
 ## Host 前缀缓存与恢复
 
 RadixTree 只表示连续 GPU 前缀，不能表示中间含 host-only 空洞的请求。KVDuo 另外维护容量受限的 host prefix cache：

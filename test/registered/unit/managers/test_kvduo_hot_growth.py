@@ -29,6 +29,17 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
     coordinator.kvduo_resolver_stats = torch.zeros(
         (layers, requests, 2), dtype=torch.int32
     )
+    coordinator.kvduo_hot_tail_ema_alpha = 1 / 64
+    coordinator.kvduo_hot_tail_ema_observe = torch.ones(1, dtype=torch.int32)
+    coordinator.kvduo_hot_tail_ema = torch.zeros(
+        (layers, requests), dtype=torch.float32
+    )
+    coordinator.kvduo_hot_tail_observation_steps = torch.zeros(
+        (layers, requests), dtype=torch.int64
+    )
+    coordinator.hot_page_last_touch = torch.zeros(
+        (layers, requests, 8), dtype=torch.int64
+    )
     coordinator.kvduo_hot_growth_events = torch.zeros(
         (layers, requests), dtype=torch.int32
     )
@@ -307,8 +318,16 @@ def test_resolver_ffi_receives_the_stable_growth_event_pointer(monkeypatch, dsv4
         resolver_stats=coordinator.kvduo_resolver_stats[0],
         touch_clock=torch.ones(1, dtype=torch.int64),
         hot_growth_events=coordinator.kvduo_hot_growth_events[0],
+        hot_tail_ema=coordinator.kvduo_hot_tail_ema[0],
+        hot_tail_observation_steps=coordinator.kvduo_hot_tail_observation_steps[0],
     )
 
     args = module.load_cache_to_device_buffer.call_args.args
     assert args[20] == coordinator.kvduo_hot_growth_events[0].data_ptr()
-    assert all(isinstance(arg, (int, bool)) for arg in args)
+    assert args[-4:-1] == (
+        coordinator.kvduo_hot_tail_ema[0].data_ptr(),
+        coordinator.kvduo_hot_tail_observation_steps[0].data_ptr(),
+        1 / 64,
+    )
+    assert args[-1] == 0
+    assert all(isinstance(arg, (int, bool, float)) for arg in args)

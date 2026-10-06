@@ -7,6 +7,7 @@ from typing import List, NamedTuple, Sequence, Union
 import torch
 
 from sglang.kernels.ops.kvcache.hisparse import (
+    DEFAULT_KVDUO_HOT_TAIL_EMA_ALPHA,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
 )
@@ -143,6 +144,7 @@ class HiSparseCoordinator:
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
         tail_protected_pages: int = 0,
+        hot_tail_ema_alpha: float = DEFAULT_KVDUO_HOT_TAIL_EMA_ALPHA,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -159,6 +161,9 @@ class HiSparseCoordinator:
         self.swap_in_block_size = swap_in_block_size
         self.tail_protected_pages = tail_protected_pages
         self.enable_mixed_residency = tail_protected_pages > 0
+        if not 0 < hot_tail_ema_alpha <= 1:
+            raise ValueError("HOT tail EMA alpha must satisfy 0 < alpha <= 1")
+        self.kvduo_hot_tail_ema_alpha = float(hot_tail_ema_alpha)
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -302,6 +307,25 @@ class HiSparseCoordinator:
                 dtype=torch.int32,
                 device=device,
             )
+            # Each (request, logical_layer) owns exactly one score and one
+            # effective observation count. The resolver updates them directly
+            # at fixed GPU addresses, with no asynchronous host-stat snapshot.
+            self.kvduo_hot_tail_ema = torch.zeros(
+                (self.mem_pool_device.layer_num, max_num_req_slots),
+                dtype=torch.float32,
+                device=device,
+            )
+            self.kvduo_hot_tail_observation_steps = torch.zeros(
+                (self.mem_pool_device.layer_num, max_num_req_slots),
+                dtype=torch.int64,
+                device=device,
+            )
+            # Capture/warmup forwards use synthetic requests, not observations.
+            # A graph reads this shared flag at execution time, so replay can
+            # resume observation without recapturing or changing EMA pointers.
+            self.kvduo_hot_tail_ema_observe = torch.ones(
+                1, dtype=torch.int32, device=device
+            )
             # One event per resolver invocation that must replace an occupied
             # HOT slot for a new H2D miss. Fixed addresses survive graph replay;
             # the next graph boundary consumes every event without miss-rate
@@ -354,6 +378,9 @@ class HiSparseCoordinator:
             self.full_touch_clock = None
             self.kvduo_swap_status = None
             self.kvduo_resolver_stats = None
+            self.kvduo_hot_tail_ema = None
+            self.kvduo_hot_tail_observation_steps = None
+            self.kvduo_hot_tail_ema_observe = None
             self.kvduo_hot_growth_events = None
             self._active_kvduo_reqs = None
             self._kvduo_pending_hot_minimum = None
@@ -1353,6 +1380,7 @@ class HiSparseCoordinator:
             self.kvduo_req_hot_capacity_gpu[:, req.req_pool_idx] = 0
             self.kvduo_resolver_stats[:, req.req_pool_idx, :] = 0
             self.kvduo_hot_growth_events[:, req.req_pool_idx] = 0
+            self._reset_kvduo_hot_tail_ema(req.req_pool_idx)
             self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
             self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
             return
@@ -1823,6 +1851,7 @@ class HiSparseCoordinator:
             device_module.current_stream(self.device).wait_stream(
                 self.decode_producer_stream
             )
+        self.kvduo_hot_tail_ema_observe.fill_(1)
         tracked_pending_minimum = getattr(self, "_kvduo_pending_hot_minimum", None)
         pending_minimum = tracked_pending_minimum
         if pending_minimum is None:
@@ -1948,10 +1977,31 @@ class HiSparseCoordinator:
         if required_slots > self.device_buffer_size:
             raise RuntimeError("KVDuo hot metadata cannot grow beyond fixed 8-page")
 
+    def _reset_kvduo_hot_tail_ema(
+        self, req_idx: int, layer_id: int | None = None
+    ) -> None:
+        """Reset after merge/shrink or request release/reuse at a safe boundary.
+
+        Order resets after the old producer so a queued decode cannot update a
+        recycled request slot. Direct device updates have no asynchronous host
+        results to apply to a different request generation. Growth never calls
+        this method and retains both the score and observation count.
+        """
+        if not self.enable_mixed_residency:
+            return
+        if self.decode_producer_stream is not None:
+            device_module.current_stream(self.device).wait_stream(
+                self.decode_producer_stream
+            )
+        layers = slice(None) if layer_id is None else layer_id
+        self.kvduo_hot_tail_ema[layers, req_idx] = 0
+        self.kvduo_hot_tail_observation_steps[layers, req_idx] = 0
+
     def _release_kvduo_layer_hot_pages(self, req_idx: int) -> None:
         """Return every HOT page of a request directly to the common allocator."""
         if not self.enable_mixed_residency:
             return
+        self._reset_kvduo_hot_tail_ema(req_idx)
         starts = []
         for layer_id in range(self.mem_pool_device.layer_num):
             owner = (layer_id, req_idx)
@@ -2030,6 +2080,7 @@ class HiSparseCoordinator:
         self.lru_slots[layer_id, req_idx, :new_capacity] = torch.cat(
             [slots[tokens < 0], slots[tokens >= 0]]
         )
+        self._reset_kvduo_hot_tail_ema(req_idx, layer_id)
 
     def reclaim_kvduo_hot_pages(self, num_tokens: int) -> int:
         """Evict layer-hot pages by LRU after full-page reclaim is exhausted."""
@@ -2558,6 +2609,7 @@ class HiSparseCoordinator:
             self._kvduo_host_valid_len[req.req_pool_idx] = 0
             self.kvduo_resolver_stats[:, req.req_pool_idx, :] = 0
             self.kvduo_hot_growth_events[:, req.req_pool_idx] = 0
+            self._reset_kvduo_hot_tail_ema(req.req_pool_idx)
         self._mixed_slots[req.req_pool_idx] = False
         if self.enable_mixed_residency:
             self._active_kvduo_reqs.pop(req.req_pool_idx, None)
@@ -2670,6 +2722,7 @@ class HiSparseCoordinator:
             self.hot_page_last_touch[:, req.req_pool_idx, :] = 0
             self.kvduo_resolver_stats[:, req.req_pool_idx, :] = 0
             self.kvduo_hot_growth_events[:, req.req_pool_idx] = 0
+            self._reset_kvduo_hot_tail_ema(req.req_pool_idx)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         if self.enable_mixed_residency:
@@ -2867,6 +2920,20 @@ class HiSparseCoordinator:
                 self.kvduo_hot_growth_events[layer_id]
                 if self.enable_mixed_residency
                 else None
+            ),
+            hot_tail_ema=(
+                self.kvduo_hot_tail_ema[layer_id]
+                if self.enable_mixed_residency
+                else None
+            ),
+            hot_tail_observation_steps=(
+                self.kvduo_hot_tail_observation_steps[layer_id]
+                if self.enable_mixed_residency
+                else None
+            ),
+            hot_tail_ema_alpha=self.kvduo_hot_tail_ema_alpha,
+            hot_tail_ema_observe=(
+                self.kvduo_hot_tail_ema_observe if self.enable_mixed_residency else None
             ),
             touch_clock=(
                 self.full_touch_clock if self.enable_mixed_residency else None

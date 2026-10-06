@@ -1,3 +1,4 @@
+#include <sgl_kernel/kvduo_hot_tail_ema.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -227,7 +228,11 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t top_k_device_locs_stride,
     int64_t page_size,
     int64_t item_size_bytes,
-    int64_t full_location_base) {
+    int64_t full_location_base,
+    float* __restrict__ hot_tail_ema,
+    int64_t* __restrict__ hot_tail_observation_steps,
+    float hot_tail_ema_alpha,
+    const int32_t* __restrict__ hot_tail_ema_observe) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
@@ -256,6 +261,12 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int hot_buffer_size =
       enable_dynamic_hot_view ? min(max(req_hot_buffer_sizes[rid], 0), HOT_BUFFER_SIZE) : HOT_BUFFER_SIZE;
   const int num_buffer_chunks = (hot_buffer_size + WARP_SIZE - 1) / WARP_SIZE;
+  const bool observe_hot_tail =
+      hot_tail_ema != nullptr && (hot_tail_ema_observe == nullptr || hot_tail_ema_observe[0] != 0);
+  const int releasable_hot_pages = observe_hot_tail && enable_full_lookup && enable_dynamic_hot_view
+                                       ? sglang::kvduo_hot_releasable_pages(hot_buffer_size, page_size, NUM_TOP_K)
+                                       : 0;
+  const int discarded_hot_slots = releasable_hot_pages * page_size;
 
   // Calculate offsets for this request
   const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
@@ -281,10 +292,12 @@ __global__ void load_cache_to_device_buffer_kernel(
   __shared__ int needs_hot_resolver;
   __shared__ int full_resident_accesses;
   __shared__ int needs_hot_growth;
+  __shared__ int tail_hot_hits;
   if (tid == 0) {
     needs_hot_resolver = 0;
     full_resident_accesses = 0;
     needs_hot_growth = 0;
+    tail_hot_hits = 0;
   }
   __syncthreads();
   // A non-zero dynamic hot view identifies a mixed request.  Do not pre-probe
@@ -485,6 +498,14 @@ __global__ void load_cache_to_device_buffer_kernel(
     if (has_valid_chunk) {
       const BallotMask hit_mask = __ballot_sync(FULL_WARP_MASK, is_hit);
       const BallotMask evict_mask = __ballot_sync(FULL_WARP_MASK, is_evictable);
+      // slot_idx is the rank in the OLD LRU permutation, not buf_slot's
+      // physical index. FULL/tail hits never enter this HOT hash table.
+      if (releasable_hot_pages > 0) {
+        const BallotMask tail_hit_mask = __ballot_sync(FULL_WARP_MASK, is_hit && slot_idx < discarded_hot_slots);
+        if (lane_id == 0 && tail_hit_mask != 0) {
+          atomicAdd(&tail_hot_hits, popc_mask(tail_hit_mask));
+        }
+      }
       local_hit_offset = popc_mask(hit_mask & lanes_before);
       local_evict_offset = popc_mask(evict_mask & lanes_before);
       if (lane_id == 0) {
@@ -616,6 +637,17 @@ __global__ void load_cache_to_device_buffer_kernel(
       if (hot_growth_events != nullptr && needs_hot_growth) {
         atomicAdd(&hot_growth_events[rid], 1);
       }
+      // One CTA owns this (request, logical_layer) in the decode batch.
+      // Zero tail hits still constitute an observation; padded CTAs already
+      // returned, and minimum-capacity objects have releasable_hot_pages == 0.
+      if (releasable_hot_pages > 0 && swap_status[rid] == 0) {
+        sglang::kvduo_update_hot_tail_ema(
+            tail_hot_hits,
+            releasable_hot_pages,
+            hot_tail_ema_alpha,
+            hot_tail_ema[rid],
+            hot_tail_observation_steps[rid]);
+      }
     }
   }
   __syncthreads();
@@ -742,7 +774,11 @@ void load_cache_to_device_buffer(
     bool enable_dynamic_hot_view,
     int64_t page_size,
     int64_t item_size_bytes,
-    int64_t full_location_base) {
+    int64_t full_location_base,
+    uint64_t hot_tail_ema_ptr,
+    uint64_t hot_tail_observation_steps_ptr,
+    double hot_tail_ema_alpha,
+    uint64_t hot_tail_ema_observe_ptr) {
   using namespace host;
 
   const auto stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(stream_ptr));
@@ -794,7 +830,11 @@ void load_cache_to_device_buffer(
         top_k_device_locs_stride,
         page_size,
         item_size_bytes,
-        full_location_base);
+        full_location_base,
+        reinterpret_cast<float*>(static_cast<uintptr_t>(hot_tail_ema_ptr)),
+        reinterpret_cast<int64_t*>(static_cast<uintptr_t>(hot_tail_observation_steps_ptr)),
+        static_cast<float>(hot_tail_ema_alpha),
+        reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(hot_tail_ema_observe_ptr)));
   };
 
   if (seq_is_i64 && rpi_is_i64) {
