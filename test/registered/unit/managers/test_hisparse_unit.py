@@ -509,6 +509,11 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
+        coordinator.decode_producer_stream = None
+        coordinator.kvduo_hot_tail_ema = torch.zeros((2, 1), dtype=torch.float32)
+        coordinator.kvduo_hot_tail_observation_steps = torch.zeros(
+            (2, 1), dtype=torch.int64
+        )
         coordinator.device = "cpu"
         coordinator.page_size = 4
         coordinator.hot_storage_layers = 1
@@ -590,6 +595,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
+        coordinator.kvduo_hot_tail_ema_observe = torch.ones(1, dtype=torch.int32)
         coordinator.decode_producer_stream = None
         coordinator.device = "cpu"
         coordinator.page_size = 4
@@ -709,6 +715,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
+        coordinator.kvduo_hot_tail_ema_observe = torch.ones(1, dtype=torch.int32)
         coordinator.decode_producer_stream = None
         coordinator.device = "cpu"
         coordinator.page_size = 1

@@ -519,6 +519,179 @@ def test_kvduo_h2d_capacity_event_and_lru_fallback(
     assert events.item() == 0
 
 
+def _kvduo_hot_tail_ema_case(
+    selected=(2, 1), *, capacity=4, k=1, lru=(2, 0, 3, 1), q=99, steps=0, alpha=1 / 64
+):
+    state = _long_case()
+    state["lru_slots"][0] = torch.tensor(lru, dtype=torch.int16, device=DEVICE)
+    top_k = torch.tensor([selected], dtype=torch.int32, device=DEVICE)
+    versions = torch.ones(16, dtype=torch.int64, device=DEVICE)
+    score = torch.tensor([q], dtype=torch.float32, device=DEVICE)
+    observations = torch.tensor([steps], dtype=torch.int64, device=DEVICE)
+    kwargs = dict(
+        **state,
+        top_k_tokens=top_k,
+        top_k_device_locs=torch.full_like(top_k, -1),
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([8], dtype=torch.int32, device=DEVICE),
+        item_size_bytes=ITEM_SIZE_BYTES,
+        num_top_k=len(selected),
+        hot_buffer_size=HOT_BUFFER_SIZE,
+        page_size=k,
+        block_size=256,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+        req_hot_buffer_sizes=torch.tensor([capacity], dtype=torch.int32, device=DEVICE),
+        hot_page_last_touch=torch.zeros((1, 4), dtype=torch.int64, device=DEVICE),
+        req_to_logical_token=torch.arange(8, dtype=torch.int64, device=DEVICE).view(
+            1, -1
+        ),
+        full_to_device_loc=torch.zeros(16, dtype=torch.int64, device=DEVICE),
+        full_last_touch=torch.zeros(16, dtype=torch.int64, device=DEVICE),
+        full_data_version=versions,
+        full_host_version=versions.clone(),
+        swap_status=torch.zeros(1, dtype=torch.int32, device=DEVICE),
+        resolver_stats=torch.zeros((1, 2), dtype=torch.int32, device=DEVICE),
+        hot_growth_events=torch.zeros(1, dtype=torch.int32, device=DEVICE),
+        touch_clock=torch.ones(1, dtype=torch.int64, device=DEVICE),
+        hot_tail_ema=score,
+        hot_tail_observation_steps=observations,
+        hot_tail_ema_alpha=alpha,
+        hot_tail_ema_observe=torch.ones(1, dtype=torch.int32, device=DEVICE),
+    )
+    return kwargs
+
+
+def test_kvduo_tail_ema_counts_old_lru_rank_and_decays_after_hits_become_mru():
+    kwargs = _kvduo_hot_tail_ema_case()
+    # Old LRU [2,0,3,1] truncates slots 2 and 0; both selected HOT tokens hit
+    # that region. Neither the physical slot number nor the new rank is valid
+    # for measuring this step: both entries become MRU after resolution.
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+    assert kwargs["hot_tail_ema"].item() == 1  # B=2, F=2
+    assert kwargs["hot_tail_observation_steps"].item() == 1
+    assert kwargs["lru_slots"].cpu().tolist() == [[3, 1, 2, 0]]
+
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+    assert kwargs["hot_tail_ema"].item() == pytest.approx(63 / 64)
+    assert kwargs["hot_tail_observation_steps"].item() == 2
+
+
+@pytest.mark.parametrize(
+    "selected, capacity, k, lru, expected",
+    [
+        ((2, 1), 3, 1, (2, 0, 1, 3), 1),  # ceil(3/2)=2, F=1
+        ((2, 1), 4, 2, (2, 0, 3, 1), 2),  # two slots/page, F=1
+        ((2, 1, 4), 4, 1, (2, 0, 3, 1), 1),  # n_min=3, F=1
+    ],
+)
+def test_kvduo_tail_ema_uses_current_shrink_geometry(
+    selected, capacity, k, lru, expected
+):
+    kwargs = _kvduo_hot_tail_ema_case(selected, capacity=capacity, k=k, lru=lru)
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+    assert kwargs["hot_tail_ema"].item() == expected
+    assert kwargs["hot_tail_observation_steps"].item() == 1
+
+
+@pytest.mark.parametrize("kind", ["miss", "full", "tail"])
+def test_kvduo_tail_ema_excludes_h2d_full_and_tail_direct_hits(kind):
+    selected = (3, 6) if kind == "miss" else ((2, 1) if kind == "full" else (7, -1))
+    kwargs = _kvduo_hot_tail_ema_case(selected, q=2, steps=10)
+    if kind == "full":
+        # These logical positions ALSO have old tail HOT copies. FULL takes
+        # precedence and must not contribute to the HOT-tail loss.
+        kwargs["full_to_device_loc"][2] = 3
+        kwargs["full_to_device_loc"][1] = 9
+    elif kind == "tail":
+        kwargs["full_to_device_loc"][7] = 11
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+    assert kwargs["hot_tail_ema"].item() == pytest.approx(2 * 63 / 64)
+    assert kwargs["hot_tail_observation_steps"].item() == 11
+
+
+@pytest.mark.parametrize("kind", ["minimum", "padded", "capture", "invalid_source"])
+def test_kvduo_tail_ema_ignores_non_observations(kind):
+    kwargs = _kvduo_hot_tail_ema_case(q=2, steps=10)
+    if kind == "minimum":
+        kwargs["req_hot_buffer_sizes"].fill_(2)
+        kwargs["lru_slots"][0] = torch.tensor(
+            [0, 1, 2, 3], dtype=torch.int16, device=DEVICE
+        )
+    elif kind == "padded":
+        kwargs["num_real_reqs"].zero_()
+    elif kind == "capture":
+        kwargs["hot_tail_ema_observe"].zero_()
+    else:
+        kwargs["top_k_tokens"][0] = torch.tensor(
+            [3, 6], dtype=torch.int32, device=DEVICE
+        )
+        kwargs["full_host_version"][3] = 0
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+    assert kwargs["hot_tail_ema"].item() == 2
+    assert kwargs["hot_tail_observation_steps"].item() == 10
+
+
+def test_kvduo_tail_ema_counts_only_real_rows_in_a_padded_batch():
+    kwargs = _kvduo_hot_tail_ema_case()
+    kwargs["top_k_tokens"] = kwargs["top_k_tokens"].repeat(2, 1)
+    kwargs["top_k_device_locs"] = torch.full_like(kwargs["top_k_tokens"], -1)
+    kwargs["req_pool_indices"] = kwargs["req_pool_indices"].repeat(2)
+    kwargs["seq_lens"] = kwargs["seq_lens"].repeat(2)
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+    assert kwargs["hot_tail_ema"].item() == 1
+    assert kwargs["hot_tail_observation_steps"].item() == 1
+    assert kwargs["top_k_device_locs"][1].cpu().tolist() == [-1, -1]
+
+
+def test_kvduo_tail_ema_survives_capture_growth_reset_and_request_slot_reuse():
+    kwargs = _kvduo_hot_tail_ema_case(
+        (1, 4), capacity=2, lru=(0, 1, 2, 3), q=2, steps=10
+    )
+    load_cache_to_device_buffer_mla(**kwargs)  # warm the JIT before capture
+    graph = torch.cuda.CUDAGraph()
+    kwargs["hot_tail_ema_observe"].zero_()
+    with torch.cuda.graph(graph):
+        load_cache_to_device_buffer_mla(**kwargs)
+    assert kwargs["hot_tail_observation_steps"].item() == 10
+
+    # Grow without clearing history. The same graph now sees n=4,F=2 and the
+    # changed OLD LRU; growth puts new empty slots first. There is no Python
+    # per-replay EMA calculation, and the first grown observation has B=0.
+    kwargs["req_hot_buffer_sizes"].fill_(4)
+    kwargs["hot_tail_ema_observe"].fill_(1)
+    kwargs["device_buffer_tokens"][0, 2:4] = -1
+    kwargs["lru_slots"][0] = torch.tensor(
+        [2, 3, 0, 1], dtype=torch.int16, device=DEVICE
+    )
+    graph.replay()
+    torch.cuda.synchronize()
+    assert kwargs["hot_tail_ema"].item() == pytest.approx(2 * 63 / 64)
+    assert kwargs["hot_tail_observation_steps"].item() == 11
+
+    # Fill the new slots through actual H2D. The old tokens now occupy the LRU
+    # tail [0,1], while the loaded tokens at [2,3] are MRU.
+    kwargs["top_k_tokens"][0] = torch.tensor([2, 5], dtype=torch.int32, device=DEVICE)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert kwargs["lru_slots"].cpu().tolist() == [[0, 1, 2, 3]]
+
+    # The replay stream completes before resetting for a merge or new owner.
+    # Scores start from the next observation instead of blending old history.
+    kwargs["hot_tail_ema"].zero_()
+    kwargs["hot_tail_observation_steps"].zero_()
+    kwargs["top_k_tokens"][0] = torch.tensor([1, 4], dtype=torch.int32, device=DEVICE)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert kwargs["hot_tail_ema"].item() == 1
+    assert kwargs["hot_tail_observation_steps"].item() == 1
+
+
 def test_load_cache_to_device_buffer_hits_newest_and_updates_lru() -> None:
     state = _long_case()
 

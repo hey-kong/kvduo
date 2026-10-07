@@ -10,6 +10,8 @@ from sglang.kernels.jit.utils import load_jit, make_cpp_args
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+DEFAULT_KVDUO_HOT_TAIL_EMA_ALPHA = 1 / 64
+
 
 @functools.cache
 def _jit_sparse_module(
@@ -103,6 +105,10 @@ def _load_cache_to_device_buffer_mla(
     touch_clock: torch.Tensor | None = None,
     full_location_base: int = 0,
     hot_growth_events: torch.Tensor | None = None,
+    hot_tail_ema: torch.Tensor | None = None,
+    hot_tail_observation_steps: torch.Tensor | None = None,
+    hot_tail_ema_alpha: float = DEFAULT_KVDUO_HOT_TAIL_EMA_ALPHA,
+    hot_tail_ema_observe: torch.Tensor | None = None,
 ) -> None:
     assert hot_buffer_size >= num_top_k, (
         f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
@@ -172,6 +178,23 @@ def _load_cache_to_device_buffer_mla(
         assert hot_growth_events.ndim == 1 and hot_growth_events.is_contiguous()
         assert hot_growth_events.numel() == device_buffer_tokens.size(0)
         assert hot_growth_events.device == top_k_tokens.device
+    if (hot_tail_ema is None) != (hot_tail_observation_steps is None):
+        raise ValueError("HOT tail EMA and observation steps must be supplied together")
+    if hot_tail_ema is not None:
+        assert enable_full_lookup and enable_dynamic_hot_view
+        assert hot_tail_ema.dtype == torch.float32
+        assert hot_tail_observation_steps.dtype == torch.int64
+        for tensor in (hot_tail_ema, hot_tail_observation_steps):
+            assert tensor.ndim == 1 and tensor.is_contiguous()
+            assert tensor.numel() == device_buffer_tokens.size(0)
+            assert tensor.device == top_k_tokens.device
+        if not 0 < hot_tail_ema_alpha <= 1:
+            raise ValueError("HOT tail EMA alpha must satisfy 0 < alpha <= 1")
+    if hot_tail_ema_observe is not None:
+        assert hot_tail_ema is not None
+        assert hot_tail_ema_observe.dtype == torch.int32
+        assert hot_tail_ema_observe.numel() == 1
+        assert hot_tail_ema_observe.device == top_k_tokens.device
     module.load_cache_to_device_buffer(
         top_k_tokens.data_ptr(),
         device_buffer_tokens.data_ptr(),
@@ -212,6 +235,10 @@ def _load_cache_to_device_buffer_mla(
         page_size,
         item_size_bytes,
         full_location_base,
+        hot_tail_ema.data_ptr() if hot_tail_ema is not None else 0,
+        hot_tail_observation_steps.data_ptr() if hot_tail_ema is not None else 0,
+        float(hot_tail_ema_alpha),
+        hot_tail_ema_observe.data_ptr() if hot_tail_ema_observe is not None else 0,
     )
 
 
@@ -244,6 +271,10 @@ def load_cache_to_device_buffer_mla(
     touch_clock: torch.Tensor | None = None,
     full_location_base: int = 0,
     hot_growth_events: torch.Tensor | None = None,
+    hot_tail_ema: torch.Tensor | None = None,
+    hot_tail_observation_steps: torch.Tensor | None = None,
+    hot_tail_ema_alpha: float = DEFAULT_KVDUO_HOT_TAIL_EMA_ALPHA,
+    hot_tail_ema_observe: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
     _load_cache_to_device_buffer_mla(
@@ -276,6 +307,10 @@ def load_cache_to_device_buffer_mla(
         touch_clock=touch_clock,
         full_location_base=full_location_base,
         hot_growth_events=hot_growth_events,
+        hot_tail_ema=hot_tail_ema,
+        hot_tail_observation_steps=hot_tail_observation_steps,
+        hot_tail_ema_alpha=hot_tail_ema_alpha,
+        hot_tail_ema_observe=hot_tail_ema_observe,
     )
 
 
@@ -308,6 +343,10 @@ def load_cache_to_device_buffer_dsv4_mla(
     touch_clock: torch.Tensor | None = None,
     full_location_base: int = 0,
     hot_growth_events: torch.Tensor | None = None,
+    hot_tail_ema: torch.Tensor | None = None,
+    hot_tail_observation_steps: torch.Tensor | None = None,
+    hot_tail_ema_alpha: float = DEFAULT_KVDUO_HOT_TAIL_EMA_ALPHA,
+    hot_tail_ema_observe: torch.Tensor | None = None,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -340,4 +379,8 @@ def load_cache_to_device_buffer_dsv4_mla(
         touch_clock=touch_clock,
         full_location_base=full_location_base,
         hot_growth_events=hot_growth_events,
+        hot_tail_ema=hot_tail_ema,
+        hot_tail_observation_steps=hot_tail_observation_steps,
+        hot_tail_ema_alpha=hot_tail_ema_alpha,
+        hot_tail_ema_observe=hot_tail_ema_observe,
     )
