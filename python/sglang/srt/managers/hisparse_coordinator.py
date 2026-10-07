@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import math
 from typing import List, NamedTuple, Sequence, Union
 
 import torch
@@ -10,6 +11,7 @@ from sglang.kernels.ops.kvcache.hisparse import (
     DEFAULT_KVDUO_HOT_TAIL_EMA_ALPHA,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
+    transfer_cache_dsv4_mla,
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
@@ -22,6 +24,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.sparsity.core.kvduo_hot_merge import plan_kvduo_hot_merge
 from sglang.srt.mem_cache.sparsity.core.kvduo_state import (
     KVDuoPressureAction,
     KVDuoPressureReason,
@@ -164,6 +167,7 @@ class HiSparseCoordinator:
         if not 0 < hot_tail_ema_alpha <= 1:
             raise ValueError("HOT tail EMA alpha must satisfy 0 < alpha <= 1")
         self.kvduo_hot_tail_ema_alpha = float(hot_tail_ema_alpha)
+        self.kvduo_hot_tail_ema_min_observations = 1 / self.kvduo_hot_tail_ema_alpha
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -1642,26 +1646,28 @@ class HiSparseCoordinator:
         if not allow_reclaim and allocator.available_size() < physical_slots:
             return
         if allow_reclaim:
-            self._kvduo_pressure_protected = protected_logical
-            protected_layers = {layer_id for layer_id, *_ in requests}
-            self._kvduo_hot_pressure_protected = {
-                (protected_layer, int(req_idx), page_index)
-                for protected_layer in protected_layers
-                for req_idx in protected_req_indices
+            previous_full_protected = getattr(self, "_kvduo_pressure_protected", None)
+            previous_hot_protected = getattr(
+                self, "_kvduo_hot_pressure_protected", set()
+            )
+            self._kvduo_pressure_protected = (
+                previous_full_protected
+                if protected_logical is None
+                else protected_logical
+            )
+            self._kvduo_hot_pressure_protected = previous_hot_protected | {
+                (layer_id, req_idx, page_index)
+                for layer_id, req_idx, *_ in requests
                 for page_index in range(
-                    len(
-                        self._kvduo_req_layer_pages.get(
-                            (protected_layer, int(req_idx)), ()
-                        )
-                    )
+                    len(self._kvduo_req_layer_pages.get((layer_id, req_idx), ()))
                 )
             }
             try:
                 pressure = self._reclaim_for_physical_allocation(physical_slots)
                 self._require_allocation_ready(pressure)
             finally:
-                self._kvduo_pressure_protected = None
-                self._kvduo_hot_pressure_protected = set()
+                self._kvduo_pressure_protected = previous_full_protected
+                self._kvduo_hot_pressure_protected = previous_hot_protected
         physical = allocator.alloc(physical_slots)
         if physical is None:
             if allow_reclaim:
@@ -1954,15 +1960,30 @@ class HiSparseCoordinator:
         if getattr(self, "_kvduo_pending_hot_minimum", None) is not None:
             self._kvduo_pending_hot_minimum.difference_update(requested)
 
-        # Each capacity event buys one physical HOT page, subject to 8K and
-        # currently free pages. Spend the available budget on individual owners
-        # rather than rejecting an entire batch when only some owners fit.
+        # Optional growth can reclaim mature HOT owners, never FULL pages.
+        # Exclude every applicant for this boundary, including applicants that
+        # cannot all fit. Released surplus pages stay in the common free pool.
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        applicants = {
+            owner: min(
+                events,
+                8 - int(self.kvduo_req_hot_capacity[owner]) // self.hot_page_size,
+            )
+            for owner, events in growth_events.items()
+        }
+        applicants = {owner: pages for owner, pages in applicants.items() if pages > 0}
+        shortfall = (
+            sum(applicants.values()) - allocator.available_size() // self.page_size
+        )
+        if shortfall > 0:
+            self.reclaim_kvduo_hot_pages(
+                shortfall * self.page_size, excluded_owners=set(applicants)
+            )
         free_pages = allocator.available_size() // self.page_size
         growth_targets = {}
-        for (layer_id, req_idx), events in sorted(growth_events.items()):
+        for (layer_id, req_idx), requested_pages in sorted(applicants.items()):
             current = int(self.kvduo_req_hot_capacity[layer_id, req_idx])
-            pages = min(events, 8 - current // self.hot_page_size, free_pages)
+            pages = min(requested_pages, free_pages)
             if pages > 0:
                 growth_targets[(layer_id, req_idx)] = (
                     current + pages * self.hot_page_size
@@ -2021,108 +2042,200 @@ class HiSparseCoordinator:
                 torch.tensor(indices, dtype=torch.int64, device=self.device)
             )
 
-    def _evict_kvduo_hot_fragment(
-        self, layer_id: int, req_idx: int, page_index: int
-    ) -> None:
-        """Drop one whole HOT physical page without moving any KV payload."""
-        pages = self._kvduo_req_layer_pages[(layer_id, req_idx)]
-        last_index = len(pages) - 1
-        victim_start = pages[page_index]
-        slot = page_index * self.hot_page_size
-        last_slot = last_index * self.hot_page_size
-        if page_index != last_index:
-            # Only page-table metadata moves. The surviving KV payload stays at
-            # its original physical addresses carried by token_locs.
-            self.req_device_buffer_tokens[
-                layer_id, req_idx, slot : slot + self.hot_page_size
-            ] = self.req_device_buffer_tokens[
-                layer_id, req_idx, last_slot : last_slot + self.hot_page_size
-            ].clone()
-            self.req_device_buffer_token_locs[
-                layer_id, req_idx, slot : slot + self.hot_page_size
-            ] = self.req_device_buffer_token_locs[
-                layer_id, req_idx, last_slot : last_slot + self.hot_page_size
-            ].clone()
-            self.hot_page_last_touch[layer_id, req_idx, page_index] = (
-                self.hot_page_last_touch[layer_id, req_idx, last_index]
-            )
-            pages[page_index] = pages[last_index]
-        self.req_device_buffer_tokens[
-            layer_id, req_idx, last_slot : last_slot + self.hot_page_size
-        ] = -1
-        self.req_device_buffer_token_locs[
-            layer_id, req_idx, last_slot : last_slot + self.hot_page_size
-        ] = -1
-        self.hot_page_last_touch[layer_id, req_idx, last_index] = 0
-        pages.pop()
-        if not pages:
-            del self._kvduo_req_layer_pages[(layer_id, req_idx)]
-        owner = (layer_id, req_idx)
-        if self._kvduo_hot_page_owners.pop(victim_start, None) != owner:
-            raise RuntimeError("KVDuo whole-page ownership mismatch")
-        self.token_to_kv_pool_allocator.free_hisparse_indices(
-            torch.arange(
-                victim_start,
-                victim_start + self.page_size,
-                dtype=torch.int64,
-                device=self.device,
-            )
-        )
-        new_capacity = last_slot
-        self.kvduo_req_hot_capacity[layer_id, req_idx] = new_capacity
-        self.kvduo_req_hot_capacity_gpu[layer_id, req_idx] = new_capacity
-        # Rebuild a deterministic permutation after metadata page removal;
-        # payload compaction is deliberately not performed. Empty slots are
-        # kept at the LRU/front side, which is the resolver's empty-first
-        # allocation contract.
-        tokens = self.req_device_buffer_tokens[layer_id, req_idx, :new_capacity]
-        slots = torch.arange(new_capacity, dtype=torch.int16, device=self.device)
-        self.lru_slots[layer_id, req_idx, :new_capacity] = torch.cat(
-            [slots[tokens < 0], slots[tokens >= 0]]
-        )
-        self._reset_kvduo_hot_tail_ema(req_idx, layer_id)
-
-    def reclaim_kvduo_hot_pages(self, num_tokens: int) -> int:
-        """Evict layer-hot pages by LRU after full-page reclaim is exhausted."""
-        if not self.enable_mixed_residency or num_tokens <= 0:
-            return 0
+    def _wait_kvduo_hot_merge_boundary(self) -> None:
+        """Order pressure work after decode readers and pending KV transfers."""
         if self.decode_producer_stream is not None:
             device_module.current_stream(self.device).wait_stream(
                 self.decode_producer_stream
             )
-        protected = getattr(self, "_kvduo_hot_pressure_protected", set())
-        candidates = []
+        if getattr(self, "_has_pending_backup", False):
+            self.wait_for_pending_backup()
+
+    def _move_kvduo_hot_entries(
+        self, layer_id: int, src_locs: torch.Tensor, dst_locs: torch.Tensor
+    ) -> None:
+        """Copy disjoint released-page sources into retained-page destinations."""
+        if src_locs.numel() == 0:
+            return
+        if self.is_dsv4_hisparse:
+            # Treat the contiguous layer/page backing as ONE cache: indices
+            # already encode storage layers and may move across those layers.
+            backing = self.mem_pool_device.get_flat_key_buffer()
+            ptrs = torch.tensor(
+                [backing.data_ptr()], dtype=torch.uint64, device=self.device
+            )
+            transfer_cache_dsv4_mla(ptrs, ptrs, src_locs, dst_locs)
+        else:
+            cache = self.mem_pool_device.kv_buffer[layer_id]
+            cache.index_copy_(0, dst_locs, cache.index_select(0, src_locs))
+
+    def _merge_kvduo_hot_pages(self, layer_id: int, req_idx: int) -> int:
+        """Halve an owner's capacity, preserving entry LRU and minimizing moves.
+
+        No physical page becomes available until payload copies and metadata
+        publication complete. A failed copy aborts reclamation without freeing
+        its source pages. All tensor addresses/shapes remain capture-stable.
+        """
+        self._wait_kvduo_hot_merge_boundary()
+        owner = (layer_id, req_idx)
+        pages = self._kvduo_req_layer_pages.get(owner)
+        if not pages or len(pages) <= self.min_hot_pages:
+            return 0
+        if any(
+            (layer_id, req_idx, index) in self._kvduo_hot_pressure_protected
+            for index in range(len(pages))
+        ):
+            return 0
+        capacity = int(self.kvduo_req_hot_capacity[owner])
+        if capacity != len(pages) * self.hot_page_size:
+            raise RuntimeError("KVDuo HOT capacity/ownership mismatch before merge")
+        if any(self._kvduo_hot_page_owners.get(start) != owner for start in pages):
+            raise RuntimeError("KVDuo whole-page ownership mismatch before merge")
+
+        # One synchronous snapshot of the REAL cache, only under pressure.
+        # It cannot outlive this boundary or be applied to a recycled owner.
+        tokens, locs, lru = (
+            torch.stack(
+                [
+                    self.req_device_buffer_tokens[layer_id, req_idx, :capacity].to(
+                        torch.int64
+                    ),
+                    self.req_device_buffer_token_locs[layer_id, req_idx, :capacity].to(
+                        torch.int64
+                    ),
+                    self.lru_slots[layer_id, req_idx, :capacity].to(torch.int64),
+                ]
+            )
+            .cpu()
+            .tolist()
+        )
+        plan = plan_kvduo_hot_merge(tokens, lru, self.hot_page_size, self.top_k)
+        if plan is None:
+            return 0
+        if any(loc < 0 for loc in locs) or len(set(locs)) != capacity:
+            raise RuntimeError("KVDuo HOT merge has invalid physical slot locations")
+        kept_starts = [pages[index] for index in plan.kept_pages]
+        released_starts = [pages[index] for index in plan.released_pages]
+        retained_locs = [
+            locs[index * self.hot_page_size + offset]
+            for index in plan.kept_pages
+            for offset in range(self.hot_page_size)
+        ]
+        new_capacity = len(plan.tokens)
+        # Stage allocations before the first payload write, so allocation
+        # failure cannot leave a partially published compaction.
+        new_tokens = torch.full_like(
+            self.req_device_buffer_tokens[layer_id, req_idx], -1
+        )
+        new_locs = torch.full_like(
+            self.req_device_buffer_token_locs[layer_id, req_idx], -1
+        )
+        new_lru = torch.full_like(self.lru_slots[layer_id, req_idx], -1)
+        new_tokens[:new_capacity] = torch.tensor(
+            plan.tokens, dtype=torch.int32, device=self.device
+        )
+        new_locs[:new_capacity] = torch.tensor(
+            retained_locs, dtype=torch.int32, device=self.device
+        )
+        new_lru[:new_capacity] = torch.tensor(
+            plan.lru_slots, dtype=torch.int16, device=self.device
+        )
+        new_touch = torch.zeros_like(self.hot_page_last_touch[layer_id, req_idx])
+        kept_indices = torch.tensor(
+            plan.kept_pages, dtype=torch.int64, device=self.device
+        )
+        new_touch[: len(kept_starts)] = self.hot_page_last_touch[
+            layer_id, req_idx, kept_indices
+        ]
+        src_locs = torch.tensor(
+            [locs[slot] for slot in plan.source_slots],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        dst_locs = torch.tensor(
+            [locs[slot] for slot in plan.destination_slots],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        released = torch.tensor(
+            [
+                slot
+                for start in released_starts
+                for slot in range(start, start + self.page_size)
+            ],
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+        self._move_kvduo_hot_entries(layer_id, src_locs, dst_locs)
+        self.req_device_buffer_tokens[layer_id, req_idx].copy_(new_tokens)
+        self.req_device_buffer_token_locs[layer_id, req_idx].copy_(new_locs)
+        self.lru_slots[layer_id, req_idx].copy_(new_lru)
+        self.hot_page_last_touch[layer_id, req_idx].copy_(new_touch)
+        self.kvduo_req_hot_capacity_gpu[owner] = new_capacity
+        self._reset_kvduo_hot_tail_ema(req_idx, layer_id)
+        if new_tokens.is_cuda:
+            finished = device_module.Event()
+            finished.record(device_module.current_stream(self.device))
+            finished.synchronize()
+        self.kvduo_req_hot_capacity[owner] = new_capacity
+        self._kvduo_req_layer_pages[owner] = kept_starts
+        for start in released_starts:
+            del self._kvduo_hot_page_owners[start]
+        self.token_to_kv_pool_allocator.free_hisparse_indices(released)
+        return len(released_starts) * self.page_size
+
+    def reclaim_kvduo_hot_pages(
+        self, num_tokens: int, *, excluded_owners: set[tuple[int, int]] | None = None
+    ) -> int:
+        """Merge mature owners by raw per-page EMA until the free pool suffices.
+
+        A snapshot is synchronous at this boundary. Other owners' scores do
+        not change while merging; the selected owner resets and is removed
+        from this pass, so it cannot be merged again without new observations.
+        """
+        if not self.enable_mixed_residency or num_tokens <= 0:
+            return 0
+        self._wait_kvduo_hot_merge_boundary()
+        protected = {
+            (layer_id, req_idx)
+            for layer_id, req_idx, _ in self._kvduo_hot_pressure_protected
+        }
+        protected.update(excluded_owners or ())
+        owners = []
         for (layer_id, req_idx), pages in self._kvduo_req_layer_pages.items():
-            minimum_pages = self.min_hot_pages
-            for page_index, start in enumerate(pages):
-                if len(pages) <= minimum_pages:
-                    continue
-                if (layer_id, req_idx, page_index) in protected:
-                    continue
-                candidates.append(
-                    (
-                        int(self.hot_page_last_touch[layer_id, req_idx, page_index]),
-                        layer_id,
-                        req_idx,
-                        page_index,
-                        start,
-                    )
-                )
-        candidates.sort(key=lambda item: (item[0], item[1], item[2], item[4]))
+            owner = (layer_id, req_idx)
+            req = self._active_kvduo_reqs.get(req_idx)
+            if (
+                owner in protected
+                or req is None
+                or getattr(req, "hisparse_staging", False)
+            ):
+                continue
+            target_pages = max(self.min_hot_pages, (len(pages) + 1) // 2)
+            if len(pages) > target_pages:
+                owners.append(owner)
+        if not owners:
+            return 0
+        indices = torch.tensor(owners, dtype=torch.int64, device=self.device).T
+        scores = self.kvduo_hot_tail_ema[indices[0], indices[1]].cpu().tolist()
+        steps = (
+            self.kvduo_hot_tail_observation_steps[indices[0], indices[1]].cpu().tolist()
+        )
+        candidates = sorted(
+            (score, owner)
+            for owner, score, observed in zip(owners, scores, steps)
+            if observed > self.kvduo_hot_tail_ema_min_observations
+            and math.isfinite(score)
+            and score >= 0
+        )
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        target_free = allocator.available_size() + num_tokens
         reclaimed = 0
-        # Indices change after removing a non-final page; locate each physical
-        # fragment again immediately before eviction.
-        for _, layer_id, req_idx, _, start in candidates:
-            pages = self._kvduo_req_layer_pages.get((layer_id, req_idx))
-            if pages is None or start not in pages:
-                continue
-            minimum_pages = self.min_hot_pages
-            if len(pages) <= minimum_pages:
-                continue
-            self._evict_kvduo_hot_fragment(layer_id, req_idx, pages.index(start))
-            reclaimed += self.page_size
-            if reclaimed >= num_tokens:
+        for _, (layer_id, req_idx) in candidates:
+            if allocator.available_size() >= target_free:
                 break
+            reclaimed += self._merge_kvduo_hot_pages(layer_id, req_idx)
         return reclaimed
 
     def has_ongoing_staging(self) -> bool:

@@ -534,6 +534,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.lru_slots = torch.arange(32, dtype=torch.int16).repeat(2, 1, 1)
         coordinator._kvduo_req_layer_pages = {}
         coordinator._kvduo_hot_page_owners = {}
+        coordinator._kvduo_pressure_protected = None
+        coordinator._kvduo_hot_pressure_protected = set()
+        coordinator.top_k = 2
         coordinator._reclaim_for_physical_allocation = MagicMock(
             return_value=SimpleNamespace(action=object())
         )
@@ -569,7 +572,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         self.assertEqual(coordinator._kvduo_req_layer_pages[(1, 0)], [20, 24])
 
-        coordinator._evict_kvduo_hot_fragment(1, 0, 1)
+        coordinator._merge_kvduo_hot_pages(1, 0)
         self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
         returned = (
             coordinator.token_to_kv_pool_allocator.free_hisparse_indices.call_args.args[
@@ -606,6 +609,8 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator._active_kvduo_reqs = {i: object() for i in range(requests)}
         coordinator._mixed_slots = [True] * requests
         coordinator._kvduo_pending_hot_minimum = set()
+        coordinator._kvduo_hot_pressure_protected = set()
+        coordinator._kvduo_req_layer_pages = {}
         coordinator.kvduo_resolver_stats = torch.zeros(
             (layers, requests, 2), dtype=torch.int32
         )
