@@ -160,7 +160,7 @@ def test_actual_shrink_resets_only_its_request_layer():
     coordinator.kvduo_hot_tail_ema.fill_(0.75)
     coordinator.kvduo_hot_tail_observation_steps.fill_(150)
 
-    coordinator._evict_kvduo_hot_fragment(1, 0, 1)
+    coordinator._merge_kvduo_hot_pages(1, 0)
 
     assert int(coordinator.kvduo_req_hot_capacity[1, 0]) == 4
     assert coordinator.kvduo_hot_tail_ema.tolist() == [[0.75, 0.75], [0, 0.75]]

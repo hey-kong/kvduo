@@ -955,3 +955,164 @@ def test_load_cache_to_device_buffer_rocm_large_lru_writeback() -> None:
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
+
+
+def test_kvduo_merge_copies_flat_c4_values_and_scales_before_freeing_pages():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.enable_mixed_residency = True
+    coordinator.is_dsv4_hisparse = True
+    coordinator.device = DEVICE
+    coordinator.decode_producer_stream = torch.cuda.current_stream()
+    coordinator._has_pending_backup = False
+    coordinator.page_size = DSV4_PAGE_SIZE
+    coordinator.hot_page_size = 2 * DSV4_PAGE_SIZE
+    coordinator.top_k = 2
+    coordinator.min_hot_pages = 1
+    coordinator._kvduo_hot_pressure_protected = set()
+    k = coordinator.hot_page_size
+    stride = 8 * DSV4_PAGE_SIZE
+    pages = [64, 128, 192, 256]
+    locs = [
+        start + layer * stride + offset
+        for start in pages
+        for layer in range(2)
+        for offset in range(64)
+    ]
+    backing = (
+        torch.arange(16 * DSV4_PAGE_BYTES, dtype=torch.int32, device=DEVICE)
+        .remainder(251)
+        .to(torch.uint8)
+        .view(16, DSV4_PAGE_BYTES)
+    )
+    coordinator.mem_pool_device = SimpleNamespace(get_flat_key_buffer=lambda: backing)
+    coordinator._kvduo_req_layer_pages = {(0, 0): list(pages)}
+    coordinator._kvduo_hot_page_owners = {start: (0, 0) for start in pages}
+    coordinator.kvduo_req_hot_capacity = torch.tensor([[4 * k]], dtype=torch.int64)
+    coordinator.kvduo_req_hot_capacity_gpu = torch.tensor(
+        [[4 * k]], dtype=torch.int32, device=DEVICE
+    )
+    coordinator.kvduo_hot_tail_ema = torch.tensor([[2.0]], device=DEVICE)
+    coordinator.kvduo_hot_tail_observation_steps = torch.tensor(
+        [[65]], dtype=torch.int64, device=DEVICE
+    )
+    coordinator.hot_page_last_touch = torch.ones(
+        (1, 1, 8), dtype=torch.int64, device=DEVICE
+    )
+    coordinator.req_device_buffer_tokens = torch.full(
+        (1, 1, 8 * k), -1, dtype=torch.int32, device=DEVICE
+    )
+    coordinator.req_device_buffer_tokens[0, 0, : 4 * k] = torch.arange(
+        10, 10 + 4 * k, dtype=torch.int32, device=DEVICE
+    )
+    coordinator.req_device_buffer_token_locs = torch.full_like(
+        coordinator.req_device_buffer_tokens, -1
+    )
+    coordinator.req_device_buffer_token_locs[0, 0, : 4 * k] = torch.tensor(
+        locs, dtype=torch.int32, device=DEVICE
+    )
+    survivors = [1] + list(range(k, 2 * k)) + list(range(3 * k, 4 * k - 1))
+    lru = [slot for slot in range(4 * k) if slot not in set(survivors)] + survivors
+    coordinator.lru_slots = torch.full(
+        (1, 1, 8 * k), -1, dtype=torch.int16, device=DEVICE
+    )
+    coordinator.lru_slots[0, 0, : 4 * k] = torch.tensor(
+        lru, dtype=torch.int16, device=DEVICE
+    )
+    expected = backing.cpu().clone()
+    src, dst = locs[1], locs[-1]  # one survivor moves across storage layers
+    for offset, width in ((0, DSV4_VALUE_BYTES), (DSV4_SCALE_OFFSET, DSV4_SCALE_BYTES)):
+        src_offset = offset + (src % 64) * width
+        dst_offset = offset + (dst % 64) * width
+        expected[dst // 64, dst_offset : dst_offset + width] = expected[
+            src // 64, src_offset : src_offset + width
+        ].clone()
+
+    def free_after_copy(indices):
+        assert torch.equal(backing.cpu(), expected)
+        assert coordinator._kvduo_req_layer_pages[(0, 0)] == [128, 256]
+        assert indices.cpu().tolist() == list(range(64, 128)) + list(range(192, 256))
+
+    free = MagicMock(side_effect=free_after_copy)
+    coordinator.token_to_kv_pool_allocator = SimpleNamespace(free_hisparse_indices=free)
+    assert coordinator._merge_kvduo_hot_pages(0, 0) == 2 * DSV4_PAGE_SIZE
+    free.assert_called_once()
+    assert coordinator.lru_slots[0, 0, : 2 * k].cpu().tolist() == [2 * k - 1] + list(
+        range(2 * k - 1)
+    )
+    assert coordinator.kvduo_hot_tail_ema.item() == 0
+    assert coordinator.kvduo_hot_tail_observation_steps.item() == 0
+
+
+def test_kvduo_resolver_graph_replays_after_actual_merge_without_recapture():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+    kwargs = _kvduo_hot_tail_ema_case()
+    load_cache_to_device_buffer_mla(**kwargs)
+    kwargs["hot_tail_ema_observe"].zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        load_cache_to_device_buffer_mla(**kwargs)
+    pointers = [
+        kwargs[key].data_ptr()
+        for key in (
+            "device_buffer_tokens",
+            "device_buffer_locs",
+            "lru_slots",
+            "req_hot_buffer_sizes",
+        )
+    ]
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.enable_mixed_residency = True
+    coordinator.is_dsv4_hisparse = False
+    coordinator.device = DEVICE
+    coordinator.decode_producer_stream = torch.cuda.current_stream()
+    coordinator._has_pending_backup = False
+    coordinator.page_size = coordinator.hot_page_size = 1
+    coordinator.top_k = coordinator.min_hot_pages = 2
+    coordinator._kvduo_hot_pressure_protected = set()
+    coordinator.mem_pool_device = SimpleNamespace(kv_buffer=[kwargs["device_buffer"]])
+    pages = kwargs["device_buffer_locs"][0, :4].cpu().tolist()
+    coordinator._kvduo_req_layer_pages = {(0, 0): pages}
+    coordinator._kvduo_hot_page_owners = {start: (0, 0) for start in pages}
+    coordinator.kvduo_req_hot_capacity = torch.tensor([[4]], dtype=torch.int64)
+    coordinator.kvduo_req_hot_capacity_gpu = kwargs["req_hot_buffer_sizes"].unsqueeze(0)
+    coordinator.kvduo_hot_tail_ema = kwargs["hot_tail_ema"].unsqueeze(0)
+    coordinator.kvduo_hot_tail_observation_steps = kwargs[
+        "hot_tail_observation_steps"
+    ].unsqueeze(0)
+    coordinator.req_device_buffer_tokens = kwargs["device_buffer_tokens"].unsqueeze(0)
+    coordinator.req_device_buffer_token_locs = kwargs["device_buffer_locs"].unsqueeze(0)
+    coordinator.lru_slots = kwargs["lru_slots"].unsqueeze(0)
+    coordinator.hot_page_last_touch = kwargs["hot_page_last_touch"].unsqueeze(0)
+    coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+        free_hisparse_indices=MagicMock()
+    )
+    assert coordinator._merge_kvduo_hot_pages(0, 0) == 2
+    assert pointers == [
+        kwargs[key].data_ptr()
+        for key in (
+            "device_buffer_tokens",
+            "device_buffer_locs",
+            "lru_slots",
+            "req_hot_buffer_sizes",
+        )
+    ]
+    kwargs["hot_tail_ema_observe"].fill_(1)
+    kwargs["top_k_tokens"][0] = torch.tensor([5, 4], dtype=torch.int32, device=DEVICE)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert kwargs["req_hot_buffer_sizes"].item() == 2
+    assert kwargs["hot_tail_observation_steps"].item() == 0  # F=0 after merge
+    for index, token in enumerate([5, 4]):
+        location = kwargs["top_k_device_locs"][0, index].item()
+        assert torch.equal(
+            kwargs["device_buffer"][location].cpu(), kwargs["host_cache"][token]
+        )

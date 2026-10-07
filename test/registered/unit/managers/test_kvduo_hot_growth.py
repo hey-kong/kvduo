@@ -30,6 +30,10 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
         (layers, requests, 2), dtype=torch.int32
     )
     coordinator.kvduo_hot_tail_ema_alpha = 1 / 64
+    coordinator.kvduo_hot_tail_ema_min_observations = 64
+    coordinator._kvduo_hot_pressure_protected = set()
+    coordinator._kvduo_pressure_protected = None
+    coordinator.is_dsv4_hisparse = False
     coordinator.kvduo_hot_tail_ema_observe = torch.ones(1, dtype=torch.int32)
     coordinator.kvduo_hot_tail_ema = torch.zeros(
         (layers, requests), dtype=torch.float32
@@ -67,23 +71,46 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
         return_value=SimpleNamespace(action=object())
     )
     coordinator._require_allocation_ready = MagicMock()
-    physical = SimpleNamespace(free_pages=free_pages, next_page=2)
+    physical = SimpleNamespace(free_pages=free_pages, next_page=2, released_starts=[])
 
     def allocate(slots):
         pages = slots // coordinator.page_size
         if pages > physical.free_pages:
             return None
-        start = physical.next_page
-        physical.next_page += slots
         physical.free_pages -= pages
-        return torch.arange(start, start + slots, dtype=torch.int64)
+        reused = physical.released_starts[:pages]
+        del physical.released_starts[: len(reused)]
+        starts = reused + list(
+            range(
+                physical.next_page,
+                physical.next_page + (pages - len(reused)) * coordinator.page_size,
+                coordinator.page_size,
+            )
+        )
+        physical.next_page += (pages - len(reused)) * coordinator.page_size
+        return torch.tensor(
+            [
+                slot
+                for start in starts
+                for slot in range(start, start + coordinator.page_size)
+            ],
+            dtype=torch.int64,
+        )
 
     physical.alloc = MagicMock(side_effect=allocate)
     physical.available_size = MagicMock(
         side_effect=lambda: physical.free_pages * coordinator.page_size
     )
+
+    def free(indices):
+        physical.free_pages += indices.numel() // coordinator.page_size
+        physical.released_starts.extend(
+            indices.view(-1, coordinator.page_size)[:, 0].tolist()
+        )
+
     coordinator.token_to_kv_pool_allocator = SimpleNamespace(
-        hisparse_attn_allocator=physical, free_hisparse_indices=MagicMock()
+        hisparse_attn_allocator=physical,
+        free_hisparse_indices=MagicMock(side_effect=free),
     )
     return coordinator, physical
 
