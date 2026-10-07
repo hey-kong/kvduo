@@ -137,11 +137,42 @@ resolver 遍历现有 `lru_slots` 时，以本轮更新前的排名识别 LRU �
 
 每次 merge 后重新检查空闲页数；仍有缺口时在其余合格对象中继续按原始 `q` 选择。剩余需求仅决定何时停止。已 merge 的对象统计归零，重新积累超过门槛的有效观察前不能再次 merge，因此同一轮不会反复缩小它。所有分配、搬运和释放均在 decode 步之间执行，resolver 元数据的地址与形状保持固定。
 
-### 7. 策略依据与限制
+### 7. Prefill 准入与增量页快速回收
+
+现有调度器仍决定请求顺序、分块和组批。KVDuo 在 chunk 和 host 前缀恢复范围确定后，检查主稀疏 KV 池所需的实际物理页，计入同轮其他 prefill 的预留及尚未补足的必需 HOT 容量。空间足够时正常准入；不足时完整规划快速回收，没有合格方案则保留请求等待，让 decode 推进。
+
+每次 merge 保留的物理页建立基础容量 `aK`。随后扩容只追加增量页，基础页内容继续正常参与条目 LRU 替换。resolver 按物理槽位是否位于 `[0, aK)`，区分基础页和增量页命中；这与 LRU 排名无关，也不恢复 merge 时的历史 KV 或 LRU。
+
+每个实际 decode 步维护四个计数的 EMA：有效访问 `D`、FULL/tail 直接命中 `H_direct`、基础页 HOT 命中 `H_base`、增量页 HOT 命中 `H_extra`。H2D 换入不计为命中；padding、无效访问和解析失败的步骤不形成有效观察，零命中步骤正常更新。使用同一个 `alpha=1/64`，首次观察直接初始化。当前 miss EMA 由 `M=D-H_direct-H_base-H_extra` 得到。
+
+merge 后清零统计，在基础容量下实际观察命中率。首次扩容冻结参考命中率 `h_ref` 和观察步数，并重新开始当前评估阶段；继续扩容保留当前统计。两个阶段都必须积累超过 64 次有效观察。过早扩容的对象缺少成熟参考，不能当作零损失候选。
+
+唯一准入参数 `max_relative_miss_increase` 默认 `0.10`，记为 `rho`。候选必须有增量页、请求仍活跃、未处于 staging、保护或扩容限制状态，且保留基础页后仍满足最低容量，并同时满足：
+
+```text
+H_extra <= rho * M
+D - H_direct - H_base <= (1 + rho) * (1 - h_ref) * D
+```
+
+第一式限制预计 miss 相对增幅，第二式检查基础容量相对于 merge 后参考的稳定性。当前 miss 为零时，仅允许 `H_extra=0`。不设置固定命中率下限或隐含容差。合格对象按 `H_extra / (b-a)` 升序选择，同分按对象顺序稳定处理，不按剩余缺口修正得分。
+
+连续准入共用一轮固定预算。首次成功快速回收前，记录活跃 decode 对象的参考 miss `M0`；每个回退对象记录当时的增量命中代价 `E`。后续新增方案必须满足 `sum(E) + sum(new H_extra) <= rho * sum(active reference M0)`。已预留代价不随 EMA 衰减，后加入的请求不扩大预算，也不能在这一轮成为新候选。请求结束时移除其参考 miss 和代价；解除某对象限制时移除其代价；所有限制解除后结束本轮。host 记录绑定请求槽位 generation，槽位复用清空旧状态。
+
+只有完整方案同时满足空间与预算条件后才执行释放，不先回收部分对象。一次批量 GPU metadata kernel 为每个对象启动一个 CTA，通过前缀和稳定过滤旧 LRU 中 `slot<aK` 的槽位。基础条目不搬运、不重新编号，空槽优先和存活条目的相对顺序保持不变。清空容量外的 token、location、LRU 和页元数据，发布基础容量；确认旧 decode、在途搬运及本次更新完成后统一归还增量整页。graph 捕获的张量地址、形状和 stride 保持固定。
+
+释放前先建立本次 prefill 的物理页预留和对象扩容限制。其他可选扩容只能使用未预留空间。回退对象清零尾部损失 `q/T`、当前贡献计数及观察步数，保留历史参考和本轮预留代价；正常执行 H2D 和条目 LRU，但不响应扩容事件，也不参与可选 merge。取消准入会撤销预留和相关限制，已经丢弃的 KV 不主动恢复。
+
+完成 prefill 分配后撤销该次物理页预留；对象限制仍保留，直到没有对应预留且物理池存在可选扩容余量。解除限制丢弃受限期间的事件，只允许后续新事件触发扩容，不立即恢复旧容量。Prefill 计算完成本身不释放新请求持有的 KV。
+
+例如，参考基础命中率为 80%，当前总体命中率为 83%，基础与直接命中贡献仍为 80%：释放增量页会让 miss 从 17% 增至 20%，相对增加约 17.6%，不满足默认预算。若总体为 81%、基础贡献为 80%，预计 miss 从 19% 增至 20%，相对增加约 5.3%；观察、稳定性、空间及本轮累计预算均满足时可以回退。
+
+### 8. 策略依据与限制
 
 尾部命中数除以可释放页数越小，说明近期这部分容量每页贡献的 HOT 命中越少。该策略倾向于回收超出近期热工作集需求的容量，以及低复用访问场景中贡献较少的容量，无需额外维护倾斜度、随机 top-k 检测、滑动窗口或独立 What-if 缓存。
 
 历史观察的权重经过 `k` 次有效更新后按 `(1 - alpha)^k` 衰减。扩容保留 EMA 和观察步数，因此得分可能混合不同容量阶段的单位页损失。它是近期缩容代价的平滑代理，不等于当前容量减半后的精确命中损失，也不保证未来访问的收益，需要离线回放和在线实验验证。
+
+Prefill 快速回收同样使用估计：基础页与增量页共同运行时的条目演化，不等于基础容量单独运行。严格遵守 miss 预算不代表能够严格保证未来命中率或 SLO。
 
 本设计借鉴 [Utility-Based Cache Partitioning（UCP）](https://www.eecs.northwestern.edu/~rjoseph/eecs453/papers/quereshi-micro2006.pdf) 按缓存资源收益分配空间的思想，使用真实 HOT 缓存的 LRU 尾部命中 EMA，不采用独立的效用监测缓存。
 
@@ -207,8 +238,9 @@ python3 -m sglang.launch_server \
 | `host_to_device_ratio` | `2` | host pool 相对 device pool 的容量比例。 |
 | `swap_in_block_size` | `960` | resolver CUDA thread block 的线程数，不是一次 H2D 搬运的 KV 条目数；范围为 1–1024。 |
 | `tail_protected_pages` | `2` | 每个请求不参与完整页回收的最新页数量。 |
+| `max_relative_miss_increase` | `0.10` | Prefill 快速回收允许的预计 miss 相对增幅；有限非负数，不与 EMA 的 `alpha` 绑定。 |
 
-所有字段必须是正整数，未知字段会报错。`--kvduo-config` 必须与 `--enable-kvduo` 一起使用。
+前四个字段必须是正整数；`max_relative_miss_increase` 可以是非负整数或小数。未知字段会报错。默认 `0.10` 是实验起点，尚未经在线实验确定为最优值。`--kvduo-config` 必须与 `--enable-kvduo` 一起使用。
 
 KVDuo 要求启用 RadixTree，且不能与 `--enable-hisparse`、`--enable-hierarchical-cache` 或 speculative decoding 同时启用。KVDuo 支持 chunked prefill；启用它不会改写 `--chunked-prefill-size`。
 

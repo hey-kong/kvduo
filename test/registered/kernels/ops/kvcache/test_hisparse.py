@@ -1116,3 +1116,146 @@ def test_kvduo_resolver_graph_replays_after_actual_merge_without_recapture():
         assert torch.equal(
             kwargs["device_buffer"][location].cpu(), kwargs["host_cache"][token]
         )
+
+
+@pytest.mark.parametrize(
+    "kind", ["mixed", "full", "miss", "invalid", "padding", "capture", "failed"]
+)
+def test_kvduo_prefill_contribution_counts_actual_slot_group_and_effective_accesses(
+    kind,
+):
+    kwargs = _kvduo_hot_tail_ema_case(selected=(2, 1))
+    counts = torch.zeros((1, 4), dtype=torch.float32, device=DEVICE)
+    steps = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+    kwargs.update(
+        hot_base_capacities=torch.tensor([2], dtype=torch.int32, device=DEVICE),
+        prefill_hit_ema=counts,
+        prefill_hit_steps=steps,
+    )
+    expected = [2, 0, 1, 1]  # slot2 extra, slot0 base, despite old LRU rank.
+    if kind == "full":
+        kwargs["req_hot_buffer_sizes"].zero_()
+        kwargs["full_to_device_loc"][1] = 9
+        kwargs["full_to_device_loc"][2] = 3
+        expected = [2, 2, 0, 0]
+    elif kind == "miss":
+        kwargs["top_k_tokens"].copy_(
+            torch.tensor([[3, 6]], dtype=torch.int32, device=DEVICE)
+        )
+        expected = [2, 0, 0, 0]
+    elif kind == "invalid":
+        kwargs["top_k_tokens"].copy_(
+            torch.tensor([[-1, 2]], dtype=torch.int32, device=DEVICE)
+        )
+        expected = [1, 0, 0, 1]
+    elif kind == "padding":
+        kwargs["num_real_reqs"].zero_()
+        expected = [0, 0, 0, 0]
+    elif kind == "capture":
+        kwargs["hot_tail_ema_observe"] = torch.zeros(
+            1, dtype=torch.int32, device=DEVICE
+        )
+        expected = [0, 0, 0, 0]
+    elif kind == "failed":
+        kwargs["top_k_tokens"].copy_(
+            torch.tensor([[3, 6]], dtype=torch.int32, device=DEVICE)
+        )
+        kwargs["full_host_version"].zero_()
+        expected = [0, 0, 0, 0]
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+    assert counts.cpu().tolist() == [expected]
+    assert steps.item() == int(kind not in {"padding", "capture", "failed"})
+
+
+def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru():
+    from sglang.kernels.ops.kvcache.hisparse import rollback_kvduo_hot_metadata
+
+    # Two selected owners and one untouched owner; physical slot ids differ
+    # from LRU rank, so truncating the permutation would be incorrect.
+    tokens = torch.arange(24, dtype=torch.int32, device=DEVICE).view(1, 3, 8)
+    locations = (tokens + 100).clone()
+    lru = torch.tensor(
+        [
+            [
+                [7, 3, 0, 6, 1, 5, 2, 4],
+                [6, 5, 4, 3, 2, 1, 0, 7],
+                [0, 1, 2, 3, 4, 5, 6, 7],
+            ]
+        ],
+        dtype=torch.int16,
+        device=DEVICE,
+    )
+    touch = torch.ones((1, 3, 4), dtype=torch.int64, device=DEVICE)
+    capacities = torch.full((1, 3), 8, dtype=torch.int32, device=DEVICE)
+    addresses = [t.data_ptr() for t in (tokens, locations, lru, touch, capacities)]
+    rollback_kvduo_hot_metadata(
+        torch.tensor([[0, 0], [0, 1]], dtype=torch.int64, device=DEVICE),
+        torch.tensor([4, 6], dtype=torch.int32, device=DEVICE),
+        tokens,
+        locations,
+        lru,
+        touch,
+        capacities,
+        2,
+    )
+    torch.cuda.synchronize()
+    assert lru.cpu().tolist() == [
+        [[3, 0, 1, 2, -1, -1, -1, -1], [5, 4, 3, 2, 1, 0, -1, -1], list(range(8))]
+    ]
+    assert capacities.cpu().tolist() == [[4, 6, 8]]
+    assert touch.cpu().tolist() == [[[1, 1, 0, 0], [1, 1, 1, 0], [1, 1, 1, 1]]]
+    assert addresses == [
+        t.data_ptr() for t in (tokens, locations, lru, touch, capacities)
+    ]
+    assert tokens[0, 0].cpu().tolist() == [0, 1, 2, 3, -1, -1, -1, -1]
+    assert locations[0, 1].cpu().tolist() == [108, 109, 110, 111, 112, 113, -1, -1]
+
+
+def test_kvduo_resolver_graph_replays_after_no_copy_rollback_without_recapture():
+    from sglang.kernels.ops.kvcache.hisparse import rollback_kvduo_hot_metadata
+
+    kwargs = _kvduo_hot_tail_ema_case()
+    kwargs.update(
+        hot_base_capacities=torch.tensor([2], dtype=torch.int32, device=DEVICE),
+        prefill_hit_ema=torch.zeros((1, 4), dtype=torch.float32, device=DEVICE),
+        prefill_hit_steps=torch.zeros(1, dtype=torch.int64, device=DEVICE),
+    )
+    load_cache_to_device_buffer_mla(**kwargs)
+    kwargs["hot_tail_ema_observe"].zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        load_cache_to_device_buffer_mla(**kwargs)
+    keys = (
+        "device_buffer_tokens",
+        "device_buffer_locs",
+        "lru_slots",
+        "req_hot_buffer_sizes",
+        "hot_base_capacities",
+        "prefill_hit_ema",
+        "prefill_hit_steps",
+    )
+    pointers = [kwargs[key].data_ptr() for key in keys]
+    rollback_kvduo_hot_metadata(
+        torch.tensor([[0, 0]], dtype=torch.int64, device=DEVICE),
+        torch.tensor([2], dtype=torch.int32, device=DEVICE),
+        kwargs["device_buffer_tokens"][:, :4].unsqueeze(0),
+        kwargs["device_buffer_locs"][:, :4].unsqueeze(0),
+        kwargs["lru_slots"].unsqueeze(0),
+        kwargs["hot_page_last_touch"].unsqueeze(0),
+        kwargs["req_hot_buffer_sizes"].unsqueeze(0),
+        1,
+    )
+    kwargs["prefill_hit_ema"].zero_()
+    kwargs["prefill_hit_steps"].zero_()
+    kwargs["hot_tail_ema_observe"].fill_(1)
+    kwargs["top_k_tokens"].copy_(
+        torch.tensor([[1, 6]], dtype=torch.int32, device=DEVICE)
+    )
+    graph.replay()
+    torch.cuda.synchronize()
+    assert kwargs["top_k_device_locs"].cpu().tolist() == [[9, 7]]
+    assert kwargs["prefill_hit_ema"].cpu().tolist() == [[2, 0, 1, 0]]
+    assert kwargs["prefill_hit_steps"].item() == 1
+    assert pointers == [kwargs[key].data_ptr() for key in keys]
+    assert torch.equal(kwargs["device_buffer"][7].cpu(), kwargs["host_cache"][6])

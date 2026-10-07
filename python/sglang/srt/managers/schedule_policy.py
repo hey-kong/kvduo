@@ -443,6 +443,7 @@ class AddReqResult(Enum):
 
 
 class PrefillAdder:
+
     def __init__(
         self,
         page_size: int,
@@ -460,6 +461,7 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        kvduo_coordinator=None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -550,6 +552,31 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+        self.kvduo_coordinator = kvduo_coordinator
+        self.kvduo_prefill_reservations = []
+
+    def _reserve_kvduo_prefill(self, req: Req, end: int):
+        coordinator = getattr(self, "kvduo_coordinator", None)
+        if coordinator is None or not coordinator.enable_mixed_residency:
+            return True, None
+        pages = coordinator.kvduo_prefill_pages(len(req.prefix_indices), end)
+        indices = (
+            [
+                r.req_pool_idx
+                for r in self.running_batch.reqs
+                if r.req_pool_idx is not None
+                and not r.finished()
+                and not getattr(r, "hisparse_staging", False)
+            ]
+            if self.running_batch is not None
+            else []
+        )
+        token = coordinator.reserve_kvduo_prefill(pages, indices)
+        if token is None:
+            self.kvduo_prefill_blocked = True
+            return False, None
+        self.kvduo_prefill_reservations.append(token)
+        return True, token
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -900,6 +927,11 @@ class PrefillAdder:
         )
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        admitted, _ = self._reserve_kvduo_prefill(
+            req, len(req.prefix_indices) + new_len
+        )
+        if not admitted:
+            return req
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -1207,6 +1239,17 @@ class PrefillAdder:
             ):
                 return AddReqResult.OTHER
 
+            planned_end = (
+                prospective_prefix_len + trunc_len
+                if trunc_len is not None
+                else len(req.full_untruncated_fill_ids)
+            )
+            admitted, reservation = self._reserve_kvduo_prefill(req, planned_end)
+            if not admitted:
+                # This is a transient physical-page deficit. Keep trying on
+                # later passes instead of marking the decode batch full.
+                return AddReqResult.OTHER
+            old_prefix_len = len(req.prefix_indices)
             if req.needs_host_load_back():
                 new_indices, restored_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
@@ -1220,11 +1263,22 @@ class PrefillAdder:
                 # leave the request and its host-prefix references intact so a
                 # later scheduling pass can retry safely.
                 if new_indices is None:
+                    if reservation is not None:
+                        self.kvduo_coordinator.finish_kvduo_prefill_reservation(
+                            reservation, cancelled=True
+                        )
                     return AddReqResult.OTHER
                 req.last_node = restored_node
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+                if reservation is not None:
+                    restored_pages = self.kvduo_coordinator.kvduo_prefill_pages(
+                        old_prefix_len, prefix_len
+                    )
+                    self.kvduo_coordinator.consume_kvduo_prefill_reservation(
+                        reservation, restored_pages
+                    )
 
                 if prefix_len != prospective_prefix_len:
                     # Ordinary HiCache may decline or partially satisfy a
