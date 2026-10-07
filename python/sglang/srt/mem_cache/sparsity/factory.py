@@ -145,6 +145,7 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         "host_to_device_ratio",
         "swap_in_block_size",
         "tail_protected_pages",
+        "max_relative_miss_increase",
     }
     unknown = set(values) - known
     if unknown:
@@ -170,11 +171,17 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
             f"swap_in_block_size ({block_size}) must be in the range [1, 1024]"
         )
 
+    from sglang.srt.mem_cache.sparsity.core.kvduo_prefill_rollback import (
+        KVDuoPrefillPolicy,
+    )
+
+    policy = KVDuoPrefillPolicy(values.get("max_relative_miss_increase", 0.10))
     return KVDuoConfig(
         top_k=top_k,
         host_to_device_ratio=ratio,
         swap_in_block_size=block_size,
         tail_protected_pages=tail_pages,
+        max_relative_miss_increase=policy.max_relative_miss_increase,
     )
 
 

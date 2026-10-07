@@ -109,10 +109,13 @@ def _load_cache_to_device_buffer_mla(
     hot_tail_observation_steps: torch.Tensor | None = None,
     hot_tail_ema_alpha: float = DEFAULT_KVDUO_HOT_TAIL_EMA_ALPHA,
     hot_tail_ema_observe: torch.Tensor | None = None,
+    hot_base_capacities: torch.Tensor | None = None,
+    prefill_hit_ema: torch.Tensor | None = None,
+    prefill_hit_steps: torch.Tensor | None = None,
 ) -> None:
-    assert hot_buffer_size >= num_top_k, (
-        f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
-    )
+    assert (
+        hot_buffer_size >= num_top_k
+    ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
 
     module = _jit_sparse_module(
         item_size_bytes,
@@ -195,6 +198,23 @@ def _load_cache_to_device_buffer_mla(
         assert hot_tail_ema_observe.dtype == torch.int32
         assert hot_tail_ema_observe.numel() == 1
         assert hot_tail_ema_observe.device == top_k_tokens.device
+    if any(
+        t is not None for t in (hot_base_capacities, prefill_hit_ema, prefill_hit_steps)
+    ):
+        assert all(
+            t is not None
+            for t in (hot_base_capacities, prefill_hit_ema, prefill_hit_steps)
+        )
+        assert enable_full_lookup and enable_dynamic_hot_view
+        assert hot_base_capacities.dtype == torch.int32
+        assert prefill_hit_ema.dtype == torch.float32
+        assert prefill_hit_steps.dtype == torch.int64
+        requests = device_buffer_tokens.size(0)
+        assert hot_base_capacities.shape == (requests,)
+        assert prefill_hit_steps.shape == (requests,)
+        assert prefill_hit_ema.shape == (requests, 4)
+        for tensor in (hot_base_capacities, prefill_hit_ema, prefill_hit_steps):
+            assert tensor.is_contiguous() and tensor.device == top_k_tokens.device
     module.load_cache_to_device_buffer(
         top_k_tokens.data_ptr(),
         device_buffer_tokens.data_ptr(),
@@ -239,6 +259,9 @@ def _load_cache_to_device_buffer_mla(
         hot_tail_observation_steps.data_ptr() if hot_tail_ema is not None else 0,
         float(hot_tail_ema_alpha),
         hot_tail_ema_observe.data_ptr() if hot_tail_ema_observe is not None else 0,
+        hot_base_capacities.data_ptr() if hot_base_capacities is not None else 0,
+        prefill_hit_ema.data_ptr() if prefill_hit_ema is not None else 0,
+        prefill_hit_steps.data_ptr() if prefill_hit_steps is not None else 0,
     )
 
 
@@ -275,6 +298,9 @@ def load_cache_to_device_buffer_mla(
     hot_tail_observation_steps: torch.Tensor | None = None,
     hot_tail_ema_alpha: float = DEFAULT_KVDUO_HOT_TAIL_EMA_ALPHA,
     hot_tail_ema_observe: torch.Tensor | None = None,
+    hot_base_capacities: torch.Tensor | None = None,
+    prefill_hit_ema: torch.Tensor | None = None,
+    prefill_hit_steps: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
     _load_cache_to_device_buffer_mla(
@@ -311,6 +337,9 @@ def load_cache_to_device_buffer_mla(
         hot_tail_observation_steps=hot_tail_observation_steps,
         hot_tail_ema_alpha=hot_tail_ema_alpha,
         hot_tail_ema_observe=hot_tail_ema_observe,
+        hot_base_capacities=hot_base_capacities,
+        prefill_hit_ema=prefill_hit_ema,
+        prefill_hit_steps=prefill_hit_steps,
     )
 
 
@@ -347,6 +376,9 @@ def load_cache_to_device_buffer_dsv4_mla(
     hot_tail_observation_steps: torch.Tensor | None = None,
     hot_tail_ema_alpha: float = DEFAULT_KVDUO_HOT_TAIL_EMA_ALPHA,
     hot_tail_ema_observe: torch.Tensor | None = None,
+    hot_base_capacities: torch.Tensor | None = None,
+    prefill_hit_ema: torch.Tensor | None = None,
+    prefill_hit_steps: torch.Tensor | None = None,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -383,4 +415,63 @@ def load_cache_to_device_buffer_dsv4_mla(
         hot_tail_observation_steps=hot_tail_observation_steps,
         hot_tail_ema_alpha=hot_tail_ema_alpha,
         hot_tail_ema_observe=hot_tail_ema_observe,
+        hot_base_capacities=hot_base_capacities,
+        prefill_hit_ema=prefill_hit_ema,
+        prefill_hit_steps=prefill_hit_steps,
+    )
+
+
+@functools.cache
+def _jit_kvduo_rollback_module(capacity: int, block_size: int):
+    args = make_cpp_args(capacity, block_size)
+    return load_jit(
+        "kvduo_prefill_rollback",
+        capacity,
+        block_size,
+        cuda_files=["kvduo_prefill_rollback.cuh"],
+        cuda_wrappers=[("rollback", f"kvduo_prefill_rollback<{args}>")],
+    )
+
+
+def rollback_kvduo_hot_metadata(
+    owners: torch.Tensor,
+    targets: torch.Tensor,
+    tokens: torch.Tensor,
+    locations: torch.Tensor,
+    lru: torch.Tensor,
+    page_touch: torch.Tensor,
+    capacities: torch.Tensor,
+    slots_per_page: int,
+) -> None:
+    """One batched metadata launch; no KV payload is read or moved."""
+    if owners.numel() == 0:
+        return
+    if not tokens.is_cuda:
+        # CPU reference also exercises publication/free ordering in unit tests.
+        for (layer, req), target in zip(owners.tolist(), targets.tolist()):
+            old = int(capacities[layer, req])
+            order = lru[layer, req, :old].clone()
+            filtered = order[(order >= 0) & (order < target)]
+            lru[layer, req, :target] = filtered
+            lru[layer, req, target:] = -1
+            tokens[layer, req, target:] = -1
+            locations[layer, req, target:] = -1
+            page_touch[layer, req, target // slots_per_page :] = 0
+            capacities[layer, req] = target
+        return
+    assert owners.dtype == torch.int64 and owners.is_contiguous()
+    assert targets.dtype == torch.int32 and targets.is_contiguous()
+    assert owners.ndim == 2 and owners.size(1) == 2
+    assert targets.numel() == owners.size(0)
+    for tensor in (tokens, locations, lru, page_touch, capacities):
+        assert tensor.is_contiguous() and tensor.device == owners.device
+    _jit_kvduo_rollback_module(tokens.size(2), 256).rollback(
+        owners,
+        targets,
+        tokens,
+        locations,
+        lru,
+        page_touch,
+        capacities,
+        slots_per_page,
     )

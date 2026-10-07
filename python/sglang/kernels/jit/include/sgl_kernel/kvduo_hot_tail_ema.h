@@ -36,6 +36,24 @@ SGLANG_KVDUO_HOST_DEVICE inline void kvduo_update_hot_tail_ema(
   ++observation_steps;
 }
 
+// Actual resolver observations, without counting freshly swapped-in entries
+// as hits. Zero-hit steps with valid accesses still update all four EMAs.
+SGLANG_KVDUO_HOST_DEVICE inline void kvduo_update_prefill_hit_ema(
+    int accesses,
+    int direct_hits,
+    int base_hits,
+    int extra_hits,
+    float alpha,
+    float* counts,
+    int64_t& observation_steps) {
+  if (accesses <= 0) return;
+  const int values[4] = {accesses, direct_hits, base_hits, extra_hits};
+  for (int i = 0; i < 4; ++i) {
+    counts[i] = observation_steps == 0 ? static_cast<float>(values[i]) : (1.0f - alpha) * counts[i] + alpha * values[i];
+  }
+  ++observation_steps;
+}
+
 }  // namespace sglang
 
 #undef SGLANG_KVDUO_HOST_DEVICE

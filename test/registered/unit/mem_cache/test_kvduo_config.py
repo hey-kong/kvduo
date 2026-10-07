@@ -41,5 +41,30 @@ class TestKVDuoConfig(unittest.TestCase):
             parse_kvduo_config(SimpleNamespace(kvduo_config='{"unknown": 1}'))
 
 
+class TestKVDuoPrefillConfig(unittest.TestCase):
+    def test_relative_miss_default_and_override(self):
+        self.assertEqual(
+            parse_kvduo_config(
+                SimpleNamespace(kvduo_config=None)
+            ).max_relative_miss_increase,
+            0.10,
+        )
+        config = parse_kvduo_config(
+            SimpleNamespace(kvduo_config='{"max_relative_miss_increase": 0.25}')
+        )
+        self.assertEqual(config.max_relative_miss_increase, 0.25)
+
+    def test_invalid_relative_miss_values_and_removed_absolute_thresholds(self):
+        for raw in [
+            '{"max_relative_miss_increase": -0.1}',
+            '{"max_relative_miss_increase": true}',
+            '{"max_relative_miss_increase": "0.1"}',
+            '{"max_relative_miss_increase": NaN}',
+            '{"prefill_h_min": 0.8}',
+        ]:
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                parse_kvduo_config(SimpleNamespace(kvduo_config=raw))
+
+
 if __name__ == "__main__":
     unittest.main()

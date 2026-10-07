@@ -30,6 +30,9 @@ extern "C" int releasable(int capacity, int k, int top_k) {
 extern "C" void observe(int hits, int pages, float alpha, float* q, int64_t* t) {
   sglang::kvduo_update_hot_tail_ema(hits, pages, alpha, *q, *t);
 }
+extern "C" void observe_prefill(int d, int direct, int base, int extra, float alpha, float* counts, int64_t* t) {
+  sglang::kvduo_update_prefill_hit_ema(d, direct, base, extra, alpha, counts, *t);
+}
 """
     )
     include = Path(__file__).parents[4] / "python/sglang/kernels/jit/include"
@@ -61,6 +64,12 @@ extern "C" void observe(int hits, int pages, float alpha, float* q, int64_t* t) 
         ctypes.POINTER(ctypes.c_int64),
     ]
     native.observe.restype = None
+    native.observe_prefill.argtypes = [ctypes.c_int] * 4 + [
+        ctypes.c_float,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_int64),
+    ]
+    native.observe_prefill.restype = None
     return native
 
 

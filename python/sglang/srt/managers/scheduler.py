@@ -3119,10 +3119,17 @@ class Scheduler(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
 
-        ret, running_batch = self._get_new_batch_prefill_raw(
-            prefill_delayer_single_pass=prefill_delayer_single_pass,
-            running_batch=running_batch,
+        coordinator = self.hisparse_coordinator
+        scope = (
+            coordinator.kvduo_prefill_reservation_scope()
+            if coordinator is not None and coordinator.enable_mixed_residency
+            else nullcontext()
         )
+        with scope:
+            ret, running_batch = self._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+                running_batch=running_batch,
+            )
 
         if self.prefill_delayer:
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
@@ -3211,11 +3218,14 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            kvduo_coordinator=self.hisparse_coordinator,
         )
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            if getattr(adder, "kvduo_prefill_blocked", False):
+                return None, running_batch
 
         if self.enable_lora:
             running_loras = {
@@ -3350,6 +3360,14 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+        if (
+            self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.enable_mixed_residency
+        ):
+            for token in adder.kvduo_prefill_reservations:
+                self.hisparse_coordinator.finish_kvduo_prefill_reservation(
+                    token, cancelled=False
+                )
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
