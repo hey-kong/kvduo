@@ -102,14 +102,23 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None,
+    num_tokens: int,
+    *,
+    allocator: BaseTokenToKVPoolAllocator | None = None,
+):
     if tree_cache is None:
         return
 
     if tree_cache.is_chunk_cache():
         return
 
-    allocator = tree_cache.token_to_kv_pool_allocator
+    # KVDuo checks its physical pool separately, against compressed page needs.
+    # Let that caller retain normal logical/SWA eviction without the physical
+    # minimum in the wrapper turning a logical page request into over-eviction.
+    if allocator is None:
+        allocator = tree_cache.token_to_kv_pool_allocator
 
     if isinstance(allocator, SWATokenToKVPoolAllocator):
         # Hybrid allocator

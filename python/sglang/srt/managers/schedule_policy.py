@@ -575,7 +575,12 @@ class PrefillAdder:
             if self.running_batch is not None
             else []
         )
-        token = coordinator.reserve_kvduo_prefill(pages, indices)
+        token = coordinator.reserve_kvduo_prefill(
+            pages,
+            indices,
+            tree_cache=self.tree_cache,
+            prefix_indices=req.prefix_indices,
+        )
         if token is None:
             self.kvduo_prefill_blocked = True
             return False, None

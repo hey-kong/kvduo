@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
 )
@@ -1210,7 +1211,11 @@ class HiSparseCoordinator:
         return num_slots // self.page_size * self._physical_page_bytes()
 
     def _reclaim_for_physical_allocation(
-        self, need_size: int, *, turnover_size: int = 0
+        self,
+        need_size: int,
+        *,
+        turnover_size: int = 0,
+        reserve_hot_minimum: bool = False,
     ) -> KVDuoPressureResult:
         """Reclaim full pages for an imminent sparse-pool allocation only.
 
@@ -1230,12 +1235,44 @@ class HiSparseCoordinator:
                 ),
             )
         physical_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
-        available_slots = (
-            physical_allocator.available_size() // self.page_size * self.page_size
+        minimum_slots = (
+            self._kvduo_mandatory_hot_pages() * self.page_size
+            if reserve_hot_minimum
+            else 0
         )
+        reserved_slots = (
+            self._kvduo_reserved_prefill_pages() * self.page_size
+            if reserve_hot_minimum
+            else 0
+        )
+
+        def available_slots():
+            # FULL reclamation may make another request mixed. Account for
+            # the newly introduced minimum in addition to the initial demand.
+            added_minimum = (
+                max(
+                    0,
+                    self._kvduo_mandatory_hot_pages() * self.page_size - minimum_slots,
+                )
+                if reserve_hot_minimum
+                else 0
+            )
+            return (
+                max(
+                    0,
+                    physical_allocator.available_size()
+                    - reserved_slots
+                    - added_minimum,
+                )
+                // self.page_size
+                * self.page_size
+            )
+
         plan = plan_kvduo_allocation(
-            available_main_kv_bytes=self._physical_bytes(available_slots),
-            requested_hot_bytes=self._physical_bytes(need_size - turnover_size),
+            available_main_kv_bytes=self._physical_bytes(available_slots()),
+            requested_hot_bytes=self._physical_bytes(
+                need_size - turnover_size + minimum_slots
+            ),
             incremental_turnover_bytes=self._physical_bytes(turnover_size),
         )
         if not self.enable_mixed_residency:
@@ -1264,22 +1301,25 @@ class HiSparseCoordinator:
             pages = (
                 shortfall_bytes + self._physical_page_bytes() - 1
             ) // self._physical_page_bytes()
-            reclaimed_slots = self.reclaim_kvduo_full_pages(pages * self.page_size)
+            if reserve_hot_minimum:
+                reclaimed_slots = self.reclaim_kvduo_full_pages(
+                    pages * self.page_size, reserve_hot_minimum=True
+                )
+                remaining = max(0, need_size + minimum_slots - available_slots())
+            else:
+                reclaimed_slots = self.reclaim_kvduo_full_pages(pages * self.page_size)
+                remaining = pages * self.page_size - reclaimed_slots
             # Full pages are always the first victims. Only after every legal
             # non-tail full victim has been consumed may pressure spill into
             # request/layer-private hot pages.
-            if reclaimed_slots < pages * self.page_size:
-                reclaimed_slots += self.reclaim_kvduo_hot_pages(
-                    pages * self.page_size - reclaimed_slots
-                )
+            if remaining > 0:
+                reclaimed_slots += self.reclaim_kvduo_hot_pages(remaining)
             return reclaimed_slots // self.page_size * self._physical_page_bytes()
 
         return execute_kvduo_pressure_plan(
             plan,
             reclaim_full_pages=reclaim_bytes,
-            available_bytes=lambda: self._physical_bytes(
-                physical_allocator.available_size() // self.page_size * self.page_size
-            ),
+            available_bytes=lambda: self._physical_bytes(available_slots()),
             # This path waits for outstanding backup before page selection, so
             # no pending DMA can independently make a failed plan progress.
             dma_can_make_progress=False,
@@ -1299,10 +1339,40 @@ class HiSparseCoordinator:
         """Make an imminent decode allocation possible without partial state."""
         if physical_slots == 0:
             return True
-        result = self._reclaim_for_physical_allocation(physical_slots)
+        result = self._reclaim_for_physical_allocation(
+            physical_slots, reserve_hot_minimum=self.enable_mixed_residency
+        )
         return result.action is KVDuoPressureAction.SUCCESS
 
-    def ensure_kvduo_decode_capacity(self, requests) -> KVDuoPressureResult:
+    def _reclaim_kvduo_radix_pages(self, required_pages: int, tree_cache) -> None:
+        """Materialize evictable FULL budget before considering active owners.
+
+        Host-only cache entries may release logical slots without releasing a
+        physical page. Keep evicting while the cache makes progress, and always
+        measure the dedicated physical pool rather than the wrapper's minimum.
+        """
+        if tree_cache is None:
+            return
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        while allocator.available_size() // self.page_size < required_pages:
+            evictable = (
+                tree_cache.full_evictable_size()
+                if self.is_dsv4_hisparse
+                else tree_cache.evictable_size()
+            )
+            if evictable <= 0:
+                break
+            self._wait_kvduo_hot_merge_boundary()
+            shortage = required_pages - allocator.available_size() // self.page_size
+            evicted = tree_cache.evict(
+                EvictParams(num_tokens=shortage * self.page_size * self.compress_ratio)
+            )
+            if evicted.num_tokens_evicted <= 0:
+                break
+
+    def ensure_kvduo_decode_capacity(
+        self, requests, *, tree_cache=None
+    ) -> KVDuoPressureResult:
         """Reserve the exact main sparse-KV pages needed by ordinary decode.
 
         This is deliberately separate from the composite allocator's
@@ -1325,7 +1395,15 @@ class HiSparseCoordinator:
             pages = sum(
                 int(req.kv_committed_len % logical_page == 0) for req in requests
             )
-        return self._reclaim_for_physical_allocation(pages * self.page_size)
+        self._reclaim_kvduo_radix_pages(
+            pages
+            + self._kvduo_mandatory_hot_pages()
+            + self._kvduo_reserved_prefill_pages(),
+            tree_cache,
+        )
+        return self._reclaim_for_physical_allocation(
+            pages * self.page_size, reserve_hot_minimum=True
+        )
 
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
@@ -1380,10 +1458,11 @@ class HiSparseCoordinator:
             # Staging materializes the complete prefill range. Appending to an
             # incomplete final page will lower this boundary to its page start.
             self._kvduo_host_valid_len[req.req_pool_idx] = compressed_len
-            radix_page_size = self.token_to_kv_pool_allocator.page_size
-            req.kvduo_radix_insert_len = (
-                allocated_len // radix_page_size * radix_page_size
-            )
+            # Until the first demotion, decode can extend the complete prefix.
+            # An initial prefill-length cap would discard those complete pages
+            # at finish. Clear a previous incarnation's first-hole marker.
+            if hasattr(req, "kvduo_radix_insert_len"):
+                del req.kvduo_radix_insert_len
 
             # A fully-resident KVDuo request does not own a speculative hot
             # buffer. The first FULL demotion schedules the whole-page minimum
@@ -2556,19 +2635,54 @@ class HiSparseCoordinator:
         return result
 
     def reserve_kvduo_prefill(
-        self, pages: int, decode_req_indices: Sequence[int]
+        self,
+        pages: int,
+        decode_req_indices: Sequence[int],
+        *,
+        tree_cache=None,
+        prefix_indices: torch.Tensor | None = None,
     ) -> int | None:
         """Check one fixed round's miss budget before any no-copy rollback."""
         self._wait_kvduo_hot_merge_boundary()
         self._prune_kvduo_prefill_budget()
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
-        shortage = max(
-            0,
+        self._reclaim_kvduo_radix_pages(
             pages
             + self._kvduo_reserved_prefill_pages()
-            + self._kvduo_mandatory_hot_pages()
-            - allocator.available_size() // self.page_size,
+            + self._kvduo_mandatory_hot_pages(),
+            tree_cache,
         )
+
+        def physical_shortage():
+            return max(
+                0,
+                pages
+                + self._kvduo_reserved_prefill_pages()
+                + self._kvduo_mandatory_hot_pages()
+                - allocator.available_size() // self.page_size,
+            )
+
+        shortage = physical_shortage()
+        if shortage:
+            # Preserve the incoming GPU prefix, including a partial page.
+            previous = self._kvduo_pressure_protected
+            if prefix_indices is not None:
+                protected = self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    prefix_indices
+                )
+                self._kvduo_pressure_protected = (
+                    protected if previous is None else torch.cat((previous, protected))
+                )
+            try:
+                # Prefill may reclaim legal FULL pages, but generic HOT merge
+                # must never bypass the rollback loss budget below. New mixed
+                # owners' minimum capacities are charged before demotion.
+                self.reclaim_kvduo_full_pages(
+                    shortage * self.page_size, reserve_hot_minimum=True
+                )
+            finally:
+                self._kvduo_pressure_protected = previous
+            shortage = physical_shortage()
         plan = ()
         objects = []
         if shortage:
@@ -3231,12 +3345,11 @@ class HiSparseCoordinator:
             full_hi = torch.unique(full_hi[full_hi > 0])
             if all_hi.numel() > 0:
                 full_hi = full_hi[~torch.isin(full_hi, all_hi)]
-            if full_hi.numel() > 0:
-                self.token_to_kv_pool_allocator.free_hisparse_indices(full_hi)
-        if is_mixed:
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 owned_compressed_locs
             ] = 0
+            if full_hi.numel() > 0:
+                self.token_to_kv_pool_allocator.free_hisparse_indices(full_hi)
         elif not self.enable_mixed_residency:
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 compressed_locs
@@ -3289,8 +3402,10 @@ class HiSparseCoordinator:
             self._active_kvduo_reqs.pop(req.req_pool_idx, None)
             self._kvduo_pending_hot_minimum.discard(req.req_pool_idx)
 
-    def reclaim_kvduo_full_pages(self, num_tokens: int) -> int:
-        """Demote cold request-owned full pages to satisfy decode pressure.
+    def reclaim_kvduo_full_pages(
+        self, num_tokens: int, *, reserve_hot_minimum: bool = False
+    ) -> int:
+        """Demote cold request-owned full pages for mandatory physical pressure.
 
         The host copy is complete before requests leave staging. This control
         path may synchronize only when allocation pressure occurs; steady-state
@@ -3362,13 +3477,49 @@ class HiSparseCoordinator:
             ),
         )
 
+        minimum_costs = {}
+        if reserve_hot_minimum:
+            # The first FULL demotion needs minimum HOT capacity in EVERY
+            # logical layer. An allocation cannot count these as free space,
+            # or make a fully resident request mixed without room to execute.
+            counts = {}
+            for i in order:
+                req_idx = candidate_meta[i][0]
+                counts[req_idx] = counts.get(req_idx, 0) + 1
+            for req_idx in counts:
+                minimum_costs[req_idx] = (
+                    0
+                    if req_idx in self._kvduo_pending_hot_minimum
+                    else sum(
+                        max(
+                            0,
+                            self.min_hot_pages
+                            - int(self.kvduo_req_hot_capacity[layer, req_idx])
+                            // self.hot_page_size,
+                        )
+                        for layer in range(self.mem_pool_device.layer_num)
+                    )
+                )
+            # Reclaiming these owners cannot produce net usable capacity.
+            order = [
+                i
+                for i in order
+                if counts[candidate_meta[i][0]] > minimum_costs[candidate_meta[i][0]]
+            ]
+
         reclaimed = 0
+        charged = set()
+        minimum_slots = 0
         selected = []
         for i in order:
-            if reclaimed >= num_tokens:
+            if reclaimed - minimum_slots >= num_tokens:
                 break
             selected.append(i)
             reclaimed += self.page_size
+            req_idx = candidate_meta[i][0]
+            if req_idx not in charged:
+                minimum_slots += minimum_costs.get(req_idx, 0) * self.page_size
+                charged.add(req_idx)
 
         if not selected:
             return 0
@@ -3378,18 +3529,19 @@ class HiSparseCoordinator:
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
             selected_logical.flatten()
         ] = 0
-        self.token_to_kv_pool_allocator.free_hisparse_indices(
-            selected_physical.flatten()
-        )
         for i in selected:
             req_idx, start = candidate_meta[i]
             req = self._active_kvduo_reqs[req_idx]
             req.kvduo_mixed_residency = True
             req.kvduo_radix_insert_len = min(
-                req.kvduo_radix_insert_len, start * self.compress_ratio
+                getattr(req, "kvduo_radix_insert_len", start * self.compress_ratio),
+                start * self.compress_ratio,
             )
             self._mixed_slots[req_idx] = True
             self._kvduo_pending_hot_minimum.add(req_idx)
+        self.token_to_kv_pool_allocator.free_hisparse_indices(
+            selected_physical.flatten()
+        )
         return reclaimed
 
     def swap_in_selected_pages(

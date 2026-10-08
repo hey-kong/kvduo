@@ -21,8 +21,13 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
     coordinator.min_hot_pages = (top_k + 3) // 4
     coordinator.device_buffer_size = 32
     coordinator.mem_pool_device = SimpleNamespace(
-        layer_num=layers, flat_layer_slot_stride=10000
+        layer_num=layers,
+        flat_layer_slot_stride=10000,
+        translate_loc_from_full_to_compressed=lambda indices: indices,
     )
+    # These focused HOT fixtures have no FULL backing; pressure/admission
+    # regressions bind the real FULL reclaimer to a complete backing fixture.
+    coordinator.reclaim_kvduo_full_pages = MagicMock(return_value=0)
     coordinator._active_kvduo_reqs = {req_idx: object() for req_idx in range(requests)}
     coordinator._mixed_slots = [True] * requests
     coordinator._kvduo_pending_hot_minimum = set(range(requests))

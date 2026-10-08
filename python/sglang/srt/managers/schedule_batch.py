@@ -97,6 +97,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.sparsity.core.kvduo_state import KVDuoPressureAction
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -2745,7 +2746,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         """Reclaim evictable tree-cache entries (shortfall only), then report
         whether the next decode step fits in the KV pool."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        evict_from_tree_cache(self.tree_cache, num_tokens)
         if (
             self.hisparse_coordinator is not None
             and self.hisparse_coordinator.enable_mixed_residency
@@ -2755,10 +2755,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if selected_indices is None
                 else [self.reqs[i] for i in selected_indices]
             )
-            # Only main sparse-KV physical pressure is handled by KVDuo.  A
-            # logical/SWA/indexer shortage still falls through to the normal
-            # retract decision below.
-            self.hisparse_coordinator.ensure_kvduo_decode_capacity(requests)
+            logical = self.token_to_kv_pool_allocator.logical_attn_allocator
+            evict_from_tree_cache(self.tree_cache, num_tokens, allocator=logical)
+            if logical.available_size() < num_tokens:
+                return False
+            # Logical pages and compressed physical pages turn over on
+            # different steps. Never compare their needs through a minimum,
+            # and do not discard an unsuccessful physical pressure result.
+            pressure = self.hisparse_coordinator.ensure_kvduo_decode_capacity(
+                requests, tree_cache=self.tree_cache
+            )
+            return pressure.action is KVDuoPressureAction.SUCCESS
+        evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_decode(
