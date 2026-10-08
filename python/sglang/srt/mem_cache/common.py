@@ -13,6 +13,9 @@ from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state_on_swa,
 )
+from sglang.srt.mem_cache.allocator.hisparse import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -120,8 +123,13 @@ def evict_from_tree_cache(
     if allocator is None:
         allocator = tree_cache.token_to_kv_pool_allocator
 
-    if isinstance(allocator, SWATokenToKVPoolAllocator):
-        # Hybrid allocator
+    if isinstance(
+        allocator,
+        (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
+    ):
+        # HiSparse's DeepSeek V4 wrapper also owns independent full/SWA pools.
+        # A composite available_size() shortfall must not become FULL-only
+        # eviction when the missing slots belong to SWA.
         full_available_size = allocator.full_available_size()
         swa_available_size = allocator.swa_available_size()
 
