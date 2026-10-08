@@ -436,7 +436,9 @@ def test_dsv4_full_physical_pool_reaches_rollback_with_real_allocator_budgets(pa
         assert adder.add_one_req(req, False, None) is AddReqResult.CONTINUE
     else:
         assert adder.add_chunked_req(req) is req
-    reserve.assert_called_once_with(2, [0])
+    reserve.assert_called_once_with(
+        2, [0], tree_cache=adder.tree_cache, prefix_indices=req.prefix_indices
+    )
     assert adder.can_run_list == [req]
     assert req.extend_range == Range(8, 24)
     assert physical.free_pages == 3
