@@ -301,6 +301,152 @@ def test_dsv4_swap_in_reads_paged_host_layout() -> None:
     )
 
 
+@pytest.mark.parametrize("dsv4", [False, True])
+@pytest.mark.parametrize("global_scratch", [False, True])
+def test_standalone_hisparse_512_topk_960_threads_with_h2d_and_graph(
+    dsv4, global_scratch
+):
+    if dsv4 and is_hip():
+        pytest.skip("DSV4 paged-layout HiSparse test is CUDA-only")
+    top_k, capacity, requests = 512, 1024, 2
+    page = DSV4_PAGE_SIZE if dsv4 else 1
+    padded = capacity + page
+    seq_len = 2 * capacity + 1  # newest token starts a page in either layout
+    host_stride = (seq_len + page - 1) // page * page
+    row_shape = (DSV4_PAGE_BYTES,) if dsv4 else (1, KV_DIM)
+    dtype = torch.uint8 if dsv4 else DTYPE
+    host_cache = torch.empty(
+        (requests * host_stride // page, *row_shape), dtype=dtype, pin_memory=True
+    )
+    host_cache.copy_(
+        torch.arange(host_cache.numel(), dtype=torch.int32)
+        .remainder(251)
+        .to(dtype)
+        .view_as(host_cache)
+    )
+    device_buffer = torch.full(
+        (requests * padded // page, *row_shape), -1, dtype=dtype, device=DEVICE
+    )
+    for rid in range(requests):
+        dst = rid * padded // page
+        src = rid * host_stride // page
+        device_buffer[dst : dst + capacity // page].copy_(
+            host_cache[src : src + capacity // page].to(DEVICE)
+        )
+        device_buffer[dst + capacity // page].copy_(
+            host_cache[src + (seq_len - 1) // page].to(DEVICE)
+        )
+    tokens = torch.full((requests, padded), -1, dtype=torch.int32, device=DEVICE)
+    tokens[:, :capacity] = torch.arange(capacity, dtype=torch.int32, device=DEVICE)
+    locations = torch.arange(requests * padded, dtype=torch.int32, device=DEVICE).view(
+        requests, padded
+    )
+    host_locations = (
+        torch.arange(seq_len, dtype=torch.int64, device=DEVICE)[None, :]
+        + torch.arange(requests, dtype=torch.int64, device=DEVICE)[:, None]
+        * host_stride
+    )
+    lru = torch.arange(capacity, dtype=torch.int16, device=DEVICE).repeat(requests, 1)
+    # Both HOT hits and occupied-slot H2D misses, plus direct newest-token use.
+    selections = (
+        torch.cat(
+            [
+                torch.arange(128),
+                torch.arange(capacity, capacity + 383),
+                torch.tensor([seq_len - 1]),
+            ]
+        )
+        .to(dtype=torch.int32, device=DEVICE)
+        .repeat(requests, 1)
+    )
+    output = torch.full_like(selections, -1)
+    req_indices = torch.tensor([1, 0], dtype=torch.int64, device=DEVICE)
+    lengths = torch.full((requests,), seq_len, dtype=torch.int32, device=DEVICE)
+    real_reqs = torch.tensor([requests], dtype=torch.int32, device=DEVICE)
+    capacities = torch.full((requests,), capacity, dtype=torch.int32, device=DEVICE)
+    scratch = (
+        torch.empty(
+            (requests, hisparse_resolver_scratch_words(top_k, capacity)),
+            dtype=torch.int32,
+            device=DEVICE,
+        )
+        if global_scratch
+        else None
+    )
+    loader = (
+        load_cache_to_device_buffer_dsv4_mla
+        if dsv4
+        else load_cache_to_device_buffer_mla
+    )
+    banks = (tokens, lru, device_buffer)
+    original = [bank.clone() for bank in banks]
+
+    def dispatch():
+        loader(
+            top_k_tokens=selections,
+            device_buffer_tokens=tokens,
+            host_cache_locs=host_locations,
+            device_buffer_locs=locations,
+            host_cache=host_cache,
+            device_buffer=device_buffer,
+            top_k_device_locs=output,
+            req_pool_indices=req_indices,
+            seq_lens=lengths,
+            lru_slots=lru,
+            item_size_bytes=DSV4_ITEM_BYTES if dsv4 else ITEM_SIZE_BYTES,
+            num_top_k=top_k,
+            hot_buffer_size=capacity,
+            page_size=1,
+            block_size=960,
+            num_real_reqs=real_reqs,
+            req_hot_buffer_sizes=capacities,
+            resolver_scratch=scratch,
+            # Standalone HiSparse allocates no KVDuo status/event banks.
+            swap_status=None,
+            hot_growth_events=None,
+        )
+
+    def reset():
+        for bank, old in zip(banks, original):
+            bank.copy_(old)
+        output.fill_(-1)
+
+    def verify():
+        torch.cuda.synchronize()  # Report kernel errors at the actual resolver.
+        resolved = output.cpu()
+        snapshot = device_buffer.cpu()
+        for bid, rid in enumerate([1, 0]):
+            if dsv4:
+                actual = torch.stack(
+                    [_read_dsv4_token(snapshot, loc) for loc in resolved[bid].tolist()]
+                )
+                expected = torch.stack(
+                    [
+                        _read_dsv4_token(host_cache, rid * host_stride + token)
+                        for token in selections[bid].cpu().tolist()
+                    ]
+                )
+            else:
+                actual = snapshot[resolved[bid].long()]
+                expected = host_cache[rid * host_stride + selections[bid].cpu().long()]
+            assert torch.equal(actual, expected)
+        assert torch.equal(
+            lru.sort(dim=1).values.cpu(),
+            torch.arange(capacity, dtype=torch.int16).repeat(requests, 1),
+        )
+
+    dispatch()  # Compile and exercise real H2D misses before graph capture.
+    verify()
+    reset()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dispatch()
+    # Capture itself filled the misses. Restore them so replay also tests H2D.
+    reset()
+    graph.replay()
+    verify()
+
+
 def _long_case():
     # One-request baseline used by the stateful cases below:
     # req 0 LRU slots      : [0, 1, 2, 3]

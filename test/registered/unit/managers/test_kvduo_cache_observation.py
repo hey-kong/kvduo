@@ -7,7 +7,10 @@ from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
 import torch
+from sglang.test.ci.ci_register import register_cpu_ci
 from test_kvduo_hot_growth import make_coordinator
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 @pytest.fixture(scope="module")
@@ -28,6 +31,10 @@ extern "C" void capacity(const int* hits, int m, int d, int n, float* counts, in
 }
 extern "C" int segment(int capacity, int position, int k) {
   return sglang::kvduo_lru_segment(capacity,position,k);
+}
+extern "C" bool can_record_growth(bool full_lookup, bool observe, const int32_t* events,
+                                  const int32_t* status, int64_t rid) {
+  return sglang::kvduo_can_record_growth(full_lookup,observe,events,status,rid);
 }
 """
     )
@@ -62,7 +69,39 @@ extern "C" int segment(int capacity, int position, int k) {
     native.capacity.restype = None
     native.segment.argtypes = [ctypes.c_int] * 3
     native.segment.restype = ctypes.c_int
+    native.can_record_growth.argtypes = [ctypes.c_bool] * 2 + [
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.c_int64,
+    ]
+    native.can_record_growth.restype = ctypes.c_bool
     return native
+
+
+def test_standalone_hisparse_growth_guard_never_reads_null_kvduo_state(
+    native_observation,
+):
+    # Real standalone resolver arguments, with default observation enabled and
+    # a nonzero request slot: neither KVDuo bank exists in this mode.
+    assert not native_observation.can_record_growth(False, True, None, None, 3)
+    events = (ctypes.c_int32 * 4)()
+    assert not native_observation.can_record_growth(False, True, events, None, 3)
+    # Also fail closed for incomplete KVDuo state or synthetic observation.
+    assert not native_observation.can_record_growth(True, True, events, None, 3)
+    assert not native_observation.can_record_growth(True, True, None, None, 3)
+    assert not native_observation.can_record_growth(True, False, events, None, 3)
+
+
+def test_kvduo_growth_guard_keeps_valid_request_and_observation_checks(
+    native_observation,
+):
+    events = (ctypes.c_int32 * 4)()
+    status = (ctypes.c_int32 * 4)(1, 1, 1, 0)
+    assert native_observation.can_record_growth(True, True, events, status, 3)
+    assert not native_observation.can_record_growth(True, True, events, status, 0)
+    assert not native_observation.can_record_growth(True, False, events, status, 3)
+    assert not native_observation.can_record_growth(False, True, events, status, 3)
+    assert not native_observation.can_record_growth(True, True, None, status, 3)
 
 
 def test_production_lru_segments_use_pre_update_current_capacity(native_observation):

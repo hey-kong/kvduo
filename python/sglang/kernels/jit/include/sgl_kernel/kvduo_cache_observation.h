@@ -6,6 +6,12 @@
 #define KVDUO_HOST_DEVICE
 #endif
 namespace sglang {
+// Standalone HiSparse has neither a swap-status bank nor growth events. Gate
+// their reads before dereferencing any KVDuo-only state in the shared resolver.
+KVDUO_HOST_DEVICE inline bool kvduo_can_record_growth(
+    bool enable_full_lookup, bool observe, const int32_t* growth_events, const int32_t* swap_status, int64_t rid) {
+  return enable_full_lookup && observe && growth_events != nullptr && swap_status != nullptr && swap_status[rid] == 0;
+}
 KVDUO_HOST_DEVICE inline int kvduo_lru_segment(int capacity, int position, int k) {
   return (capacity - 1 - position) / k;
 }
