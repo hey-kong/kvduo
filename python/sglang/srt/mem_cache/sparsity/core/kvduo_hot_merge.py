@@ -1,4 +1,4 @@
-"""A pressure-boundary plan for compacting the real HOT cache's LRU survivors."""
+"""Compact genuinely reused HOT entries at a Hand pressure boundary."""
 
 from dataclasses import dataclass
 from typing import Sequence
@@ -15,9 +15,13 @@ class KVDuoHotMergePlan:
 
 
 def plan_kvduo_hot_merge(
-    tokens: Sequence[int], lru_slots: Sequence[int], k: int, top_k: int
-) -> KVDuoHotMergePlan | None:
-    """Keep the MRU valid entries, then minimize moves by choosing backing pages.
+    tokens: Sequence[int],
+    lru_slots: Sequence[int],
+    k: int,
+    top_k: int,
+    visited: Sequence[bool],
+) -> KVDuoHotMergePlan:
+    """Keep visited valid entries in relative LRU order, minimizing payload moves.
 
     Slot numbers in the copy plan refer to the original capacity. The new LRU
     refers to compacted slots; moving a survivor never changes its access rank.
@@ -32,11 +36,10 @@ def plan_kvduo_hot_merge(
         raise ValueError("HOT merge capacity is outside its minimum/8-page limits")
     if sorted(lru_slots) != list(range(capacity)):
         raise ValueError("HOT merge requires the current LRU slot permutation")
-    m = max(minimum, (n + 1) // 2)
-    if m == n:
-        return None
-
-    survivors = [slot for slot in lru_slots if tokens[slot] >= 0][-m * k :]
+    if len(visited) != capacity:
+        raise ValueError("HOT visited flags must match the current capacity")
+    survivors = [slot for slot in lru_slots if tokens[slot] >= 0 and visited[slot]]
+    m = max(minimum, (len(survivors) + k - 1) // k)
     survivor_set = set(survivors)
     counts = [0] * n
     for slot in survivors:

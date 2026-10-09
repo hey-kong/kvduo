@@ -34,8 +34,6 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
     coordinator.kvduo_resolver_stats = torch.zeros(
         (layers, requests, 2), dtype=torch.int32
     )
-    coordinator.kvduo_hot_tail_ema_alpha = 1 / 64
-    coordinator.kvduo_hot_tail_ema_min_observations = 64
     coordinator._kvduo_hot_pressure_protected = set()
     coordinator._kvduo_pressure_protected = None
     coordinator.is_dsv4_hisparse = False
@@ -46,16 +44,8 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
 
     coordinator.kvduo_prefill_policy = KVDuoPrefillPolicy()
     coordinator._init_kvduo_prefill_rollback_state(requests)
-    coordinator.kvduo_hot_tail_ema_observe = torch.ones(1, dtype=torch.int32)
-    coordinator.kvduo_hot_tail_ema = torch.zeros(
-        (layers, requests), dtype=torch.float32
-    )
-    coordinator.kvduo_hot_tail_observation_steps = torch.zeros(
-        (layers, requests), dtype=torch.int64
-    )
-    coordinator.hot_page_last_touch = torch.zeros(
-        (layers, requests, 8), dtype=torch.int64
-    )
+    coordinator.kvduo_observe = torch.ones(1, dtype=torch.int32)
+    coordinator.hot_visited = torch.zeros((layers, requests, 32), dtype=torch.bool)
     coordinator.kvduo_hot_growth_events = torch.zeros(
         (layers, requests), dtype=torch.int32
     )
@@ -258,14 +248,14 @@ def test_only_the_request_layer_with_a_capacity_event_grows():
     assert torch.equal(coordinator.kvduo_req_hot_capacity, expected)
 
 
-def test_multiple_h2d_capacity_events_are_not_merged_into_one_growth_step():
+def test_multiple_h2d_capacity_events_coalesce_into_one_growth_step():
     coordinator, _ = make_coordinator()
     coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
     coordinator.kvduo_hot_growth_events[0, 0] = 3
 
     coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
 
-    assert int(coordinator.kvduo_req_hot_capacity[0, 0]) == 16
+    assert int(coordinator.kvduo_req_hot_capacity[0, 0]) == 8
 
 
 def test_mixed_minimum_failure_cannot_replay_with_zero_capacity():
@@ -347,7 +337,7 @@ def test_resolver_ffi_receives_the_stable_growth_event_pointer(monkeypatch, dsv4
         hot_buffer_size=32,
         num_real_reqs=torch.ones(1, dtype=torch.int32),
         req_hot_buffer_sizes=coordinator.kvduo_req_hot_capacity_gpu[0],
-        hot_page_last_touch=torch.zeros((1, 8), dtype=torch.int64),
+        hot_visited=coordinator.hot_visited[0],
         req_to_logical_token=torch.arange(16, dtype=torch.int64).view(1, -1),
         full_to_device_loc=torch.zeros(16, dtype=torch.int64),
         full_last_touch=torch.zeros(16, dtype=torch.int64),
@@ -357,24 +347,19 @@ def test_resolver_ffi_receives_the_stable_growth_event_pointer(monkeypatch, dsv4
         resolver_stats=coordinator.kvduo_resolver_stats[0],
         touch_clock=torch.ones(1, dtype=torch.int64),
         hot_growth_events=coordinator.kvduo_hot_growth_events[0],
-        hot_tail_ema=coordinator.kvduo_hot_tail_ema[0],
-        hot_tail_observation_steps=coordinator.kvduo_hot_tail_observation_steps[0],
+        observe_cache=coordinator.kvduo_observe,
         hot_base_capacities=coordinator.kvduo_hot_base_capacity[0],
-        prefill_hit_ema=coordinator.kvduo_prefill_hit_ema[0],
-        prefill_hit_steps=coordinator.kvduo_prefill_hit_steps[0],
+        prefill_ema=coordinator.kvduo_prefill_ema[0],
+        prefill_steps=coordinator.kvduo_prefill_steps[0],
     )
 
     args = module.load_cache_to_device_buffer.call_args.args
     assert args[20] == coordinator.kvduo_hot_growth_events[0].data_ptr()
-    assert args[-7:-4] == (
-        coordinator.kvduo_hot_tail_ema[0].data_ptr(),
-        coordinator.kvduo_hot_tail_observation_steps[0].data_ptr(),
-        1 / 64,
-    )
-    assert args[-4] == 0
-    assert args[-3:] == (
+    assert args[12] == coordinator.hot_visited[0].data_ptr()
+    assert args[-4:] == (
+        coordinator.kvduo_observe.data_ptr(),
         coordinator.kvduo_hot_base_capacity[0].data_ptr(),
-        coordinator.kvduo_prefill_hit_ema[0].data_ptr(),
-        coordinator.kvduo_prefill_hit_steps[0].data_ptr(),
+        coordinator.kvduo_prefill_ema[0].data_ptr(),
+        coordinator.kvduo_prefill_steps[0].data_ptr(),
     )
     assert all(isinstance(arg, (int, bool, float)) for arg in args)

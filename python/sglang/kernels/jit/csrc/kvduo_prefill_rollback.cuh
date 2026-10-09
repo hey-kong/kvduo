@@ -19,11 +19,9 @@ __global__ void kvduo_prefill_rollback_kernel(
     int32_t* tokens,
     int32_t* locations,
     int16_t* lru,
-    int64_t* page_touch,
+    bool* visited,
     int32_t* capacities,
-    int requests,
-    int pages,
-    int k) {
+    int requests) {
   constexpr int ITEMS = (CAPACITY + BLOCK_SIZE - 1) / BLOCK_SIZE;
   using Scan = rollback_cub::BlockScan<int, BLOCK_SIZE>;
   __shared__ typename Scan::TempStorage scratch;
@@ -50,10 +48,8 @@ __global__ void kvduo_prefill_rollback_kernel(
     if (rank >= target) {
       tokens[owner * CAPACITY + rank] = -1;
       locations[owner * CAPACITY + rank] = -1;
+      visited[owner * CAPACITY + rank] = false;
     }
-  }
-  for (int page = target / k + tid; page < pages; page += BLOCK_SIZE) {
-    page_touch[owner * pages + page] = 0;
   }
   __syncthreads();
   if (tid == 0) capacities[owner] = target;
@@ -66,14 +62,12 @@ void kvduo_prefill_rollback(
     tvm::ffi::TensorView tokens,
     tvm::ffi::TensorView locations,
     tvm::ffi::TensorView lru,
-    tvm::ffi::TensorView page_touch,
-    tvm::ffi::TensorView capacities,
-    int64_t slots_per_page) {
+    tvm::ffi::TensorView visited,
+    tvm::ffi::TensorView capacities) {
   using namespace host;
   auto n = SymbolicSize{"objects"};
   auto layers = SymbolicSize{"layers"};
   auto requests = SymbolicSize{"requests"};
-  auto pages = SymbolicSize{"pages"};
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA, kDLROCM>();
   TensorMatcher({n, 2}).with_dtype<int64_t>().with_device(device).verify(owners);
@@ -84,7 +78,9 @@ void kvduo_prefill_rollback(
       .verify(tokens)
       .verify(locations);
   TensorMatcher({layers, requests, CAPACITY}).with_dtype<int16_t>().with_device(device).verify(lru);
-  TensorMatcher({layers, requests, pages}).with_dtype<int64_t>().with_device(device).verify(page_touch);
+  // bool is integral in C++; TensorMatcher's generic integral trait maps it
+  // to uint8. PyTorch exports a distinct DLPack bool8 dtype.
+  TensorMatcher({layers, requests, CAPACITY}).with_dtype(DLDataType{kDLBool, 8, 1}).with_device(device).verify(visited);
   TensorMatcher({layers, requests}).with_dtype<int32_t>().with_device(device).verify(capacities);
   constexpr size_t smem_bytes = CAPACITY * sizeof(int16_t);
 #ifndef USE_ROCM
@@ -100,11 +96,9 @@ void kvduo_prefill_rollback(
       static_cast<int32_t*>(tokens.data_ptr()),
       static_cast<int32_t*>(locations.data_ptr()),
       static_cast<int16_t*>(lru.data_ptr()),
-      static_cast<int64_t*>(page_touch.data_ptr()),
+      static_cast<bool*>(visited.data_ptr()),
       static_cast<int32_t*>(capacities.data_ptr()),
-      static_cast<int>(requests.unwrap()),
-      static_cast<int>(pages.unwrap()),
-      static_cast<int>(slots_per_page));
+      static_cast<int>(requests.unwrap()));
 }
 
 }  // namespace

@@ -40,14 +40,15 @@ def test_attention_selects_kv_tensor_in_the_index_address_space():
 
 
 def test_owner_keys_keep_asymmetric_requests_and_layers_separate():
-    source = COORDINATOR.read_text()
-    owners = {(3, 17): [64], (17, 3): [128]}
-    assert owners.pop((3, 17)) == [64]
-    assert owners == {(17, 3): [128]}
+    from test_kvduo_hot_merge import make_merge_coordinator
 
-    assert "owner = (req_idx, layer_id)" not in source
-    assert "owner = (layer_id, req_idx)" in source
-    assert "for (layer_id, req_idx), pages" in source
+    c, _ = make_merge_coordinator({(3, 17): 3, (17, 3): 3}, layers=18)
+    untouched = c._kvduo_req_layer_pages[17, 3].copy()
+    c.hot_visited[3, 17, 0] = True
+    assert c._merge_kvduo_hot_pages(3, 17) == 2 * c.page_size
+    assert len(c._kvduo_req_layer_pages[3, 17]) == 1
+    assert c._kvduo_req_layer_pages[17, 3] == untouched
+    assert all(c._kvduo_hot_page_owners[page] == (17, 3) for page in untouched)
 
 
 def test_merge_returns_whole_allocator_pages_after_payload_copy_completion():
@@ -141,8 +142,7 @@ def test_kvduo_cpu_group_never_reduces_cuda_control_tensors():
     restore = next(
         node
         for node in klass.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "init_kvduo_load_back"
+        if isinstance(node, ast.FunctionDef) and node.name == "init_kvduo_load_back"
     )
 
     ready_tensors = []

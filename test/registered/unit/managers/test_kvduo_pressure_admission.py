@@ -135,7 +135,7 @@ def test_decode_reclaims_radix_against_physical_shortfall_without_logical_overev
 def test_prefill_evicts_radix_before_rejecting_an_immature_hot_rollback(path):
     coordinator, physical = ready_coordinator()
     coordinator.is_dsv4_hisparse = True
-    coordinator.kvduo_prefill_reference_steps.zero_()
+    coordinator.kvduo_prefill_steps.zero_()
     adder, req = actual_budget_adder_and_req(coordinator, path=path)
     adder.tree_cache.full_evictable_size.return_value = 16
 
@@ -152,7 +152,7 @@ def test_prefill_evicts_radix_before_rejecting_an_immature_hot_rollback(path):
     adder.tree_cache.evict.assert_called_once()
     coordinator.reclaim_kvduo_full_pages.assert_not_called()
     assert physical.free_pages == coordinator._kvduo_reserved_prefill_pages() == 2
-    assert not coordinator._kvduo_prefill_growth_blocked
+    assert not coordinator._kvduo_prefill_limited_requests
     assert int(coordinator.kvduo_req_hot_capacity[0, 0]) == 28
 
 
@@ -359,3 +359,34 @@ def test_fully_resident_finish_caches_decode_pages_without_an_initial_prefill_ca
     cache.insert = MagicMock(return_value=InsertResult(prefix_len=0))
     cache.cache_finished_req(req, kv_len_to_handle=committed)
     assert len(cache.insert.call_args.args[0].key) == expected
+
+
+@pytest.mark.parametrize("allow_reclaim", [False, True])
+def test_mandatory_hot_allocation_cannot_spend_reserved_prefill_pages(allow_reclaim):
+    coordinator, physical, _ = make_full_coordinator(pages=4)
+    physical.free_pages = 1
+    token = coordinator.reserve_kvduo_prefill(1, [0])
+    assert token is not None
+    coordinator._mixed_slots[0] = True
+    coordinator._kvduo_pending_hot_minimum.add(0)
+    coordinator._reclaim_for_physical_allocation = MethodType(
+        HiSparseCoordinator._reclaim_for_physical_allocation, coordinator
+    )
+    coordinator._require_allocation_ready = (
+        HiSparseCoordinator._require_allocation_ready
+    )
+    coordinator.reclaim_kvduo_full_pages = MagicMock(return_value=0)
+    physical.alloc.reset_mock()
+    if allow_reclaim:
+        with pytest.raises(RuntimeError, match="physical allocation cannot proceed"):
+            coordinator._ensure_kvduo_hot_capacity_targets_batch(
+                {(0, 0): 4}, allow_reclaim=True
+            )
+    else:
+        coordinator._ensure_kvduo_hot_capacity_targets_batch(
+            {(0, 0): 4}, allow_reclaim=False
+        )
+    physical.alloc.assert_not_called()
+    assert physical.free_pages == 1
+    assert coordinator.kvduo_req_hot_capacity[0, 0].item() == 0
+    assert coordinator._kvduo_reserved_prefill_pages() == 1
