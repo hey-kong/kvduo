@@ -1954,6 +1954,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 params.req,
                 params.host_hit_length,
                 radix_reclaimer=reclaim_radix,
+                prefill_reservation=params.kvduo_prefill_reservation,
             )
             return restored, params.best_match_node
         best_match_node_id = params.best_match_node

@@ -417,7 +417,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         coordinator = getattr(self, "kvduo_coordinator", None)
         if coordinator is None or params.req is None:
             return super().init_load_back(params)
-        restored = coordinator.init_kvduo_load_back(params.req, params.host_hit_length)
+        restored = coordinator.init_kvduo_load_back(
+            params.req,
+            params.host_hit_length,
+            prefill_reservation=params.kvduo_prefill_reservation,
+        )
         return restored, params.best_match_node
 
     def insert(self, params: InsertParams) -> InsertResult:

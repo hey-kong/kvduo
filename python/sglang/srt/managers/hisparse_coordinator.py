@@ -657,7 +657,12 @@ class HiSparseCoordinator:
         return result
 
     def init_kvduo_load_back(
-        self, req: Req, host_hit_length: int, radix_reclaimer=None
+        self,
+        req: Req,
+        host_hit_length: int,
+        radix_reclaimer=None,
+        *,
+        prefill_reservation: int | None = None,
     ):
         """Allocate and restore the host-only suffix before prefill executes."""
         plan = getattr(req, "kvduo_residency_plan", None)
@@ -788,7 +793,10 @@ class HiSparseCoordinator:
             self._kvduo_pressure_protected = protected
             try:
                 pressure = self._reclaim_for_physical_allocation(
-                    physical_pages * self.page_size
+                    physical_pages * self.page_size,
+                    reserve_hot_minimum=self.enable_mixed_residency,
+                    prefill_reservation=prefill_reservation,
+                    allow_hot_reclaim=False,
                 )
             finally:
                 self._kvduo_pressure_protected = None
@@ -1191,8 +1199,10 @@ class HiSparseCoordinator:
         *,
         turnover_size: int = 0,
         reserve_hot_minimum: bool = False,
+        prefill_reservation: int | None = None,
+        allow_hot_reclaim: bool = True,
     ) -> KVDuoPressureResult:
-        """Reclaim full pages for an imminent sparse-pool allocation only.
+        """Reclaim physical KV pages while protecting pending allocations.
 
         This intentionally consults the dedicated physical allocator rather
         than ``available_size()`` on the composite allocator, whose minimum may
@@ -1216,6 +1226,21 @@ class HiSparseCoordinator:
             else 0
         )
         reserved_slots = self._kvduo_reserved_prefill_pages() * self.page_size
+        if prefill_reservation is not None:
+            reservation = self._kvduo_prefill_reservations.get(prefill_reservation)
+            if reservation is None or need_size > reservation[0] * self.page_size:
+                return KVDuoPressureResult(
+                    KVDuoPressureStatus.RECLAIM_REQUIRED,
+                    0,
+                    action=KVDuoPressureAction.ERROR,
+                    reason=KVDuoPressureReason.INVALID_STATE,
+                    detail="Host-prefix restore exceeds its live prefill reservation",
+                )
+            # Restore and its fresh prefill tail were admitted together. Credit
+            # only this allocation, keeping the tail and other prefills reserved.
+            # The caller consumes this credit only after restore succeeds.
+            reserved_slots -= need_size
+            allow_hot_reclaim = False
 
         def available_slots():
             # FULL reclamation may make another request mixed. Account for
@@ -1280,10 +1305,9 @@ class HiSparseCoordinator:
             else:
                 reclaimed_slots = self.reclaim_kvduo_full_pages(pages * self.page_size)
                 remaining = pages * self.page_size - reclaimed_slots
-            # Full pages are always the first victims. Only after every legal
-            # non-tail full victim has been consumed may pressure spill into
-            # request/layer-private hot pages.
-            if remaining > 0:
+            # Decode may continue through ordinary Hand merge. Prefill restore
+            # must use its admitted rollback budget instead of this HOT fallback.
+            if remaining > 0 and allow_hot_reclaim:
                 reclaimed_slots += self.reclaim_kvduo_hot_pages(remaining)
             return reclaimed_slots // self.page_size * self._physical_page_bytes()
 
