@@ -333,6 +333,7 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.dsa_prefill_backend
         )
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        self._validate_kvduo_flashmla_kv()
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
@@ -2260,6 +2261,12 @@ class DeepseekSparseAttnBackend(
                 topk_indices,
                 layer.layer_id,
             )
+            if self.hisparse_coordinator.enable_mixed_residency:
+                # Resolver locations encode storage layers for FULL and HOT.
+                # Model writes/prefill still use the ordinary per-layer views.
+                kv_cache = self.token_to_kv_pool.get_flat_key_buffer().view(
+                    self.token_to_kv_pool.dtype
+                )
         elif self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
@@ -2789,6 +2796,19 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
+    def _validate_kvduo_flashmla_kv(self) -> None:
+        if (
+            self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.enable_mixed_residency
+            and self.dsa_decode_impl == "flashmla_kv"
+            and not self.dsa_kv_cache_store_fp8
+        ):
+            raise ValueError(
+                "KVDuo flashmla_kv decode requires --kv-cache-dtype=fp8_e4m3. "
+                "For BF16 KV use --dsa-decode-backend=flashmla_sparse; "
+                "quantizing the entire cross-layer KV pool on each layer is unsupported."
+            )
+
     def _forward_flashmla_kv(
         self,
         q_all: torch.Tensor,
@@ -2799,6 +2819,7 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
+        self._validate_kvduo_flashmla_kv()
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.dsa_cache_seqlens_int32

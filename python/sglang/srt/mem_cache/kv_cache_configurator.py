@@ -1186,6 +1186,7 @@ class KVCacheConfigurator:
             pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                 self.server_args
             ).host_to_device_ratio
+            pool_kwargs["enable_kvduo"] = get_memory().enable_kvduo
         elif dsa_cp_layer_shard_rank is not None:
             # DSA cache layer split: shard KV/indexer layers across CP ranks.
             from sglang.srt.mem_cache.dsa_cache_layer_split import (

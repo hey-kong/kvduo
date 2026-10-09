@@ -5,6 +5,8 @@ import torch
 
 import sglang.kernels.ops.kvcache.hisparse as hisparse_ops
 from sglang.kernels.ops.kvcache.hisparse import (
+    allocate_hisparse_resolver_scratch,
+    hisparse_resolver_scratch_words,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
     transfer_cache_dsv4_mla,
@@ -942,7 +944,10 @@ def test_kvduo_resolver_graph_replays_after_actual_merge_without_recapture():
     coordinator.page_size = coordinator.hot_page_size = 1
     coordinator.top_k = coordinator.min_hot_pages = 2
     coordinator._kvduo_hot_pressure_protected = set()
-    coordinator.mem_pool_device = SimpleNamespace(kv_buffer=[kwargs["device_buffer"]])
+    coordinator.mem_pool_device = SimpleNamespace(
+        kv_buffer=[kwargs["device_buffer"]],
+        get_flat_key_buffer=lambda: kwargs["device_buffer"],
+    )
     pages = kwargs["device_buffer_locs"][0, :4].cpu().tolist()
     coordinator._kvduo_req_layer_pages = {(0, 0): pages}
     coordinator._kvduo_hot_page_owners = {start: (0, 0) for start in pages}
@@ -1055,7 +1060,183 @@ def test_kvduo_ema_decays_on_valid_zero_counts_and_marks_reuse_after_h2d():
     assert kwargs["prefill_steps"].item() == 2
 
 
-@pytest.mark.parametrize("capacity", [8, 512])
+def _generic_kvduo_stack(monkeypatch):
+    if is_hip():
+        pytest.skip("Actual DSA pool fixture uses CUDA's 64-token page layout")
+    from types import SimpleNamespace
+
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+    from sglang.srt.mem_cache.pool_host.common import (
+        ALLOC_MEMORY_FUNCS,
+        alloc_with_pin_memory,
+    )
+
+    pool = HiSparseDSATokenToKVPool(
+        size=1024,
+        page_size=64,
+        dtype=torch.bfloat16,
+        kv_lora_rank=12,
+        qk_rope_head_dim=4,
+        kv_cache_dim=16,
+        layer_num=3,
+        device=DEVICE,
+        index_head_dim=128,
+        enable_memory_saver=False,
+        enable_kvduo=True,
+    )
+    allocator = HiSparseTokenToKVPoolAllocator(
+        1024, 64, pool.dtype, DEVICE, pool, False
+    )
+    monkeypatch.setitem(ALLOC_MEMORY_FUNCS, DEVICE, alloc_with_pin_memory)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda **kw: 1)
+    c = HiSparseCoordinator(
+        SimpleNamespace(
+            req_to_token=torch.zeros((2, 128), dtype=torch.int32, device=DEVICE),
+            max_context_len=128,
+        ),
+        allocator,
+        top_k=4,
+        device_buffer_size=8,
+        device=DEVICE,
+        tp_group=None,
+        tail_protected_pages=2,
+    )
+    c._active_kvduo_reqs = {0: SimpleNamespace(hisparse_staging=False)}
+    c._mixed_slots[0] = True
+    c.num_real_reqs.fill_(1)
+    c._ensure_kvduo_hot_capacity_targets_batch({(1, 0): c.hot_page_size})
+    c._merge_kvduo_hot_pages(1, 0)  # Establish a real merge base, even with no release.
+    c._ensure_kvduo_hot_capacity_targets_batch({(1, 0): 2 * c.hot_page_size})
+    return c, pool, allocator
+
+
+def test_generic_kvduo_resolver_reads_full_hot_and_host_across_layers_after_graph_merge(
+    monkeypatch,
+):
+    c, pool, allocator = _generic_kvduo_stack(monkeypatch)
+    k = c.hot_page_size
+    full = allocator.hisparse_attn_allocator.alloc(64)
+    allocator.full_to_hisparse_device_index_mapping[1] = full[0]
+    c.req_to_full_lookup[0, :4] = torch.arange(1, 5, dtype=torch.int64, device=DEVICE)
+    c.req_to_host_pool[0, :4] = torch.arange(4, dtype=torch.int64, device=DEVICE)
+    c.full_host_version[1:5] = 0
+    base_slot, extra_slot = 2 * 64, k
+    c.req_device_buffer_tokens[1, 0, base_slot] = 1
+    c.req_device_buffer_tokens[1, 0, extra_slot] = 2
+    base_loc = c.req_device_buffer_token_locs[1, 0, base_slot].long()
+    extra_loc = c.req_device_buffer_token_locs[1, 0, extra_slot].long()
+    backing = pool.get_flat_key_buffer()
+    pool.kv_buffer[1][full[0]] = 10
+    backing[base_loc] = 20  # Logical layer 1's KV stored in storage layer 2.
+    backing[extra_loc] = 30  # Logical layer 1's KV stored in storage layer 0.
+    c.mem_pool_host.kv_buffer[1, 3] = 40
+    args = (
+        torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        torch.tensor([4], dtype=torch.int32, device=DEVICE),
+        torch.tensor([[0, 1, 2, 3]], dtype=torch.int32, device=DEVICE),
+        1,
+    )
+    output = c.swap_in_selected_pages(*args)
+    torch.cuda.synchronize()
+    assert output[0, 0].item() == pool.flat_layer_slot_stride + full[0].item()
+    assert output[0, 1].item() == base_loc.item()
+    assert output[0, 2].item() == extra_loc.item()
+    assert backing[output[0].long(), 0, 0].tolist() == [10, 20, 30, 40]
+    assert c.kvduo_prefill_ema[1, 0].tolist() == [1, 1]
+    assert c.kvduo_prefill_steps[1, 0].item() == 1
+    pointers = [
+        bank.data_ptr()
+        for bank in (
+            backing,
+            c.req_device_buffer_tokens,
+            c.req_device_buffer_token_locs,
+            c.lru_slots,
+            c.kvduo_req_hot_capacity_gpu,
+        )
+    ]
+    c.kvduo_observe.zero_()
+    c.swap_in_selected_pages(*args)  # Warm up assertion and resolver kernels.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        c.swap_in_selected_pages(*args)
+    c.kvduo_observe.fill_(1)
+    before = allocator.hisparse_attn_allocator.available_size()
+    assert c._merge_kvduo_hot_pages(1, 0) == 64
+    assert allocator.hisparse_attn_allocator.available_size() == before + 64
+    graph.replay()
+    torch.cuda.synchronize()
+    assert backing[output[0].long(), 0, 0].tolist() == [10, 20, 30, 40]
+    # The first H2D insert was never observed as a later HOT hit. Merge drops
+    # it, so replay fetches it again while both visited HOT entries survive.
+    assert c.kvduo_prefill_ema[1, 0].tolist() == [0, 1]
+    assert c.kvduo_prefill_steps[1, 0].item() == 1
+    assert pointers == [
+        bank.data_ptr()
+        for bank in (
+            backing,
+            c.req_device_buffer_tokens,
+            c.req_device_buffer_token_locs,
+            c.lru_slots,
+            c.kvduo_req_hot_capacity_gpu,
+        )
+    ]
+    c.destroy()
+
+
+def test_generic_kvduo_fast_rollback_keeps_base_payload_and_filters_lru(monkeypatch):
+    c, pool, allocator = _generic_kvduo_stack(monkeypatch)
+    k = c.hot_page_size
+    c.req_device_buffer_tokens[1, 0, : 2 * k] = torch.arange(2 * k, device=DEVICE)
+    locs = c.req_device_buffer_token_locs[1, 0, : 2 * k].long()
+    pool.get_flat_key_buffer()[locs] = torch.arange(
+        2 * k, device=DEVICE, dtype=torch.bfloat16
+    )[:, None, None]
+    c.lru_slots[1, 0, : 2 * k] = torch.arange(2 * k, device=DEVICE).flip(0)
+    c.hot_visited[1, 0, : 2 * k] = True
+    expected = pool.get_flat_key_buffer().clone()
+    base = c._kvduo_hot_base_pages[1, 0]
+    before = allocator.hisparse_attn_allocator.available_size()
+    c._rollback_kvduo_hot_batch(((1, 0),))
+    assert c._kvduo_req_layer_pages[1, 0] == list(base)
+    assert allocator.hisparse_attn_allocator.available_size() == before + 64
+    assert torch.equal(pool.get_flat_key_buffer(), expected)
+    assert c.lru_slots[1, 0, :k].tolist() == list(reversed(range(k)))
+    assert torch.all(c.req_device_buffer_tokens[1, 0, k:] == -1)
+    assert torch.all(c.req_device_buffer_token_locs[1, 0, k:] == -1)
+    assert torch.all(c.hot_visited[1, 0, :k])
+    assert not torch.any(c.hot_visited[1, 0, k:])
+    c.destroy()
+
+
+def test_generic_resolver_preserves_lru_slots_above_int16_range():
+    kwargs = _kvduo_observation_case(selected=(1, 2))
+    capacity = 33000
+    tokens = torch.full((1, capacity + 1), -1, dtype=torch.int32, device=DEVICE)
+    tokens[0, capacity - 2 :] = torch.tensor([1, 2, -1], device=DEVICE)
+    kwargs.update(
+        device_buffer_tokens=tokens,
+        device_buffer_locs=torch.full_like(tokens, 5),
+        hot_visited=torch.zeros_like(tokens, dtype=torch.bool),
+        lru_slots=torch.arange(capacity, dtype=torch.int32, device=DEVICE).unsqueeze(0),
+        hot_buffer_size=capacity,
+        req_hot_buffer_sizes=torch.tensor([capacity], dtype=torch.int32, device=DEVICE),
+        hot_base_capacities=torch.tensor(
+            [capacity - 1], dtype=torch.int32, device=DEVICE
+        ),
+        resolver_scratch=allocate_hisparse_resolver_scratch(
+            1, 2, capacity, 256, torch.device(DEVICE)
+        ),
+    )
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+    assert kwargs["lru_slots"][0, -2:].tolist() == [capacity - 2, capacity - 1]
+    assert kwargs["hot_visited"][0, capacity - 2 : capacity].all()
+    assert kwargs["prefill_ema"].tolist() == [[1, 0]]
+
+
+@pytest.mark.parametrize("capacity", [8, 512, 39936])
 @pytest.mark.parametrize("page_size", [2, 64])
 def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru(
     capacity, page_size
@@ -1069,7 +1250,8 @@ def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru
         2 * 3 * padded_capacity, dtype=torch.int32, device=DEVICE
     ).view(2, 3, padded_capacity)
     locations = (tokens + 100).clone()
-    order = torch.arange(capacity, dtype=torch.int16, device=DEVICE).flip(0)
+    slot_dtype = torch.int32 if capacity > 32767 else torch.int16
+    order = torch.arange(capacity, dtype=slot_dtype, device=DEVICE).flip(0)
     lru = torch.stack([order.roll(i) for i in range(6)]).view(2, 3, capacity)
     visited = (tokens % 3 != 0).clone()
     visited[:, :, capacity:] = True
@@ -1108,6 +1290,127 @@ def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru
             assert not torch.any(visited[owner][target:])
             assert capacities[owner].item() == target
     assert addresses == [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
+
+
+@pytest.mark.parametrize("active_capacity", [0, 78 * 64, 8 * 78 * 64])
+@pytest.mark.parametrize("global_scratch", [True, False])
+def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_scratch(
+    active_capacity, global_scratch
+):
+    # Exact configuration from the resource regression: 210712 bytes at
+    # compile-time max capacity, even when only one HOT page is currently live.
+    topk, capacity, base, requests = 2048, 39936, 4992, 2
+    scratch = allocate_hisparse_resolver_scratch(
+        requests, topk, capacity, 960, torch.device(DEVICE)
+    )
+    if not global_scratch and scratch is not None:
+        pytest.skip("Device cannot run this fixture's shared-memory variant")
+    words = hisparse_resolver_scratch_words(topk, capacity)
+    if global_scratch:
+        # Padding exposes using the wrong row stride between simultaneous CTAs.
+        scratch = torch.full((requests, words + 4), 7, dtype=torch.int32, device=DEVICE)
+    else:
+        scratch = None
+    host = torch.empty((requests * topk, 1, KV_DIM), dtype=DTYPE, pin_memory=True)
+    host.copy_(torch.arange(requests * topk, dtype=DTYPE).view(-1, 1, 1))
+    tokens = torch.full((requests, capacity + 64), -1, dtype=torch.int32, device=DEVICE)
+    locations = torch.full_like(tokens, -1)
+    for req in range(requests):
+        locations[req, :capacity] = (
+            64 + req * capacity + torch.arange(capacity, device=DEVICE)
+        )
+    logical = torch.arange(
+        1, requests * topk + 1, dtype=torch.int64, device=DEVICE
+    ).view(requests, topk)
+    full_offset = requests * capacity + 64
+    device = torch.zeros(
+        (full_offset + requests * topk + 1, 1, KV_DIM), dtype=DTYPE, device=DEVICE
+    )
+    full_mapping = torch.zeros(requests * topk + 1, dtype=torch.int64, device=DEVICE)
+    expected = host[:, 0, 0].reshape(requests, topk).to(DEVICE)
+    if active_capacity == 0:
+        full_mapping[1:] = full_offset + logical.flatten()
+        device[full_mapping[1:]] = host.to(DEVICE)
+    else:
+        for req in range(requests):
+            tokens[req, active_capacity - 1] = 0
+            device[locations[req, active_capacity - 1]] = 9000 + req
+            full_mapping[logical[req, 1]] = full_offset + req + 1
+            device[full_offset + req + 1] = 8000 + req
+            expected[req, :2] = torch.tensor([9000 + req, 8000 + req], device=DEVICE)
+    versions = torch.ones_like(full_mapping)
+    selections = torch.arange(topk, dtype=torch.int32, device=DEVICE).repeat(3, 1)
+    kwargs = dict(
+        top_k_tokens=selections,
+        device_buffer_tokens=tokens,
+        host_cache_locs=torch.arange(
+            requests * topk, dtype=torch.int64, device=DEVICE
+        ).view(requests, topk),
+        device_buffer_locs=locations,
+        host_cache=host,
+        device_buffer=device,
+        top_k_device_locs=torch.full_like(selections, -1),
+        req_pool_indices=torch.tensor([1, 0, 0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.full((3,), topk, dtype=torch.int32, device=DEVICE),
+        lru_slots=torch.arange(capacity, dtype=torch.int32, device=DEVICE).repeat(
+            requests, 1
+        ),
+        item_size_bytes=ITEM_SIZE_BYTES,
+        num_top_k=topk,
+        hot_buffer_size=capacity,
+        page_size=base,
+        block_size=960,
+        num_real_reqs=torch.tensor([2], dtype=torch.int32, device=DEVICE),
+        req_hot_buffer_sizes=torch.full(
+            (requests,), active_capacity, dtype=torch.int32, device=DEVICE
+        ),
+        hot_visited=torch.zeros_like(tokens, dtype=torch.bool),
+        req_to_logical_token=logical,
+        full_to_device_loc=full_mapping,
+        full_last_touch=torch.zeros_like(full_mapping),
+        full_data_version=versions,
+        full_host_version=versions.clone(),
+        swap_status=torch.zeros(requests, dtype=torch.int32, device=DEVICE),
+        resolver_stats=torch.zeros((requests, 2), dtype=torch.int32, device=DEVICE),
+        hot_growth_events=torch.zeros(requests, dtype=torch.int32, device=DEVICE),
+        touch_clock=torch.ones(1, dtype=torch.int64, device=DEVICE),
+        observe_cache=torch.ones(1, dtype=torch.int32, device=DEVICE),
+        hot_base_capacities=torch.full(
+            (requests,), base, dtype=torch.int32, device=DEVICE
+        ),
+        prefill_ema=torch.zeros((requests, 2), dtype=torch.float32, device=DEVICE),
+        prefill_steps=torch.zeros(requests, dtype=torch.int64, device=DEVICE),
+        resolver_scratch=scratch,
+    )
+    banks = [value for value in kwargs.values() if isinstance(value, torch.Tensor)]
+    addresses = [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+    output = kwargs["top_k_device_locs"]
+    assert torch.equal(device[output[:2].long(), 0, 0], expected.flip(0))
+    assert torch.all(output[2] == -1)
+    extra_hits = int(active_capacity > base)
+    misses = topk - 2 if active_capacity else 0
+    assert kwargs["prefill_ema"].tolist() == [[extra_hits, misses]] * requests
+    if scratch is not None:
+        assert torch.all(scratch[:, words:] == 7)
+    kwargs["observe_cache"].zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        load_cache_to_device_buffer_mla(**kwargs)
+    kwargs["observe_cache"].fill_(1)
+    kwargs["prefill_ema"].zero_()
+    kwargs["prefill_steps"].zero_()
+    if scratch is not None:
+        scratch.fill_(31)  # Scratch from older objects must never affect replay.
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(device[output[:2].long(), 0, 0], expected.flip(0))
+    assert kwargs["prefill_ema"].tolist() == [[extra_hits, 0]] * requests
+    assert kwargs["prefill_steps"].tolist() == [1] * requests
+    assert addresses == [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
+    if scratch is not None:
+        assert torch.all(scratch[:, words:] == 31)
 
 
 @pytest.mark.parametrize("bad_bank", ["locations", "visited", "lru"])

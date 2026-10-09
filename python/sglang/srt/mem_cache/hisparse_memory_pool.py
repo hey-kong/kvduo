@@ -1,10 +1,12 @@
 # mapping on device memory, host memory and memory allocator
 
 import logging
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.utils import is_cuda, is_hip
@@ -41,7 +43,9 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         host_to_device_ratio: int = 2,
+        enable_kvduo: bool = False,
     ):
+        self.enable_kvduo = enable_kvduo
         super().__init__(
             size=size,
             page_size=page_size,
@@ -58,6 +62,45 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             index_buf_size=size * host_to_device_ratio,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
+
+    def _create_buffers(self):
+        if not self.enable_kvduo:
+            return super()._create_buffers()
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                # FULL retains ordinary layer views. HOT owns a whole page
+                # number and can use its fragments across every storage layer.
+                self._flat_kv_buffer = torch.zeros(
+                    (
+                        self.layer_num * (self.size + self.page_size),
+                        1,
+                        self.kv_cache_dim,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                self.kv_buffer = list(
+                    self._flat_kv_buffer.view(
+                        self.layer_num, self.size + self.page_size, 1, self.kv_cache_dim
+                    )
+                )
+
+    def _clear_buffers(self):
+        super()._clear_buffers()
+        if self.enable_kvduo:
+            del self._flat_kv_buffer
+
+    def get_flat_key_buffer(self) -> torch.Tensor:
+        """Raw cross-layer backing, with capture-stable token addresses."""
+        return self._flat_kv_buffer
+
+    @property
+    def flat_layer_slot_stride(self) -> int:
+        return self.size + self.page_size
 
     def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
         self.full_to_hisparse_device_index_mapping = (

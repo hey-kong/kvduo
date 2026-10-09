@@ -11,6 +11,58 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
+def hisparse_resolver_scratch_words(
+    num_top_k: int, hot_buffer_size: int, *, warp_size: int | None = None
+) -> int:
+    """Size of SmemLayout in int32 words, for a persistent global fallback."""
+    if warp_size is None:
+        warp_size = 64 if torch.version.hip else 32
+    chunks = (hot_buffer_size + warp_size - 1) // warp_size
+    hash_size = 2 * num_top_k
+    int32_count = num_top_k + 2 * (chunks + 1) + hash_size + 4
+    slot_bytes = 4 if hot_buffer_size > torch.iinfo(torch.int16).max else 2
+    required_bytes = 4 * int32_count + slot_bytes * (hot_buffer_size + hash_size)
+    return (required_bytes + 3) // 4
+
+
+def allocate_hisparse_resolver_scratch(
+    requests: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    block_size: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Check launch resources and allocate before capture when shared memory is too small.
+
+    One row per request is reused across serialized layer calls, rather than
+    reserving scratch for every (request, layer). The resolver fully initializes
+    each used row on every invocation, including after request-slot reuse.
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        return None
+    properties = torch.cuda.get_device_properties(device)
+    warp_size = 64 if torch.version.hip else 32
+    max_threads = getattr(properties, "max_threads_per_block", 1024)
+    if block_size < warp_size or block_size % warp_size or block_size > max_threads:
+        raise ValueError(
+            f"HiSparse resolver block_size={block_size} must be a multiple of "
+            f"{warp_size} and at most {max_threads} on {device}"
+        )
+    shared_limit = max(
+        properties.shared_memory_per_block,
+        getattr(properties, "shared_memory_per_block_optin", 0),
+    )
+    words = hisparse_resolver_scratch_words(
+        num_top_k, hot_buffer_size, warp_size=warp_size
+    )
+    # Four small shared counters remain even on the global path. Reserve
+    # compiler alignment headroom; the CUDA wrapper checks actual static usage.
+    if words * 4 + 256 <= shared_limit:
+        return None
+    return torch.empty((requests, words), dtype=torch.int32, device=device)
+
+
 @functools.cache
 def _jit_sparse_module(
     item_size_bytes: int,
@@ -19,12 +71,24 @@ def _jit_sparse_module(
     hot_buffer_size: int,
     is_mla: bool = False,
     is_dsv4_layout: bool = False,
+    use_global_scratch: bool = False,
 ) -> Module:
     template_args = make_cpp_args(
-        block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        is_mla,
+        is_dsv4_layout,
+        use_global_scratch,
     )
     cache_args = make_cpp_args(
-        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        is_mla,
+        is_dsv4_layout,
+        use_global_scratch,
     )
     return load_jit(
         "sparse_cache",
@@ -107,10 +171,22 @@ def _load_cache_to_device_buffer_mla(
     hot_base_capacities: torch.Tensor | None = None,
     prefill_ema: torch.Tensor | None = None,
     prefill_steps: torch.Tensor | None = None,
+    resolver_scratch: torch.Tensor | None = None,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    assert lru_slots.dtype == (
+        torch.int32 if hot_buffer_size > torch.iinfo(torch.int16).max else torch.int16
+    ), "LRU slot dtype must match the compiled HOT capacity"
+    if resolver_scratch is not None:
+        assert resolver_scratch.dtype == torch.int32
+        assert resolver_scratch.ndim == 2 and resolver_scratch.is_contiguous()
+        assert resolver_scratch.device == top_k_tokens.device
+        assert resolver_scratch.size(0) == device_buffer_tokens.size(0)
+        assert resolver_scratch.size(1) >= hisparse_resolver_scratch_words(
+            num_top_k, hot_buffer_size
+        )
 
     module = _jit_sparse_module(
         item_size_bytes,
@@ -119,6 +195,7 @@ def _load_cache_to_device_buffer_mla(
         hot_buffer_size,
         is_mla=True,
         is_dsv4_layout=is_dsv4_layout,
+        use_global_scratch=resolver_scratch is not None,
     )
 
     # Pass only scalars through TVM FFI.  Its PyTorch fallback can reject tensor
@@ -241,6 +318,8 @@ def _load_cache_to_device_buffer_mla(
         hot_base_capacities.data_ptr() if hot_base_capacities is not None else 0,
         prefill_ema.data_ptr() if prefill_ema is not None else 0,
         prefill_steps.data_ptr() if prefill_steps is not None else 0,
+        resolver_scratch.data_ptr() if resolver_scratch is not None else 0,
+        resolver_scratch.stride(0) if resolver_scratch is not None else 0,
     )
 
 
@@ -277,6 +356,7 @@ def load_cache_to_device_buffer_mla(
     hot_base_capacities: torch.Tensor | None = None,
     prefill_ema: torch.Tensor | None = None,
     prefill_steps: torch.Tensor | None = None,
+    resolver_scratch: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
     _load_cache_to_device_buffer_mla(
@@ -313,6 +393,7 @@ def load_cache_to_device_buffer_mla(
         hot_base_capacities=hot_base_capacities,
         prefill_ema=prefill_ema,
         prefill_steps=prefill_steps,
+        resolver_scratch=resolver_scratch,
     )
 
 
@@ -349,6 +430,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     hot_base_capacities: torch.Tensor | None = None,
     prefill_ema: torch.Tensor | None = None,
     prefill_steps: torch.Tensor | None = None,
+    resolver_scratch: torch.Tensor | None = None,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -385,6 +467,7 @@ def load_cache_to_device_buffer_dsv4_mla(
         hot_base_capacities=hot_base_capacities,
         prefill_ema=prefill_ema,
         prefill_steps=prefill_steps,
+        resolver_scratch=resolver_scratch,
     )
 
 
@@ -431,6 +514,9 @@ def rollback_kvduo_hot_metadata(
     assert targets.numel() == owners.size(0)
     for tensor in (tokens, locations, lru, visited, capacities):
         assert tensor.is_contiguous() and tensor.device == owners.device
+    assert lru.dtype == (
+        torch.int32 if lru.size(2) > torch.iinfo(torch.int16).max else torch.int16
+    ), "LRU slot dtype must match the compiled HOT capacity"
     # The coordinator pads token/location/visited rows by one page, but LRU
     # contains only HOT slots. Compile the scan for LRU's logical capacity;
     # the wrapper passes each bank's actual strides and padded width.
