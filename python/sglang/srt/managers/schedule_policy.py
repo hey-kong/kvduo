@@ -1243,6 +1243,7 @@ class PrefillAdder:
                         best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
+                        kvduo_prefill_reservation=reservation,
                     )
                 )
                 # KVDuo host-prefix restore may be transiently short of logical

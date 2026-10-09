@@ -250,7 +250,8 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         fill_call_count = 0
         match = coordinator.augment_kvduo_prefix_match(req, gpu_match, max_prefix_len=4)
-        self.assertEqual(fill_call_count, 1)
+        # Host probing and residency-plan construction both fetch the fill IDs.
+        self.assertEqual(fill_call_count, 2)
         self.assertEqual(match.host_hit_length, 2)
         self.assertEqual(match.full_kv_hit_length, 4)
         self.assertEqual(
@@ -420,7 +421,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.mem_pool_host = SimpleNamespace(load_to_device_per_layer=load)
         protected_during_reclaim = []
 
-        def reclaim(slots):
+        def reclaim(slots, **kwargs):
             protected_during_reclaim.append(
                 coordinator._kvduo_pressure_protected.clone()
             )
@@ -489,7 +490,15 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         self.assertTrue(torch.equal(restored, torch.tensor([10, 11])))
         self.assertEqual(
             coordinator._reclaim_for_physical_allocation.call_args_list,
-            [call(2), call(2)],
+            [
+                call(
+                    2,
+                    reserve_hot_minimum=True,
+                    prefill_reservation=None,
+                    allow_hot_reclaim=False,
+                )
+            ]
+            * 2,
         )
         self.assertEqual(protected_during_reclaim[0].tolist(), [5, 6])
         self.assertIsNone(coordinator._kvduo_pressure_protected)
@@ -1012,7 +1021,8 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         self.assertEqual(physical.available_size.call_count, 2)
         coordinator.token_to_kv_pool_allocator.available_size.assert_not_called()
         coordinator.reclaim_kvduo_full_pages.assert_called_once_with(5)
-        coordinator.reclaim_kvduo_hot_pages.assert_called_once_with(3)
+        # FULL already supplied the entire shortfall; HOT must stay untouched.
+        coordinator.reclaim_kvduo_hot_pages.assert_not_called()
 
     def test_does_not_reclaim_when_physical_pool_fits_reserved_page(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
