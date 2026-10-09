@@ -36,7 +36,7 @@ def ready_coordinator(extra=3, requests=1):
     coordinator, physical = make_merge_coordinator(
         {(0, 0): 8, **{(0, req): 1 for req in range(1, requests)}}
     )
-    coordinator.hot_visited[0, 0, 16:32] = True
+    coordinator.kvduo_capacity_ema[0, 0, :4] = 100
     coordinator._merge_kvduo_hot_pages(0, 0)
     coordinator._ensure_kvduo_hot_capacity_targets_batch({(0, 0): (4 + extra) * 4})
     coordinator.kvduo_prefill_ema[0, 0] = torch.tensor([1, 19])
@@ -278,7 +278,11 @@ def test_dsv4_full_physical_pool_reaches_rollback_with_real_allocator_budgets(pa
     else:
         assert adder.add_chunked_req(req) is req
     reserve.assert_called_once_with(
-        2, [0], tree_cache=adder.tree_cache, prefix_indices=req.prefix_indices
+        2,
+        [0],
+        tree_cache=adder.tree_cache,
+        prefix_indices=req.prefix_indices,
+        prefill_req=req,
     )
     assert adder.can_run_list == [req]
     assert req.extend_range == Range(8, 24)
@@ -413,6 +417,7 @@ def test_kvduo_keeps_logical_headroom_for_future_decode_before_rollback(path):
 
 def test_multiple_prefills_charge_logical_swa_offsets_and_separate_physical_reservations():
     coordinator, physical = ready_coordinator()
+    physical.free_pages = 2
     adder, first = actual_budget_adder_and_req(coordinator)
     _, second = actual_budget_adder_and_req(coordinator)
     second.full_untruncated_fill_ids = list(range(16))
@@ -421,7 +426,9 @@ def test_multiple_prefills_charge_logical_swa_offsets_and_separate_physical_rese
     assert adder.can_run_list == [first, second]
     assert adder.rem_total_tokens == adder.cur_rem_tokens == 984
     assert adder.rem_swa_token_offset == 40
-    assert coordinator._kvduo_reserved_prefill_pages() == physical.free_pages == 3
+    assert coordinator._kvduo_reserved_prefill_pages() == 3
+    assert physical.free_pages == 5
+    assert coordinator._kvduo_mandatory_hot_pages() == 2
     assert len(adder.kvduo_prefill_reservations) == 2
     # A third prefill cannot use the already-reserved physical pages.
     _, third = actual_budget_adder_and_req(coordinator)
@@ -445,6 +452,7 @@ def test_prefill_waits_without_mutating_chunk_or_loading_host_when_no_complete_p
 
 def test_host_restore_and_chunk_share_exact_reservation_and_cancellation_releases_hold():
     coordinator, physical = ready_coordinator(extra=4)
+    physical.free_pages = 1
     adder, req = adder_and_req(coordinator, host_hit=4)
 
     def restore(_):
@@ -456,7 +464,8 @@ def test_host_restore_and_chunk_share_exact_reservation_and_cancellation_release
     assert adder.add_one_req(req, False, None) is AddReqResult.CONTINUE
     assert req.extend_range == Range(6, 10)
     assert coordinator._kvduo_reserved_prefill_pages() == 2
-    assert physical.free_pages == 2
+    assert physical.free_pages == 3
+    assert coordinator._kvduo_mandatory_hot_pages() == 1
     token = adder.kvduo_prefill_reservations[0]
     coordinator.finish_kvduo_prefill_reservation(token, cancelled=False)
     assert coordinator._kvduo_reserved_prefill_pages() == 0
@@ -471,7 +480,7 @@ def test_host_restore_and_chunk_share_exact_reservation_and_cancellation_release
 def merged_and_expanded(page_counts, expanded, *, layers=1):
     c, physical = make_merge_coordinator(page_counts, layers=layers)
     for owner in page_counts:
-        c.hot_visited[owner][:8] = True
+        c.kvduo_capacity_ema[owner][:2] = 100
         c._merge_kvduo_hot_pages(*owner)
     c._ensure_kvduo_hot_capacity_targets_batch(
         {owner: pages * 4 for owner, pages in expanded.items()}
@@ -492,7 +501,7 @@ def test_rollback_cuda_entry_uses_unpadded_lru_capacity_and_passes_full_banks(
         {(layer, req): 4 for req in range(3) for layer in range(2)}, layers=2
     )
     assert c.req_device_buffer_tokens.shape == (2, 3, 34)
-    assert c.req_device_buffer_token_locs.shape == c.hot_visited.shape == (2, 3, 34)
+    assert c.req_device_buffer_token_locs.shape == (2, 3, 34)
     assert c.lru_slots.shape == (2, 3, 32)
     owners = torch.tensor([[0, 1], [1, 2]], dtype=torch.int64)
     targets = torch.tensor([8, 12], dtype=torch.int32)
@@ -506,7 +515,6 @@ def test_rollback_cuda_entry_uses_unpadded_lru_capacity_and_passes_full_banks(
         c.req_device_buffer_tokens,
         c.req_device_buffer_token_locs,
         c.lru_slots,
-        c.hot_visited,
         c.kvduo_req_hot_capacity_gpu,
     )
     ops.rollback_kvduo_hot_metadata(owners, targets, *banks)
@@ -529,15 +537,12 @@ def test_multi_request_layer_rollback_with_coordinator_padding_publishes_before_
         c.req_device_buffer_tokens,
         c.req_device_buffer_token_locs,
         c.lru_slots,
-        c.hot_visited,
         c.kvduo_req_hot_capacity_gpu,
     )
     assert banks[0].size(2) == c.device_buffer_size + c.page_size
     assert banks[2].size(2) == c.device_buffer_size
     c.req_device_buffer_tokens[:, :, 32:] = 999
     c.req_device_buffer_token_locs[:, :, 32:] = 999
-    c.hot_visited.fill_(True)
-    c.hot_visited[:, :, 1] = False
     c.lru_slots[:, :, :12] = torch.tensor(
         [9, 3, 10, 7, 0, 11, 6, 2, 8, 1, 5, 4], dtype=torch.int16
     )
@@ -561,13 +566,10 @@ def test_multi_request_layer_rollback_with_coordinator_padding_publishes_before_
                 assert c.kvduo_req_hot_capacity_gpu[owner].item() == 8
                 assert c.lru_slots[owner][:8].tolist() == [3, 7, 0, 6, 2, 1, 5, 4]
                 assert torch.all(c.lru_slots[owner][8:] == -1)
-                for bank, original in zip(
-                    (banks[0], banks[1], banks[3]), (before[0], before[1], before[3])
-                ):
+                for bank, original in zip((banks[0], banks[1]), (before[0], before[1])):
                     assert torch.equal(bank[owner][:8], original[owner][:8])
                 assert torch.all(c.req_device_buffer_tokens[owner][8:] == -1)
                 assert torch.all(c.req_device_buffer_token_locs[owner][8:] == -1)
-                assert not c.hot_visited[owner][8:].any()
                 assert c._kvduo_req_layer_pages[owner] == list(
                     c._kvduo_hot_base_pages[owner]
                 )
@@ -595,7 +597,6 @@ def test_first_growth_starts_evaluation_without_reference_stage_later_growth_kee
             c.kvduo_hot_base_capacity,
             c.kvduo_prefill_ema,
             c.kvduo_prefill_steps,
-            c.hot_visited,
         )
     ]
     p.free_pages = 10
@@ -608,15 +609,13 @@ def test_first_growth_starts_evaluation_without_reference_stage_later_growth_kee
             c.kvduo_hot_base_capacity,
             c.kvduo_prefill_ema,
             c.kvduo_prefill_steps,
-            c.hot_visited,
         )
     ]
     c.req_device_buffer_tokens[0, 0, :16] = torch.arange(16, dtype=torch.int32)
-    c.hot_visited[0, 0, :16] = True
     c._merge_kvduo_hot_pages(0, 0)  # no-release merge still resets the phase
     assert len(c._kvduo_hot_base_pages[0, 0]) == 4
     assert c.kvduo_prefill_steps[0, 0].item() == 0
-    assert not c.kvduo_prefill_ema.any() and not c.hot_visited.any()
+    assert not c.kvduo_prefill_ema.any()
     c.kvduo_prefill_ema[0, 0] = torch.tensor([9, 10])
     c.kvduo_prefill_steps[0, 0] = 30
     c._ensure_kvduo_hot_capacity_targets_batch({(0, 0): 20})
@@ -629,13 +628,10 @@ def test_whole_request_releases_all_extra_pages_and_limits_base_only_and_later_h
     )
     c.kvduo_prefill_ema[0, 0] = torch.tensor([8, 10])
     c.kvduo_prefill_ema[1, 0] = torch.tensor([0, 90])
-    c.hot_visited[:, 0, :8] = True
-    c.hot_visited[0, 0, 8:16] = True
     c.lru_slots[0, 0, :16] = torch.tensor(
         [9, 3, 10, 7, 0, 11, 6, 12, 2, 8, 1, 13, 5, 14, 4, 15], dtype=torch.int16
     )
     before = c.req_device_buffer_tokens.clone()
-    visited = c.hot_visited.clone()
     move = MagicMock()
     c._move_kvduo_hot_entries = move
     token = c.reserve_kvduo_prefill(1, [0])
@@ -643,12 +639,10 @@ def test_whole_request_releases_all_extra_pages_and_limits_base_only_and_later_h
     assert c.kvduo_req_hot_capacity[:, 0].tolist() == [8, 8, 8, 0]
     assert c.lru_slots[0, 0, :8].tolist() == [3, 7, 0, 6, 2, 1, 5, 4]
     assert torch.equal(c.req_device_buffer_tokens[:3, 0, :8], before[:3, 0, :8])
-    assert torch.equal(c.hot_visited[:3, 0, :8], visited[:3, 0, :8])
-    assert not c.hot_visited[:, :, 8:].any()
     assert c._kvduo_request_limited(0) and not c._kvduo_can_merge((2, 0))
     move.assert_not_called()
     assert c._kvduo_prefill_budget_cost[c._kvduo_request_key(0)] == 8
-    assert c._kvduo_prefill_budget_reference == {(0, 0, 0): 10, (1, 0, 0): 90}
+    assert not c._kvduo_prefill_budget_reference
     # No established HOT cache in layer3: its later mandatory allocation is
     # allowed, but never above the minimum, and inherits the request limit.
     c._ensure_kvduo_hot_capacity_targets_batch({(3, 0): 16}, allow_reclaim=False)
@@ -710,12 +704,12 @@ def test_fixed_round_budget_does_not_decay_or_expand_with_current_miss_observati
     c.kvduo_prefill_ema[0, 1] = torch.tensor([17, 1000])
     assert c.reserve_kvduo_prefill(1, [0, 1]) is None
     assert p.free_pages == 0 and c._kvduo_prefill_budget_cost == {(0, 0): 5}
-    c.kvduo_prefill_ema[0, 1] = torch.tensor([15, 1000])
+    c.kvduo_prefill_ema[0, 1] = torch.tensor([5, 1000])
     second = c.reserve_kvduo_prefill(1, [0, 1])
-    assert second is not None and sum(c._kvduo_prefill_budget_cost.values()) == 20
+    assert second is not None and sum(c._kvduo_prefill_budget_cost.values()) == 10
     c._reset_kvduo_hot_metadata(0)
-    assert c._kvduo_prefill_budget_reference == {(0, 1, 0): 100}
-    assert c._kvduo_prefill_budget_cost == {(1, 0): 15}
+    assert not c._kvduo_prefill_budget_reference
+    assert c._kvduo_prefill_budget_cost == {(1, 0): 5}
     assert c._kvduo_hand_sequence == 2  # lifecycle reset never restarts Hand
     c.finish_kvduo_prefill_reservation(second, cancelled=True)
     assert (
@@ -731,7 +725,6 @@ def test_no_new_generation_or_evaluation_phase_can_use_old_round_reference():
     p.free_pages = 0
     c.finish_kvduo_prefill_reservation(token, cancelled=False)
     c.req_device_buffer_tokens[0, 1, :12] = torch.arange(12, dtype=torch.int32)
-    c.hot_visited[0, 1, :12] = True
     c._merge_kvduo_hot_pages(0, 1)  # new base invalidates original round entry
     p.free_pages = 1
     c._ensure_kvduo_hot_capacity_targets_batch({(0, 1): 16})
@@ -758,10 +751,11 @@ def test_prefill_completion_keeps_limits_until_real_headroom_and_discards_old_ev
     c.kvduo_hot_growth_events[0, 0] = 1
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
     assert not c._kvduo_request_limited(0)
-    assert c.kvduo_req_hot_capacity[0, 0].item() == 16
+    assert c.kvduo_req_hot_capacity[0, 0].item() == 20
+    p.free_pages = 1
     c.kvduo_hot_growth_events[0, 0] = 1
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
-    assert c.kvduo_req_hot_capacity[0, 0].item() == 20
+    assert c.kvduo_req_hot_capacity[0, 0].item() == 24
 
 
 def test_request_end_clears_all_generation_bound_records_but_not_global_hand():

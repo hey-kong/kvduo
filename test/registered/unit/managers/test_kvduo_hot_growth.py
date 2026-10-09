@@ -1,6 +1,6 @@
 """CPU regressions exercising the production HOT allocation/replay boundary."""
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -50,7 +50,6 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
     coordinator.kvduo_observe = torch.ones(1, dtype=torch.int32)
     # Match production: LRU has HOT capacity, other banks have page padding.
     metadata_shape = (layers, requests, coordinator.padded_buffer_size)
-    coordinator.hot_visited = torch.zeros(metadata_shape, dtype=torch.bool)
     coordinator.kvduo_hot_growth_events = torch.zeros(
         (layers, requests), dtype=torch.int32
     )
@@ -144,6 +143,31 @@ def test_full_resident_requests_keep_zero_hot_capacity():
 
     physical.alloc.assert_not_called()
     assert int(coordinator.kvduo_req_hot_capacity[0, 0]) == 0
+
+
+@pytest.mark.parametrize("free_pages", [1, 2])
+def test_mandatory_allocation_credits_its_minimum_and_protects_other_owners(free_pages):
+    coordinator, physical = make_coordinator(requests=2, free_pages=free_pages)
+    coordinator.item_size_bytes = 1
+    coordinator._reclaim_for_physical_allocation = MethodType(
+        HiSparseCoordinator._reclaim_for_physical_allocation, coordinator
+    )
+    coordinator._require_allocation_ready = (
+        HiSparseCoordinator._require_allocation_ready
+    )
+    coordinator.reclaim_kvduo_hot_pages = MagicMock(return_value=0)
+
+    if free_pages == 1:
+        with pytest.raises(RuntimeError, match="physical allocation cannot proceed"):
+            coordinator._ensure_kvduo_hot_capacity_targets_batch({(0, 0): 4})
+        physical.alloc.assert_not_called()
+        assert not coordinator._kvduo_req_layer_pages
+    else:
+        coordinator._ensure_kvduo_hot_capacity_targets_batch({(0, 0): 4})
+        assert int(coordinator.kvduo_req_hot_capacity[0, 0]) == 4
+        assert physical.free_pages == 1
+        assert coordinator._kvduo_mandatory_hot_pages() == 1
+        coordinator.reclaim_kvduo_full_pages.assert_not_called()
 
 
 def test_capacity_event_grows_on_the_very_next_replay_without_miss_thresholds():
@@ -342,7 +366,8 @@ def test_resolver_ffi_receives_the_stable_growth_event_pointer(monkeypatch, dsv4
         hot_buffer_size=32,
         num_real_reqs=torch.ones(1, dtype=torch.int32),
         req_hot_buffer_sizes=coordinator.kvduo_req_hot_capacity_gpu[0],
-        hot_visited=coordinator.hot_visited[0],
+        capacity_ema=coordinator.kvduo_capacity_ema[0],
+        capacity_steps=coordinator.kvduo_capacity_steps[0],
         req_to_logical_token=torch.arange(16, dtype=torch.int64).view(1, -1),
         full_to_device_loc=torch.zeros(16, dtype=torch.int64),
         full_last_touch=torch.zeros(16, dtype=torch.int64),
@@ -360,7 +385,8 @@ def test_resolver_ffi_receives_the_stable_growth_event_pointer(monkeypatch, dsv4
 
     args = module.load_cache_to_device_buffer.call_args.args
     assert args[20] == coordinator.kvduo_hot_growth_events[0].data_ptr()
-    assert args[12] == coordinator.hot_visited[0].data_ptr()
+    assert args[12] == coordinator.kvduo_capacity_ema[0].data_ptr()
+    assert args[27] == coordinator.kvduo_capacity_steps[0].data_ptr()
     assert args[-6:-2] == (
         coordinator.kvduo_observe.data_ptr(),
         coordinator.kvduo_hot_base_capacity[0].data_ptr(),

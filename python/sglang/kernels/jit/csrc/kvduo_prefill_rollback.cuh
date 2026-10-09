@@ -28,14 +28,12 @@ __global__ void kvduo_prefill_rollback_kernel(
     int32_t* tokens,
     int32_t* locations,
     KVDuoRollbackSlot<CAPACITY>* lru,
-    bool* visited,
     int32_t* capacities,
     int requests,
     int64_t padded_capacity,
     KVDuoRollbackStrides token_strides,
     KVDuoRollbackStrides location_strides,
-    KVDuoRollbackStrides lru_strides,
-    KVDuoRollbackStrides visited_strides) {
+    KVDuoRollbackStrides lru_strides) {
   constexpr int ITEMS = (CAPACITY + BLOCK_SIZE - 1) / BLOCK_SIZE;
   using SlotT = KVDuoRollbackSlot<CAPACITY>;
   using Scan = rollback_cub::BlockScan<int, BLOCK_SIZE>;
@@ -47,7 +45,6 @@ __global__ void kvduo_prefill_rollback_kernel(
   tokens += layer * token_strides.layer + request * token_strides.request;
   locations += layer * location_strides.layer + request * location_strides.request;
   lru += layer * lru_strides.layer + request * lru_strides.request;
-  visited += layer * visited_strides.layer + request * visited_strides.request;
   const int target = targets[blockIdx.x];
   const int old_capacity = capacities[owner];
   SlotT slots[ITEMS];
@@ -74,7 +71,6 @@ __global__ void kvduo_prefill_rollback_kernel(
   for (int64_t slot = target + tid; slot < padded_capacity; slot += BLOCK_SIZE) {
     tokens[slot] = -1;
     locations[slot] = -1;
-    visited[slot] = false;
   }
   __syncthreads();
   if (tid == 0) capacities[owner] = target;
@@ -87,7 +83,6 @@ void kvduo_prefill_rollback(
     tvm::ffi::TensorView tokens,
     tvm::ffi::TensorView locations,
     tvm::ffi::TensorView lru,
-    tvm::ffi::TensorView visited,
     tvm::ffi::TensorView capacities) {
   using namespace host;
   using SlotT = KVDuoRollbackSlot<CAPACITY>;
@@ -105,12 +100,6 @@ void kvduo_prefill_rollback(
       .verify(tokens)
       .verify(locations);
   TensorMatcher({layers, requests, CAPACITY}).with_dtype<SlotT>().with_device(device).verify(lru);
-  // bool is integral in C++; TensorMatcher's generic integral trait maps it
-  // to uint8. PyTorch exports a distinct DLPack bool8 dtype.
-  TensorMatcher({layers, requests, padded_capacity})
-      .with_dtype(DLDataType{kDLBool, 8, 1})
-      .with_device(device)
-      .verify(visited);
   TensorMatcher({layers, requests}).with_dtype<int32_t>().with_device(device).verify(capacities);
   RuntimeCheck(padded_capacity.unwrap() >= CAPACITY, "Padded metadata cannot be smaller than LRU capacity");
   LaunchKernel(n.unwrap(), BLOCK_SIZE, device.unwrap())(
@@ -120,14 +109,12 @@ void kvduo_prefill_rollback(
       static_cast<int32_t*>(tokens.data_ptr()),
       static_cast<int32_t*>(locations.data_ptr()),
       static_cast<SlotT*>(lru.data_ptr()),
-      static_cast<bool*>(visited.data_ptr()),
       static_cast<int32_t*>(capacities.data_ptr()),
       static_cast<int>(requests.unwrap()),
       padded_capacity.unwrap(),
       KVDuoRollbackStrides{tokens.stride(0), tokens.stride(1)},
       KVDuoRollbackStrides{locations.stride(0), locations.stride(1)},
-      KVDuoRollbackStrides{lru.stride(0), lru.stride(1)},
-      KVDuoRollbackStrides{visited.stride(0), visited.stride(1)});
+      KVDuoRollbackStrides{lru.stride(0), lru.stride(1)});
 }
 
 }  // namespace

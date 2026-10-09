@@ -8,7 +8,10 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from sglang.srt.mem_cache.sparsity.core.kvduo_hot_merge import plan_kvduo_hot_merge
+from sglang.srt.mem_cache.sparsity.core.kvduo_hot_merge import (
+    plan_kvduo_hot_merge,
+    kvduo_shrink_target,
+)
 from test_kvduo_hot_growth import make_coordinator
 
 
@@ -35,6 +38,8 @@ def make_merge_coordinator(page_counts, *, layers=1, top_k=2):
             capacity, dtype=torch.int16
         )
         seed_payloads(coordinator, layer, req)
+        coordinator.kvduo_capacity_steps[layer, req] = 65
+        coordinator.kvduo_capacity_ema[layer, req, : min(2, pages)] = 100
     physical.free_pages = 0
     coordinator.token_to_kv_pool_allocator.free_hisparse_indices.reset_mock()
     return coordinator, physical
@@ -71,41 +76,129 @@ def assert_payloads_match_tokens(coordinator, layer, req):
     )
 
 
+def prefill_protected_growth_coordinator(*, free_pages, applicant_pages=2):
+    c, p = make_merge_coordinator({(0, 0): 2, (0, 1): applicant_pages, (0, 2): 8})
+    key = c._kvduo_request_key(0)
+    c._establish_kvduo_hot_base((0, 0), c._kvduo_req_layer_pages[0, 0])
+    c._kvduo_prefill_limited_requests.add(key)
+    c._kvduo_prefill_budget_cost[key] = 1.0
+    c.kvduo_hot_page_limit[:, 0] = 2
+    # Keep the lock pending complete-prefill conversion even when pages appear.
+    prefill_key = c._kvduo_prefill_key(SimpleNamespace(rid="prefilling"))
+    c._kvduo_prefill_associations[key] = {prefill_key}
+    c._kvduo_next_prefill_pages = 5
+    p.free_pages = free_pages
+    p.alloc.reset_mock()
+    c.reclaim_kvduo_hot_pages = MagicMock(wraps=c.reclaim_kvduo_hot_pages)
+    return c, p
+
+
 @pytest.mark.parametrize(
-    "visited_count,target", [(0, 1), (4, 1), (5, 2), (12, 3), (16, 4)]
+    "events,free_pages,applicant_pages",
+    [(0, 0, 2), (1, 0, 2), (1, 4, 2), (0, 5, 2), (1, 0, 8)],
 )
-def test_visited_count_drives_capacity_without_halving(visited_count, target):
-    c, physical = make_merge_coordinator({(0, 0): 4})
-    c.hot_visited[0, 0, :visited_count] = True
-    expected = live_lru(c, 0, 0)[:visited_count]
-    assert c._merge_kvduo_hot_pages(0, 0) == (4 - target) * c.page_size
-    assert physical.free_pages == 4 - target
-    assert int(c.kvduo_req_hot_capacity[0, 0]) == target * 4
-    assert live_lru(c, 0, 0) == expected
-    assert_payloads_match_tokens(c, 0, 0)
-    assert not torch.any(c.hot_visited)
-    assert len(c._kvduo_hot_base_pages[0, 0]) == target
-    assert c._kvduo_hot_processed[0, 0] == 1
+def test_optional_growth_never_merges_to_cover_waiting_prefill(
+    events, free_pages, applicant_pages
+):
+    c, p = prefill_protected_growth_coordinator(
+        free_pages=free_pages, applicant_pages=applicant_pages
+    )
+    banks = (
+        c.req_device_buffer_tokens,
+        c.req_device_buffer_token_locs,
+        c.lru_slots,
+        c.kvduo_req_hot_capacity,
+        c.kvduo_req_hot_capacity_gpu,
+        c.kvduo_capacity_ema,
+        c.kvduo_capacity_steps,
+        c.kvduo_prefill_ema,
+        c.kvduo_prefill_steps,
+    )
+    before = [bank.clone() for bank in banks]
+    c.kvduo_hot_growth_events[0, 1] = events
+
+    c.prepare_kvduo_graph_replay(torch.tensor([0, 1, 2]))
+
+    c.reclaim_kvduo_hot_pages.assert_not_called()
+    p.alloc.assert_not_called()
+    c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
+    assert all(torch.equal(bank, old) for bank, old in zip(banks, before))
+    assert p.free_pages == free_pages and c._kvduo_hand == 0
+    assert c._kvduo_request_limited(0)
+    assert c._kvduo_prefill_budget_cost[c._kvduo_request_key(0)] == 1.0
+    assert not c.kvduo_hot_growth_events.any()
+    # A deferred capacity event cannot be replayed when space later appears.
+    p.free_pages = 6
+    c.prepare_kvduo_graph_replay(torch.tensor([0, 1, 2]))
+    c.reclaim_kvduo_hot_pages.assert_not_called()
+    p.alloc.assert_not_called()
+    assert all(torch.equal(bank, old) for bank, old in zip(banks, before))
 
 
-def test_merge_keeps_visited_even_if_lru_and_minimizes_payload_moves_before_free():
+@pytest.mark.parametrize(
+    "free_pages,protected_pages,merge_needed",
+    [(5, 5, True), (6, 5, False), (0, 0, True)],
+)
+def test_optional_growth_merges_only_for_real_applicants_after_prefill_is_covered(
+    free_pages, protected_pages, merge_needed
+):
+    c, p = prefill_protected_growth_coordinator(free_pages=free_pages)
+    c._kvduo_next_prefill_pages = protected_pages
+    c.kvduo_hot_growth_events[0, 1] = 1
+    applicant_lru = live_lru(c, 0, 1)
+
+    c.prepare_kvduo_graph_replay(torch.tensor([0, 1, 2]))
+
+    if merge_needed:
+        c.reclaim_kvduo_hot_pages.assert_called_once_with(2, excluded_owners={(0, 1)})
+        assert c.kvduo_req_hot_capacity[0, 2] == 8
+        assert_payloads_match_tokens(c, 0, 2)
+    else:
+        c.reclaim_kvduo_hot_pages.assert_not_called()
+        assert c.kvduo_req_hot_capacity[0, 2] == 32
+    p.alloc.assert_called_once_with(2)
+    assert c.kvduo_req_hot_capacity[0, 1] == 12
+    assert live_lru(c, 0, 1) == applicant_lru
+    assert p.free_pages == free_pages + (6 if merge_needed else 0) - 1
+    assert p.free_pages >= protected_pages
+    assert c._kvduo_request_limited(0)
+
+
+@pytest.mark.parametrize(
+    "steps,misses,hits,target",
+    [
+        (64, 100, [100, 30, 5, 1], 4),
+        (65, 100, [100, 30, 5, 1], 2),
+        (65, 0, [100, 0, 0, 0], 1),
+        (65, 0, [100, 0, 0, 1], 4),
+        (65, 1, [100, 0, 0, 0.1], 1),
+        (65, 100, [float("nan"), 0, 0, 0], 4),
+    ],
+)
+def test_budget_selects_smallest_mature_capacity(steps, misses, hits, target):
+    assert kvduo_shrink_target(hits, misses, steps, 4, 1, 0.10) == target
+
+
+def test_target_respects_multi_page_minimum():
+    assert kvduo_shrink_target([0] * 8, 0, 65, 8, 3, 0.10) == 3
+
+
+def test_mru_merge_moves_minimum_payload_and_publishes_before_free():
     c, physical = make_merge_coordinator({(0, 0): 4, (1, 0): 2}, layers=2)
     survivors = [5, 1, 12, 6, 13, 4, 14, 7]
     c.lru_slots[0, 0, :16] = torch.tensor(
-        survivors + [0, 2, 3, 8, 9, 10, 11, 15], dtype=torch.int16
+        [0, 2, 3, 8, 9, 10, 11, 15] + survivors, dtype=torch.int16
     )
-    c.hot_visited[0, 0, survivors] = True
     pages = list(c._kvduo_req_layer_pages[0, 0])
-    expected = live_lru(c, 0, 0)[:8]
     other = c.req_device_buffer_tokens[1].clone()
     c._move_kvduo_hot_entries = MagicMock(wraps=c._move_kvduo_hot_entries)
     free = c.token_to_kv_pool_allocator.free_hisparse_indices.side_effect
 
     def check(indices):
         assert c._kvduo_req_layer_pages[0, 0] == [pages[1], pages[3]]
-        assert live_lru(c, 0, 0) == expected
+        assert live_lru(c, 0, 0) == [10 + s for s in survivors]
         assert_payloads_match_tokens(c, 0, 0)
-        assert not torch.any(c.hot_visited[0, 0])
+        assert not c.kvduo_capacity_ema[0, 0].any()
         free(indices)
 
     c.token_to_kv_pool_allocator.free_hisparse_indices.side_effect = check
@@ -120,105 +213,89 @@ def test_merge_keeps_visited_even_if_lru_and_minimizes_payload_moves_before_free
         assert torch.all(bank[0, 0, 8:] == -1)
 
 
-def test_minimum_capacity_is_still_cleaned_and_no_release_rebuilds_base():
-    c, physical = make_merge_coordinator({(0, 0): 1})
-    c.hot_visited[0, 0, 2] = True
-    c.kvduo_prefill_ema[0, 0] = torch.tensor([5, 7])
+def test_no_release_scan_keeps_contents_lru_and_capacity_cost_but_rebuilds_base():
+    c, p = make_merge_coordinator({(0, 0): 4})
+    c.kvduo_capacity_ema[0, 0, :4] = 1
+    before = [
+        b.clone()
+        for b in (
+            c.req_device_buffer_tokens,
+            c.lru_slots,
+            c.kvduo_capacity_ema,
+            c.kvduo_capacity_steps,
+        )
+    ]
     assert c.reclaim_kvduo_hot_pages(2) == 0
-    assert live_lru(c, 0, 0) == [12]
-    assert c.lru_slots[0, 0, :4].tolist() == [0, 1, 3, 2]
-    assert not torch.any(c.hot_visited)
-    assert not torch.any(c.kvduo_prefill_ema)
-    assert c._kvduo_hand_sequence == 1
-    c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
-
-
-def test_hand_wraps_and_second_visit_reclaims_after_zero_release_first_rotation():
-    c, physical = make_merge_coordinator(
-        {(layer, req): 2 for req in range(2) for layer in range(2)}, layers=2
+    assert all(
+        torch.equal(b, x)
+        for b, x in zip(
+            (
+                c.req_device_buffer_tokens,
+                c.lru_slots,
+                c.kvduo_capacity_ema,
+                c.kvduo_capacity_steps,
+            ),
+            before,
+        )
     )
-    c.hot_visited[:, :, :8] = True
-    merge = c._merge_kvduo_hot_pages
-    calls = []
+    assert c._kvduo_hand_sequence == 1
+    assert len(c._kvduo_hot_base_pages[0, 0]) == 4
+    assert c.reclaim_kvduo_hot_pages(2) == 0
+    assert c._kvduo_hand_sequence == 2
 
-    def trace(layer, req):
-        calls.append((layer, req))
-        return merge(layer, req)
 
-    c._merge_kvduo_hot_pages = trace
+def test_hand_resumes_request_major_and_never_erases_cost_to_force_progress():
+    c, p = make_merge_coordinator(
+        {(layer, req): 3 for req in range(2) for layer in range(2)}, layers=2
+    )
     assert c.reclaim_kvduo_hot_pages(2) == 2
-    assert calls == [(0, 0), (1, 0), (0, 1), (1, 1), (0, 0)]
-    assert c._kvduo_hand == 1
-    assert c._kvduo_hand_sequence == 5
-    assert not live_lru(c, 0, 0)
-    # The next invocation resumes at the following layer, not slot zero.
+    assert c._kvduo_hand == 1 and c._kvduo_hot_processed == {(0, 0): 1}
     assert c.reclaim_kvduo_hot_pages(2) == 2
-    assert calls[-1] == (1, 0)
-    assert c._kvduo_hand == 2
+    assert c._kvduo_hand == 2 and c._kvduo_hot_processed[(1, 0)] == 2
 
 
-def test_hand_skips_protected_staging_applicants_and_limited_requests_without_clearing_flags():
-    c, physical = make_merge_coordinator({(0, req): 2 for req in range(5)})
-    c.hot_visited[0, :, 0] = True
+def test_scan_skips_generation_staging_protection_applicants_and_fixed_mode():
+    c, p = make_merge_coordinator({(0, req): 3 for req in range(5)})
     c._kvduo_hot_pressure_protected.add((0, 1, 0))
     c._active_kvduo_reqs[2] = SimpleNamespace(hisparse_staging=True)
     c._kvduo_prefill_limited_requests.add(c._kvduo_request_key(3))
     assert c.reclaim_kvduo_hot_pages(2, excluded_owners={(0, 0)}) == 2
-    assert torch.all(c.hot_visited[0, :4, 0])
     assert c._kvduo_hot_processed == {(0, 4): 1}
-    assert c._kvduo_hand == 0
+    c._kvduo_request_generation[4] += 1
+    assert c.reclaim_kvduo_hot_pages(2, excluded_owners={(0, 0)}) == 0
 
 
-def test_stale_generation_and_all_protected_finish_without_no_progress_loop():
-    c, physical = make_merge_coordinator({(0, 0): 4})
-    c.hot_visited[0, 0, :16] = True
-    c._kvduo_request_generation[0] += 1
-    assert c.reclaim_kvduo_hot_pages(2) == 0
-    assert torch.all(c.hot_visited[0, 0, :16])
-    assert not c._kvduo_hot_processed
-    c._kvduo_hot_generation[0, 0] = c._kvduo_request_generation[0]
-    c._kvduo_hot_pressure_protected.add((0, 0, 0))
-    assert c.reclaim_kvduo_hot_pages(2) == 0
-    assert not c._kvduo_hot_processed
-
-
-def test_failed_payload_move_never_publishes_or_releases_source_pages():
-    c, physical = make_merge_coordinator({(0, 0): 4})
-    # One survivor in each page forces a retained/released-page move.
-    c.hot_visited[0, 0, [0, 4, 8, 12]] = True
+def test_copy_failure_does_not_publish_or_free():
+    c, p = make_merge_coordinator({(0, 0): 4})
+    survivors = list(range(8, 16))
+    c.lru_slots[0, 0, :16] = torch.tensor(
+        [0, 2, 3, 5, 6, 7, 9, 10] + [1, 4, 8, 11, 12, 13, 14, 15], dtype=torch.int16
+    )
     before = c.req_device_buffer_tokens.clone()
     c._move_kvduo_hot_entries = MagicMock(side_effect=RuntimeError("copy failed"))
     with pytest.raises(RuntimeError, match="copy failed"):
         c._merge_kvduo_hot_pages(0, 0)
     assert torch.equal(before, c.req_device_buffer_tokens)
-    assert len(c._kvduo_req_layer_pages[0, 0]) == 4
-    assert physical.free_pages == 0
-    assert not c._kvduo_hot_base_pages
+    assert len(c._kvduo_req_layer_pages[0, 0]) == 4 and p.free_pages == 0
 
 
-def test_random_merge_plans_preserve_exact_visited_set_lru_and_page_selection():
+def test_random_plans_preserve_mru_set_relative_order_and_optimal_page_choice():
     rng = random.Random(9)
     for _ in range(250):
         n = rng.randrange(1, 9)
         k = 4
-        top_k = rng.randrange(1, n * k + 1)
+        topk = rng.randrange(1, n * k + 1)
+        m = rng.randrange((topk + k - 1) // k, n + 1)
         tokens = [i if rng.random() < 0.8 else -1 for i in range(n * k)]
-        visited = [rng.random() < 0.6 for i in range(n * k)]
         lru = list(range(n * k))
         rng.shuffle(lru)
-        plan = plan_kvduo_hot_merge(tokens, lru, k, top_k, visited)
-        survivors = [i for i in lru if tokens[i] >= 0 and visited[i]]
-        assert len(plan.kept_pages) == max(
-            (top_k + k - 1) // k, (len(survivors) + k - 1) // k
-        )
+        plan = plan_kvduo_hot_merge(tokens, lru, k, topk, m)
+        survivors = [i for i in lru if tokens[i] >= 0][-m * k :]
         assert [plan.tokens[i] for i in plan.lru_slots if plan.tokens[i] >= 0] == [
             tokens[i] for i in survivors
         ]
         counts = [sum(i // k == p for i in survivors) for p in range(n)]
-        expected = sorted(
-            sorted(range(n), key=lambda p: (-counts[p], p))[: len(plan.kept_pages)]
+        assert list(plan.kept_pages) == sorted(
+            sorted(range(n), key=lambda p: (-counts[p], p))[:m]
         )
-        assert list(plan.kept_pages) == expected
-        assert all(i // k in plan.released_pages for i in plan.source_slots)
-        assert all(i // k in plan.kept_pages for i in plan.destination_slots)
-        assert sorted(plan.lru_slots) == list(range(len(plan.tokens)))
+        assert sorted(plan.lru_slots) == list(range(m * k))

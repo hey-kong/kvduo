@@ -199,7 +199,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     typename SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::SlotT* __restrict__ lru_slots,
     const int32_t* __restrict__ num_real_reqs,
     const int32_t* __restrict__ req_hot_buffer_sizes,
-    bool* __restrict__ hot_visited,
+    float* __restrict__ capacity_ema,
     const int64_t* __restrict__ req_to_logical_token,
     const int64_t* __restrict__ full_to_device_loc,
     int64_t* __restrict__ full_last_touch,
@@ -216,7 +216,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t buffer_stride_0,
     int64_t host_stride,
     int64_t lru_slot_stride_0,
-    int64_t hot_visited_stride_0,
+    int64_t* __restrict__ capacity_steps,
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t page_size,
@@ -268,10 +268,12 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int64_t buffer_offset = rid * buffer_stride_0;
   int32_t* req_device_buffer_tokens = device_buffer_tokens + buffer_offset;
   const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
-  bool* req_visited = hot_visited != nullptr ? hot_visited + rid * hot_visited_stride_0 : nullptr;
   const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
   SlotT* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
-  if (tid == 0 && enable_full_lookup) swap_status[rid] = 0;
+  if (tid == 0 && enable_full_lookup) {
+    swap_status[rid] = 0;
+    if (observe && hot_growth_events != nullptr) hot_growth_events[rid] = 0;
+  }
   __syncthreads();
 
   // KVDuo deliberately keeps complete pages resident until memory pressure
@@ -288,6 +290,8 @@ __global__ void load_cache_to_device_buffer_kernel(
   __shared__ int full_resident_accesses;
   __shared__ int needs_hot_growth;
   __shared__ int base_hot_hits;
+  __shared__ int segment_hot_hits[8];
+  if (tid < 8) segment_hot_hits[tid] = 0;
   if (tid == 0) {
     needs_hot_resolver = 0;
     full_resident_accesses = 0;
@@ -491,8 +495,9 @@ __global__ void load_cache_to_device_buffer_kernel(
     if (is_hit) {
       s_top_k_tokens[my_found_top_k_idx] = TOKEN_HIT;
       req_top_k_device_locs[my_found_top_k_idx] = req_device_buffer_locs[buf_slot];
-      if (req_visited != nullptr) {
-        sglang::kvduo_record_hot_hit(req_visited[buf_slot], observe && swap_status[rid] == 0);
+      if (capacity_ema != nullptr && observe) {
+        const int segment = sglang::kvduo_lru_segment(hot_buffer_size, slot_idx, page_size);
+        atomicAdd(&segment_hot_hits[segment], 1);
       }
     }
 
@@ -615,7 +620,6 @@ __global__ void load_cache_to_device_buffer_kernel(
       s_top_k_tokens[miss_offset] = my_token;
       req_top_k_device_locs[my_token_idx] = req_device_buffer_locs[evict_slot];
       req_device_buffer_tokens[evict_slot] = my_token;
-      if (req_visited != nullptr) sglang::kvduo_record_hot_insert(req_visited[evict_slot]);
     }
   }
   __syncthreads();
@@ -629,7 +633,13 @@ __global__ void load_cache_to_device_buffer_kernel(
       atomicAdd(
           &resolver_stats[rid * resolver_stats_stride + 1], total_misses + s_total_hits + s_full_hits + s_newest_hit);
       if (hot_growth_events != nullptr && needs_hot_growth) {
-        atomicAdd(&hot_growth_events[rid], 1);
+        atomicExch(&hot_growth_events[rid], 1);
+      }
+      const int accesses = total_misses + s_total_hits + s_full_hits + s_newest_hit;
+      if (capacity_ema != nullptr && observe && swap_status[rid] == 0) {
+        sglang::kvduo_update_capacity_ema(
+            segment_hot_hits, total_misses, accesses, hot_buffer_size / page_size,
+            capacity_ema + rid * 9, capacity_steps[rid]);
       }
       if (observe_prefill && swap_status[rid] == 0) {
         sglang::kvduo_update_prefill_ema(
@@ -739,7 +749,7 @@ void load_cache_to_device_buffer(
     uint64_t lru_slots_ptr,
     uint64_t num_real_reqs_ptr,
     uint64_t req_hot_buffer_sizes_ptr,
-    uint64_t hot_visited_ptr,
+    uint64_t capacity_ema_ptr,
     uint64_t req_to_logical_token_ptr,
     uint64_t full_to_device_loc_ptr,
     uint64_t full_last_touch_ptr,
@@ -754,7 +764,7 @@ void load_cache_to_device_buffer(
     int64_t host_stride,
     int64_t buffer_stride_0,
     int64_t lru_slot_stride_0,
-    int64_t hot_visited_stride_0,
+    uint64_t capacity_steps_ptr,
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t req_to_logical_stride,
@@ -822,7 +832,7 @@ void load_cache_to_device_buffer(
         reinterpret_cast<SlotT*>(static_cast<uintptr_t>(lru_slots_ptr)),
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(num_real_reqs_ptr)),
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(req_hot_buffer_sizes_ptr)),
-        reinterpret_cast<bool*>(static_cast<uintptr_t>(hot_visited_ptr)),
+        reinterpret_cast<float*>(static_cast<uintptr_t>(capacity_ema_ptr)),
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(req_to_logical_token_ptr)),
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(full_to_device_loc_ptr)),
         reinterpret_cast<int64_t*>(static_cast<uintptr_t>(full_last_touch_ptr)),
@@ -839,7 +849,7 @@ void load_cache_to_device_buffer(
         buffer_stride_0,
         host_stride,
         lru_slot_stride_0,
-        hot_visited_stride_0,
+        reinterpret_cast<int64_t*>(static_cast<uintptr_t>(capacity_steps_ptr)),
         top_k_tokens_stride,
         top_k_device_locs_stride,
         page_size,

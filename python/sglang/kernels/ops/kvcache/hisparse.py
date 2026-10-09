@@ -156,7 +156,8 @@ def _load_cache_to_device_buffer_mla(
     block_size: int,
     num_real_reqs: torch.Tensor | None,
     req_hot_buffer_sizes: torch.Tensor | None = None,
-    hot_visited: torch.Tensor | None = None,
+    capacity_ema: torch.Tensor | None = None,
+    capacity_steps: torch.Tensor | None = None,
     req_to_logical_token: torch.Tensor | None = None,
     full_to_device_loc: torch.Tensor | None = None,
     full_last_touch: torch.Tensor | None = None,
@@ -249,11 +250,16 @@ def _load_cache_to_device_buffer_mla(
         assert hot_growth_events.ndim == 1 and hot_growth_events.is_contiguous()
         assert hot_growth_events.numel() == device_buffer_tokens.size(0)
         assert hot_growth_events.device == top_k_tokens.device
-    if hot_visited is not None:
+    if capacity_ema is not None or capacity_steps is not None:
+        assert capacity_ema is not None and capacity_steps is not None
         assert enable_full_lookup and enable_dynamic_hot_view
-        assert hot_visited.dtype == torch.bool
-        assert hot_visited.shape == device_buffer_tokens.shape
-        assert hot_visited.is_contiguous() and hot_visited.device == top_k_tokens.device
+        assert (
+            capacity_ema.dtype == torch.float32 and capacity_steps.dtype == torch.int64
+        )
+        assert capacity_ema.shape == (device_buffer_tokens.size(0), 9)
+        assert capacity_steps.shape == (device_buffer_tokens.size(0),)
+        for tensor in (capacity_ema, capacity_steps):
+            assert tensor.is_contiguous() and tensor.device == top_k_tokens.device
     if observe_cache is not None:
         assert observe_cache.dtype == torch.int32 and observe_cache.numel() == 1
         assert (
@@ -287,7 +293,7 @@ def _load_cache_to_device_buffer_mla(
         lru_slots.data_ptr(),
         num_real_reqs.data_ptr(),
         req_hot_buffer_sizes.data_ptr() if enable_dynamic_hot_view else 0,
-        hot_visited.data_ptr() if hot_visited is not None else 0,
+        capacity_ema.data_ptr() if capacity_ema is not None else 0,
         req_to_logical_token.data_ptr() if enable_full_lookup else 0,
         full_to_device_loc.data_ptr() if enable_full_lookup else 0,
         full_last_touch.data_ptr() if enable_full_lookup else 0,
@@ -302,7 +308,7 @@ def _load_cache_to_device_buffer_mla(
         host_cache_locs.size(1),
         device_buffer_tokens.stride(0),
         lru_slots.stride(0),
-        hot_visited.stride(0) if hot_visited is not None else 0,
+        capacity_steps.data_ptr() if capacity_steps is not None else 0,
         top_k_tokens.stride(0),
         top_k_device_locs.stride(0),
         req_to_logical_token.stride(0) if enable_full_lookup else 0,
@@ -341,7 +347,8 @@ def load_cache_to_device_buffer_mla(
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
     req_hot_buffer_sizes: torch.Tensor | None = None,
-    hot_visited: torch.Tensor | None = None,
+    capacity_ema: torch.Tensor | None = None,
+    capacity_steps: torch.Tensor | None = None,
     req_to_logical_token: torch.Tensor | None = None,
     full_to_device_loc: torch.Tensor | None = None,
     full_last_touch: torch.Tensor | None = None,
@@ -378,7 +385,8 @@ def load_cache_to_device_buffer_mla(
         block_size=block_size,
         num_real_reqs=num_real_reqs,
         req_hot_buffer_sizes=req_hot_buffer_sizes,
-        hot_visited=hot_visited,
+        capacity_ema=capacity_ema,
+        capacity_steps=capacity_steps,
         req_to_logical_token=req_to_logical_token,
         full_to_device_loc=full_to_device_loc,
         full_last_touch=full_last_touch,
@@ -415,7 +423,8 @@ def load_cache_to_device_buffer_dsv4_mla(
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
     req_hot_buffer_sizes: torch.Tensor | None = None,
-    hot_visited: torch.Tensor | None = None,
+    capacity_ema: torch.Tensor | None = None,
+    capacity_steps: torch.Tensor | None = None,
     req_to_logical_token: torch.Tensor | None = None,
     full_to_device_loc: torch.Tensor | None = None,
     full_last_touch: torch.Tensor | None = None,
@@ -452,7 +461,8 @@ def load_cache_to_device_buffer_dsv4_mla(
         block_size=block_size,
         num_real_reqs=num_real_reqs,
         req_hot_buffer_sizes=req_hot_buffer_sizes,
-        hot_visited=hot_visited,
+        capacity_ema=capacity_ema,
+        capacity_steps=capacity_steps,
         req_to_logical_token=req_to_logical_token,
         full_to_device_loc=full_to_device_loc,
         full_last_touch=full_last_touch,
@@ -489,7 +499,6 @@ def rollback_kvduo_hot_metadata(
     tokens: torch.Tensor,
     locations: torch.Tensor,
     lru: torch.Tensor,
-    visited: torch.Tensor,
     capacities: torch.Tensor,
 ) -> None:
     """One batched metadata launch; no KV payload is read or moved."""
@@ -505,19 +514,18 @@ def rollback_kvduo_hot_metadata(
             lru[layer, req, target:] = -1
             tokens[layer, req, target:] = -1
             locations[layer, req, target:] = -1
-            visited[layer, req, target:] = False
             capacities[layer, req] = target
         return
     assert owners.dtype == torch.int64 and owners.is_contiguous()
     assert targets.dtype == torch.int32 and targets.is_contiguous()
     assert owners.ndim == 2 and owners.size(1) == 2
     assert targets.numel() == owners.size(0)
-    for tensor in (tokens, locations, lru, visited, capacities):
+    for tensor in (tokens, locations, lru, capacities):
         assert tensor.is_contiguous() and tensor.device == owners.device
     assert lru.dtype == (
         torch.int32 if lru.size(2) > torch.iinfo(torch.int16).max else torch.int16
     ), "LRU slot dtype must match the compiled HOT capacity"
-    # The coordinator pads token/location/visited rows by one page, but LRU
+    # The coordinator pads token/location rows by one page, but LRU
     # contains only HOT slots. Compile the scan for LRU's logical capacity;
     # the wrapper passes each bank's actual strides and padded width.
     _jit_kvduo_rollback_module(lru.size(2), 256).rollback(
@@ -526,6 +534,5 @@ def rollback_kvduo_hot_metadata(
         tokens,
         locations,
         lru,
-        visited,
         capacities,
     )

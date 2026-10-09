@@ -3120,6 +3120,8 @@ class Scheduler(
             )
 
         coordinator = self.hisparse_coordinator
+        if coordinator is not None and coordinator.enable_mixed_residency:
+            coordinator.begin_kvduo_schedule_boundary()
         scope = (
             coordinator.kvduo_prefill_reservation_scope()
             if coordinator is not None and coordinator.enable_mixed_residency
@@ -3364,6 +3366,9 @@ class Scheduler(
             self.hisparse_coordinator is not None
             and self.hisparse_coordinator.enable_mixed_residency
         ):
+            self.hisparse_coordinator.bind_kvduo_prefill_batch(
+                can_run_list, adder.kvduo_prefill_reservations
+            )
             for token in adder.kvduo_prefill_reservations:
                 self.hisparse_coordinator.finish_kvduo_prefill_reservation(
                     token, cancelled=False

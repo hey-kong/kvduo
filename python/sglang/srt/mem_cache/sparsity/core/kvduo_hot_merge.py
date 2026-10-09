@@ -1,5 +1,6 @@
-"""Compact genuinely reused HOT entries at a Hand pressure boundary."""
+"""Plan budgeted HOT capacity reduction and MRU-preserving compaction."""
 
+import math
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -14,14 +15,31 @@ class KVDuoHotMergePlan:
     lru_slots: tuple[int, ...]
 
 
+def kvduo_shrink_target(segment_hits, misses, steps, current_pages, minimum_pages, rho):
+    """Smallest mature capacity whose discarded LRU contribution fits the budget."""
+    if not 1 <= minimum_pages <= current_pages <= 8:
+        raise ValueError("Invalid HOT capacity geometry")
+    if steps <= 64:
+        return current_pages
+    values = list(segment_hits[:current_pages])
+    if len(values) != current_pages or any(
+        not math.isfinite(v) or v < 0 for v in (*values, misses, rho)
+    ):
+        return current_pages
+    for m in range(minimum_pages, current_pages):
+        if sum(values[m:]) <= rho * misses:
+            return m
+    return current_pages
+
+
 def plan_kvduo_hot_merge(
     tokens: Sequence[int],
     lru_slots: Sequence[int],
     k: int,
     top_k: int,
-    visited: Sequence[bool],
+    target_pages: int,
 ) -> KVDuoHotMergePlan:
-    """Keep visited valid entries in relative LRU order, minimizing payload moves.
+    """Keep the MRU valid entries in relative LRU order, minimizing payload moves.
 
     Slot numbers in the copy plan refer to the original capacity. The new LRU
     refers to compacted slots; moving a survivor never changes its access rank.
@@ -36,10 +54,10 @@ def plan_kvduo_hot_merge(
         raise ValueError("HOT merge capacity is outside its minimum/8-page limits")
     if sorted(lru_slots) != list(range(capacity)):
         raise ValueError("HOT merge requires the current LRU slot permutation")
-    if len(visited) != capacity:
-        raise ValueError("HOT visited flags must match the current capacity")
-    survivors = [slot for slot in lru_slots if tokens[slot] >= 0 and visited[slot]]
-    m = max(minimum, (len(survivors) + k - 1) // k)
+    m = target_pages
+    if not minimum <= m <= n:
+        raise ValueError("HOT merge target is outside the minimum/current capacity")
+    survivors = [slot for slot in lru_slots if tokens[slot] >= 0][-m * k :]
     survivor_set = set(survivors)
     counts = [0] * n
     for slot in survivors:
