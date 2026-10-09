@@ -611,7 +611,8 @@ __global__ void load_cache_to_device_buffer_kernel(
       // An H2D miss that consumes an empty slot needs no capacity increase.
       // Replacing any occupied slot emits exactly one event for this request
       // and logical layer, regardless of the number of missed entries.
-      if (observe && swap_status[rid] == 0 && hot_growth_events != nullptr && hot_buffer_size < HOT_BUFFER_SIZE &&
+      if (hot_buffer_size < HOT_BUFFER_SIZE &&
+          sglang::kvduo_can_record_growth(enable_full_lookup, observe, hot_growth_events, swap_status, rid) &&
           req_device_buffer_tokens[evict_slot] >= 0) {
         atomicExch(&needs_hot_growth, 1);
       }
