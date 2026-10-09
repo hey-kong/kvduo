@@ -1,3 +1,4 @@
+#include <sgl_kernel/hisparse_resolver_layout.h>
 #include <sgl_kernel/kvduo_cache_observation.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -163,18 +164,8 @@ __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int
   return accumulator;
 }
 
-// Shared memory size calculation for dynamic allocation.
-// Layout: int32_t scratch followed by slots (int16 or int32 for large HOT banks).
 template <int NUM_TOP_K, int HOT_BUFFER_SIZE>
-struct SmemLayout {
-  using SlotT = std::conditional_t<(HOT_BUFFER_SIZE > INT16_MAX), int32_t, int16_t>;
-  static constexpr int HASH_SIZE = NUM_TOP_K * 2;
-  static constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
-  // int32_t region: top_k_tokens + offsets + hash_keys + hit/miss counters
-  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 4;
-  static constexpr int TOTAL_SLOTS = HOT_BUFFER_SIZE + HASH_SIZE;
-  static constexpr size_t BYTES = TOTAL_INT32 * sizeof(int32_t) + TOTAL_SLOTS * sizeof(SlotT);
-};
+using SmemLayout = sglang::HisparseResolverLayout<NUM_TOP_K, HOT_BUFFER_SIZE, WARP_SIZE>;
 
 // Each block processes one request
 // req_pool_indices and seq_lens can each be int32_t or int64_t
@@ -190,6 +181,7 @@ template <
     int HOT_BUFFER_SIZE,
     bool IsMLA,
     bool IsDsv4Layout,
+    bool UseGlobalScratch,
     typename SeqLensT,
     typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_kernel(
@@ -233,7 +225,9 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int32_t* __restrict__ observe_cache,
     const int32_t* __restrict__ hot_base_capacities,
     float* __restrict__ prefill_ema,
-    int64_t* __restrict__ prefill_steps) {
+    int64_t* __restrict__ prefill_steps,
+    int32_t* __restrict__ resolver_scratch,
+    int64_t resolver_scratch_stride) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
@@ -356,12 +350,19 @@ __global__ void load_cache_to_device_buffer_kernel(
     return;
   }
 
-  // Dynamic shared memory layout: int32_t scratch first, then slot arrays.
+  // Persistent global scratch uses the same layout when the maximum HOT bank
+  // exceeds device shared memory. Each CTA owns its request row; layer calls
+  // are serialized, and all used fields are initialized below on every call.
   extern __shared__ char smem_raw[];
   using Layout = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>;
   constexpr int HASH_SIZE = Layout::HASH_SIZE;
 
-  int32_t* smem_i32 = reinterpret_cast<int32_t*>(smem_raw);
+  int32_t* smem_i32;
+  if constexpr (UseGlobalScratch) {
+    smem_i32 = resolver_scratch + rid * resolver_scratch_stride;
+  } else {
+    smem_i32 = reinterpret_cast<int32_t*>(smem_raw);
+  }
   // Top-k token positions; reused as miss-token scratch in the copy phase
   int32_t* s_top_k_tokens = smem_i32;
   // Prefix-sum offsets for hit counting and miss counting
@@ -724,7 +725,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsDsv4Layout>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsDsv4Layout, bool UseGlobalScratch>
 void load_cache_to_device_buffer(
     uint64_t top_k_tokens_ptr,
     uint64_t device_buffer_tokens_ptr,
@@ -768,20 +769,41 @@ void load_cache_to_device_buffer(
     uint64_t observe_cache_ptr,
     uint64_t hot_base_capacities_ptr,
     uint64_t prefill_ema_ptr,
-    uint64_t prefill_steps_ptr) {
+    uint64_t prefill_steps_ptr,
+    uint64_t resolver_scratch_ptr,
+    int64_t resolver_scratch_stride) {
   using namespace host;
 
   using SlotT = typename SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::SlotT;
+  RuntimeCheck((resolver_scratch_ptr != 0) == UseGlobalScratch, "HiSparse scratch does not match the compiled path");
 
   const auto stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(stream_ptr));
 
   // Generic lambda: int32/int64 kernel variants are compiled for both
   // seq_lens and req_pool_indices; the correct combo is selected at runtime.
   auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr, const auto* req_pool_indices_ptr) {
-    constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
+    constexpr size_t required_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
+    constexpr size_t smem_bytes = UseGlobalScratch ? 0 : required_bytes;
+    RuntimeCheck(
+        resolver_scratch_ptr == 0 || resolver_scratch_stride * sizeof(int32_t) >= required_bytes,
+        "HiSparse global resolver scratch row is too small");
 #ifndef USE_ROCM
-    if constexpr (smem_bytes > 48u * 1024u) {
-      cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    if (smem_bytes != 0) {
+      int device, shared_limit;
+      cudaFuncAttributes attributes;
+      RuntimeDeviceCheck(cudaGetDevice(&device));
+      RuntimeDeviceCheck(cudaDeviceGetAttribute(&shared_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+      RuntimeDeviceCheck(cudaFuncGetAttributes(&attributes, kernel_fn));
+      RuntimeCheck(
+          smem_bytes + attributes.sharedSizeBytes <= shared_limit,
+          "HiSparse resolver needs ",
+          smem_bytes + attributes.sharedSizeBytes,
+          " shared-memory bytes but the device supports ",
+          shared_limit,
+          "; allocate persistent resolver_scratch before graph capture");
+      if (smem_bytes > 48u * 1024u) {
+        RuntimeDeviceCheck(cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+      }
     }
 #endif
     LaunchKernel(bs, BLOCK_SIZE, stream, smem_bytes)(
@@ -826,7 +848,9 @@ void load_cache_to_device_buffer(
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(observe_cache_ptr)),
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(hot_base_capacities_ptr)),
         reinterpret_cast<float*>(static_cast<uintptr_t>(prefill_ema_ptr)),
-        reinterpret_cast<int64_t*>(static_cast<uintptr_t>(prefill_steps_ptr)));
+        reinterpret_cast<int64_t*>(static_cast<uintptr_t>(prefill_steps_ptr)),
+        reinterpret_cast<int32_t*>(static_cast<uintptr_t>(resolver_scratch_ptr)),
+        resolver_scratch_stride);
   };
 
   if (seq_is_i64 && rpi_is_i64) {
@@ -837,6 +861,7 @@ void load_cache_to_device_buffer(
             HOT_BUFFER_SIZE,
             IsMLA,
             IsDsv4Layout,
+            UseGlobalScratch,
             int64_t,
             int64_t>,
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
@@ -849,6 +874,7 @@ void load_cache_to_device_buffer(
             HOT_BUFFER_SIZE,
             IsMLA,
             IsDsv4Layout,
+            UseGlobalScratch,
             int64_t,
             int32_t>,
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
@@ -861,6 +887,7 @@ void load_cache_to_device_buffer(
             HOT_BUFFER_SIZE,
             IsMLA,
             IsDsv4Layout,
+            UseGlobalScratch,
             int32_t,
             int64_t>,
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
@@ -873,6 +900,7 @@ void load_cache_to_device_buffer(
             HOT_BUFFER_SIZE,
             IsMLA,
             IsDsv4Layout,
+            UseGlobalScratch,
             int32_t,
             int32_t>,
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(seq_lens_ptr)),

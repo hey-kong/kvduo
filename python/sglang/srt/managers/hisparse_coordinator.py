@@ -9,6 +9,7 @@ from typing import List, NamedTuple, Sequence, Union
 import torch
 
 from sglang.kernels.ops.kvcache.hisparse import (
+    allocate_hisparse_resolver_scratch,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
     rollback_kvduo_hot_metadata,
@@ -232,6 +233,13 @@ class HiSparseCoordinator:
             self.device_buffer_size = max_hot_capacity
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
+        self.resolver_scratch = allocate_hisparse_resolver_scratch(
+            max_num_req_slots,
+            self.top_k,
+            self.device_buffer_size,
+            self.swap_in_block_size,
+            device,
+        )
         max_context_len = req_to_token_pool.max_context_len
         max_compressed_context_len = (
             max_context_len + self.compress_ratio - 1
@@ -3611,6 +3619,7 @@ class HiSparseCoordinator:
                 if self.enable_mixed_residency
                 else 0
             ),
+            resolver_scratch=getattr(self, "resolver_scratch", None),
         )
         if self.enable_mixed_residency:
             # Capturable execution boundary: an invalid/mismatched host source

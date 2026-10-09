@@ -40,8 +40,6 @@ __global__ void kvduo_prefill_rollback_kernel(
   using SlotT = KVDuoRollbackSlot<CAPACITY>;
   using Scan = rollback_cub::BlockScan<int, BLOCK_SIZE>;
   __shared__ typename Scan::TempStorage scratch;
-  extern __shared__ char slot_scratch[];
-  SlotT* compacted = reinterpret_cast<SlotT*>(slot_scratch);
   const int tid = threadIdx.x;
   const int64_t layer = owners[blockIdx.x * 2];
   const int64_t request = owners[blockIdx.x * 2 + 1];
@@ -61,12 +59,16 @@ __global__ void kvduo_prefill_rollback_kernel(
     flags[i] = slots[i] >= 0 && slots[i] < target;
   }
   Scan(scratch).ExclusiveSum(flags, offsets);
+  // Every source slot is already in this CTA's register/local snapshot.
+  // Wait for all readers before writing directly into the same LRU bank;
+  // no capacity-sized shared output buffer is needed, even for int32 slots.
+  __syncthreads();
   for (int i = 0; i < ITEMS; ++i) {
-    if (flags[i]) compacted[offsets[i]] = slots[i];
+    if (flags[i]) lru[offsets[i]] = slots[i];
   }
   __syncthreads();
-  for (int rank = tid; rank < CAPACITY; rank += BLOCK_SIZE) {
-    lru[rank] = rank < target ? compacted[rank] : -1;
+  for (int rank = target + tid; rank < CAPACITY; rank += BLOCK_SIZE) {
+    lru[rank] = -1;
   }
   // These banks include coordinator padding that is absent from LRU.
   for (int64_t slot = target + tid; slot < padded_capacity; slot += BLOCK_SIZE) {
@@ -111,14 +113,7 @@ void kvduo_prefill_rollback(
       .verify(visited);
   TensorMatcher({layers, requests}).with_dtype<int32_t>().with_device(device).verify(capacities);
   RuntimeCheck(padded_capacity.unwrap() >= CAPACITY, "Padded metadata cannot be smaller than LRU capacity");
-  constexpr size_t smem_bytes = CAPACITY * sizeof(SlotT);
-#ifndef USE_ROCM
-  if constexpr (smem_bytes > 46u * 1024u) {
-    cudaFuncSetAttribute(
-        kvduo_prefill_rollback_kernel<CAPACITY, BLOCK_SIZE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-  }
-#endif
-  LaunchKernel(n.unwrap(), BLOCK_SIZE, device.unwrap(), smem_bytes)(
+  LaunchKernel(n.unwrap(), BLOCK_SIZE, device.unwrap())(
       kvduo_prefill_rollback_kernel<CAPACITY, BLOCK_SIZE>,
       static_cast<const int64_t*>(owners.data_ptr()),
       static_cast<const int32_t*>(targets.data_ptr()),

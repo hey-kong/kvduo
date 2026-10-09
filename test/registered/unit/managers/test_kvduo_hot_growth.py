@@ -361,10 +361,11 @@ def test_resolver_ffi_receives_the_stable_growth_event_pointer(monkeypatch, dsv4
     args = module.load_cache_to_device_buffer.call_args.args
     assert args[20] == coordinator.kvduo_hot_growth_events[0].data_ptr()
     assert args[12] == coordinator.hot_visited[0].data_ptr()
-    assert args[-4:] == (
+    assert args[-6:-2] == (
         coordinator.kvduo_observe.data_ptr(),
         coordinator.kvduo_hot_base_capacity[0].data_ptr(),
         coordinator.kvduo_prefill_ema[0].data_ptr(),
         coordinator.kvduo_prefill_steps[0].data_ptr(),
     )
+    assert args[-2:] == (0, 0)  # Small capacities keep the shared-memory path.
     assert all(isinstance(arg, (int, bool, float)) for arg in args)

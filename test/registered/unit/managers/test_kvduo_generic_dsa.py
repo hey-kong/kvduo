@@ -1,5 +1,6 @@
 """Generic DSA shares complete physical pages across HOT storage layers."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -218,6 +219,130 @@ def test_generic_resolver_receives_flat_backing_and_local_full_layer_offset(
     assert kwargs["full_location_base"] == pool.flat_layer_slot_stride
     assert kwargs["page_size"] == 3 * 64
     assert kwargs["host_cache"].data_ptr() == c.mem_pool_host.kv_buffer[1].data_ptr()
+
+
+def test_coordinator_initializes_workspace_once_and_reuses_it_across_requests(
+    monkeypatch,
+):
+    import sglang.srt.managers.hisparse_coordinator as module
+    from sglang.kernels.ops.kvcache.hisparse import hisparse_resolver_scratch_words
+
+    allocate = MagicMock(
+        side_effect=lambda requests, topk, capacity, block, device: torch.empty(
+            (requests, hisparse_resolver_scratch_words(topk, capacity)),
+            dtype=torch.int32,
+            device=device,
+        )
+    )
+    monkeypatch.setattr(module, "allocate_hisparse_resolver_scratch", allocate)
+    c, _, _ = make_stack(monkeypatch, layers=78, top_k=2048)
+    c.mem_pool_host.kv_buffer = torch.zeros((78, 1, 1, 16), dtype=torch.bfloat16)
+    swap = MagicMock()
+    monkeypatch.setattr(module, "load_cache_to_device_buffer_mla", swap)
+    workspace = c.resolver_scratch
+    for req in (1, 0):
+        c.swap_in_selected_pages(
+            torch.tensor([req]),
+            torch.tensor([2048]),
+            torch.zeros((1, 2048), dtype=torch.int32),
+            77,
+        )
+        assert swap.call_args.kwargs["resolver_scratch"] is workspace
+    allocate.assert_called_once_with(2, 2048, 39936, 960, torch.device("cpu"))
+
+
+def test_kvduo_bf16_flashmla_kv_rejected_during_actual_backend_initialization(
+    monkeypatch,
+):
+    import sglang.srt.layers.attention.dsa_backend as module
+
+    pool = make_pool()
+    hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"], index_topk=64)
+    hf.get_text_config = lambda: hf
+    runner = SimpleNamespace(
+        device="cpu",
+        page_size=64,
+        token_to_kv_pool=pool,
+        model_config=SimpleNamespace(
+            hf_config=hf,
+            context_len=128,
+            num_attention_heads=1,
+            qk_nope_head_dim=12,
+            kv_lora_rank=12,
+            qk_rope_head_dim=4,
+        ),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.zeros((2, 128), dtype=torch.int32)
+        ),
+        hisparse_coordinator=SimpleNamespace(enable_mixed_residency=True),
+        server_args=SimpleNamespace(
+            enable_deterministic_inference=False,
+            dsa_prefill_backend="flashmla_sparse",
+            dsa_decode_backend="flashmla_kv",
+        ),
+    )
+    monkeypatch.setattr(module, "get_parallel", lambda: SimpleNamespace(attn_tp_size=1))
+    with pytest.raises(ValueError, match="KVDuo flashmla_kv decode requires.*fp8_e4m3"):
+        module.DeepseekSparseAttnBackend(runner)
+
+
+def test_actual_flashmla_kv_rejects_bf16_before_quantization_or_kernel_import(
+    monkeypatch,
+):
+    import sglang.srt.layers.attention.dsa_backend as module
+
+    backend = module.DeepseekSparseAttnBackend.__new__(module.DeepseekSparseAttnBackend)
+    backend.hisparse_coordinator = SimpleNamespace(enable_mixed_residency=True)
+    backend.dsa_decode_impl = "flashmla_kv"
+    backend.dsa_kv_cache_store_fp8 = False
+    quantize = MagicMock()
+    monkeypatch.setattr(module, "quantize_k_cache", quantize)
+    with pytest.raises(ValueError, match="For BF16 KV use.*flashmla_sparse"):
+        backend._forward_flashmla_kv(None, None, 12, 1, None, None, None)
+    quantize.assert_not_called()
+
+
+def test_actual_flashmla_kv_uses_fp8_backing_without_quantizing_it(monkeypatch):
+    import sglang.srt.layers.attention.dsa_backend as module
+
+    pool = make_pool(dtype=torch.float8_e4m3fn)
+    backend = module.DeepseekSparseAttnBackend.__new__(module.DeepseekSparseAttnBackend)
+    backend.hisparse_coordinator = SimpleNamespace(enable_mixed_residency=True)
+    backend.dsa_decode_impl = "flashmla_kv"
+    backend.dsa_kv_cache_store_fp8 = True
+    backend.real_page_size = 64
+    backend.kv_cache_dim = pool.kv_cache_dim
+    backend.dsa_index_topk = 2
+    backend.flashmla_kv_num_q_heads = 64
+    output = torch.ones((1, 1, 64, 12))
+    kernel = MagicMock(return_value=(output, None))
+    monkeypatch.setitem(
+        sys.modules,
+        "sgl_kernel.flash_mla",
+        SimpleNamespace(flash_mla_with_kvcache=kernel),
+    )
+    quantize = MagicMock(
+        side_effect=AssertionError("FP8 storage must never be quantized")
+    )
+    monkeypatch.setattr(module, "quantize_k_cache", quantize)
+    result = backend._forward_flashmla_kv(
+        torch.zeros((1, 1, 16)),
+        pool.get_flat_key_buffer().view(pool.dtype),
+        12,
+        1,
+        SimpleNamespace(tp_q_head_num=1, head_dim=16),
+        SimpleNamespace(
+            dsa_cache_seqlens_int32=torch.tensor([2]),
+            flashmla_metadata=SimpleNamespace(flashmla_metadata=None, num_splits=None),
+        ),
+        torch.tensor([[64, pool.flat_layer_slot_stride + 65]], dtype=torch.int32),
+    )
+    assert torch.equal(result, output[:, :, :1, :])
+    assert (
+        kernel.call_args.kwargs["k_cache"].data_ptr()
+        == pool.get_flat_key_buffer().data_ptr()
+    )
+    quantize.assert_not_called()
 
 
 def test_large_generic_rollback_preserves_int32_lru_and_base_contents(monkeypatch):
