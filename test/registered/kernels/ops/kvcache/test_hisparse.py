@@ -397,7 +397,14 @@ def test_kvduo_full_resident_fast_path_skips_empty_hot_view() -> None:
         block_size=256,
         num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
         req_hot_buffer_sizes=torch.zeros(1, dtype=torch.int32, device=DEVICE),
-        hot_visited=torch.zeros_like(state["device_buffer_tokens"], dtype=torch.bool),
+        capacity_ema=torch.zeros(
+            (state["device_buffer_tokens"].size(0), 9),
+            dtype=torch.float32,
+            device=DEVICE,
+        ),
+        capacity_steps=torch.zeros(
+            state["device_buffer_tokens"].size(0), dtype=torch.int64, device=DEVICE
+        ),
         req_to_logical_token=torch.arange(8, dtype=torch.int64, device=DEVICE).view(
             1, -1
         ),
@@ -458,7 +465,14 @@ def test_kvduo_h2d_capacity_event_and_lru_fallback(
         block_size=256,
         num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
         req_hot_buffer_sizes=torch.tensor([capacity], dtype=torch.int32, device=DEVICE),
-        hot_visited=torch.zeros_like(state["device_buffer_tokens"], dtype=torch.bool),
+        capacity_ema=torch.zeros(
+            (state["device_buffer_tokens"].size(0), 9),
+            dtype=torch.float32,
+            device=DEVICE,
+        ),
+        capacity_steps=torch.zeros(
+            state["device_buffer_tokens"].size(0), dtype=torch.int64, device=DEVICE
+        ),
         req_to_logical_token=torch.arange(8, dtype=torch.int64, device=DEVICE).view(
             1, -1
         ),
@@ -537,7 +551,14 @@ def _kvduo_observation_case(selected=(2, 1), *, capacity=4, k=1, lru=(2, 0, 3, 1
         block_size=256,
         num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
         req_hot_buffer_sizes=torch.tensor([capacity], dtype=torch.int32, device=DEVICE),
-        hot_visited=torch.zeros_like(state["device_buffer_tokens"], dtype=torch.bool),
+        capacity_ema=torch.zeros(
+            (state["device_buffer_tokens"].size(0), 9),
+            dtype=torch.float32,
+            device=DEVICE,
+        ),
+        capacity_steps=torch.zeros(
+            state["device_buffer_tokens"].size(0), dtype=torch.int64, device=DEVICE
+        ),
         req_to_logical_token=torch.arange(8, dtype=torch.int64, device=DEVICE).view(
             1, -1
         ),
@@ -865,9 +886,8 @@ def test_kvduo_merge_copies_flat_c4_values_and_scales_before_freeing_pages():
     coordinator._active_kvduo_reqs = {0: object()}
     coordinator._init_kvduo_prefill_rollback_state(1)
     coordinator._kvduo_hot_generation[0, 0] = 0
-    coordinator.hot_visited = torch.zeros(
-        (1, 1, 8 * k), dtype=torch.bool, device=DEVICE
-    )
+    coordinator.kvduo_capacity_steps.fill_(65)
+    coordinator.kvduo_capacity_ema[..., :2] = 100
     coordinator.req_device_buffer_tokens = torch.full(
         (1, 1, 8 * k), -1, dtype=torch.int32, device=DEVICE
     )
@@ -888,7 +908,6 @@ def test_kvduo_merge_copies_flat_c4_values_and_scales_before_freeing_pages():
     coordinator.lru_slots[0, 0, : 4 * k] = torch.tensor(
         lru, dtype=torch.int16, device=DEVICE
     )
-    coordinator.hot_visited[0, 0, survivors] = True
     expected = backing.cpu().clone()
     src, dst = locs[1], locs[-1]  # one survivor moves across storage layers
     for offset, width in ((0, DSV4_VALUE_BYTES), (DSV4_SCALE_OFFSET, DSV4_SCALE_BYTES)):
@@ -905,12 +924,12 @@ def test_kvduo_merge_copies_flat_c4_values_and_scales_before_freeing_pages():
 
     free = MagicMock(side_effect=free_after_copy)
     coordinator.token_to_kv_pool_allocator = SimpleNamespace(free_hisparse_indices=free)
+    coordinator.kvduo_capacity_ema[..., :2] = 100
     assert coordinator._merge_kvduo_hot_pages(0, 0) == 2 * DSV4_PAGE_SIZE
     free.assert_called_once()
     assert coordinator.lru_slots[0, 0, : 2 * k].cpu().tolist() == [2 * k - 1] + list(
         range(2 * k - 1)
     )
-    assert not torch.any(coordinator.hot_visited)
     assert coordinator.kvduo_prefill_steps.item() == 0
 
 
@@ -963,10 +982,13 @@ def test_kvduo_resolver_graph_replays_after_actual_merge_without_recapture():
     coordinator.req_device_buffer_tokens = kwargs["device_buffer_tokens"].unsqueeze(0)
     coordinator.req_device_buffer_token_locs = kwargs["device_buffer_locs"].unsqueeze(0)
     coordinator.lru_slots = kwargs["lru_slots"].unsqueeze(0)
-    coordinator.hot_visited = kwargs["hot_visited"].unsqueeze(0)
+    coordinator.kvduo_capacity_ema = kwargs["capacity_ema"].unsqueeze(0)
+    coordinator.kvduo_capacity_steps = kwargs["capacity_steps"].unsqueeze(0)
+    coordinator.kvduo_capacity_steps.fill_(65)
     coordinator.token_to_kv_pool_allocator = SimpleNamespace(
         free_hisparse_indices=MagicMock()
     )
+    coordinator.kvduo_capacity_ema[..., :2] = 100
     assert coordinator._merge_kvduo_hot_pages(0, 0) == 2
     assert pointers == [
         kwargs[key].data_ptr()
@@ -1005,10 +1027,9 @@ def test_kvduo_resolver_graph_replays_after_actual_merge_without_recapture():
         "failed",
     ],
 )
-def test_kvduo_visited_and_two_count_ema_use_actual_hot_reuse_and_host_misses(kind):
+def test_kvduo_segment_and_extra_ema_use_actual_pre_update_hot_reuse_and_misses(kind):
     kwargs = _kvduo_observation_case()
     expected = [1, 0]  # slot2 extra, slot0 base, independent of LRU rank.
-    visited = [True, False, True, False, False]
     observed = True
     if kind in {"full", "tail"}:
         if kind == "full":
@@ -1018,20 +1039,15 @@ def test_kvduo_visited_and_two_count_ema_use_actual_hot_reuse_and_host_misses(ki
             kwargs["top_k_tokens"][0] = torch.tensor([7, -1], device=DEVICE)
             kwargs["full_to_device_loc"][7] = 11
         expected = [0, 0]
-        visited = [False] * 5
     elif kind == "miss":
         kwargs["top_k_tokens"][0] = torch.tensor([3, 6], device=DEVICE)
-        kwargs["hot_visited"].fill_(True)
         expected = [0, 2]
-        visited = [False, True, False, True, True]
     elif kind == "partial":
         kwargs["top_k_tokens"][0] = torch.tensor([-1, 2], device=DEVICE)
         expected = [1, 0]
-        visited = [False, False, True, False, False]
     elif kind in {"invalid", "padding", "capture", "failed"}:
         observed = False
         expected = [0, 0]
-        visited = [False] * 5
         if kind == "invalid":
             kwargs["top_k_tokens"].fill_(-1)
         if kind == "padding":
@@ -1040,11 +1056,26 @@ def test_kvduo_visited_and_two_count_ema_use_actual_hot_reuse_and_host_misses(ki
             kwargs["observe_cache"].zero_()
         if kind == "failed":
             kwargs["full_host_version"][2] = 0
+    capacity = kwargs["req_hot_buffer_sizes"].item()
+    selected = set(kwargs["top_k_tokens"][0].cpu().tolist())
+    old_tokens = kwargs["device_buffer_tokens"][0].cpu().tolist()
+    old_order = kwargs["lru_slots"][0].cpu().tolist()[:capacity]
+    full = kwargs["full_to_device_loc"].cpu().tolist()
+    segments = [0] * 8
+    if observed:
+        for rank, slot in enumerate(old_order):
+            token = old_tokens[slot]
+            if token >= 0 and token in selected and full[token] <= 0:
+                segments[(capacity - 1 - rank) // kwargs["page_size"]] += 1
     load_cache_to_device_buffer_mla(**kwargs)
     torch.cuda.synchronize()
     assert kwargs["prefill_ema"].cpu().tolist() == [expected]
     assert kwargs["prefill_steps"].item() == int(observed)
-    assert kwargs["hot_visited"].cpu().tolist() == [visited]
+
+    assert kwargs["capacity_ema"].cpu().tolist() == [
+        segments + [expected[1] if capacity and observed else 0]
+    ]
+    assert kwargs["capacity_steps"].item() == int(observed and capacity > 0)
 
 
 def test_kvduo_ema_decays_on_valid_zero_counts_and_marks_reuse_after_h2d():
@@ -1052,11 +1083,9 @@ def test_kvduo_ema_decays_on_valid_zero_counts_and_marks_reuse_after_h2d():
     load_cache_to_device_buffer_mla(**kwargs)
     torch.cuda.synchronize()
     assert kwargs["prefill_ema"].cpu().tolist() == [[0, 2]]
-    assert not torch.any(kwargs["hot_visited"])
     load_cache_to_device_buffer_mla(**kwargs)
     torch.cuda.synchronize()
     assert kwargs["prefill_ema"].cpu().tolist() == [[1 / 64, 2 * 63 / 64]]
-    assert kwargs["hot_visited"][0, [0, 2]].all()
     assert kwargs["prefill_steps"].item() == 2
 
 
@@ -1107,6 +1136,8 @@ def _generic_kvduo_stack(monkeypatch):
     c._mixed_slots[0] = True
     c.num_real_reqs.fill_(1)
     c._ensure_kvduo_hot_capacity_targets_batch({(1, 0): c.hot_page_size})
+    c.kvduo_capacity_steps[1, 0] = 65
+    c.kvduo_capacity_ema[1, 0] = 0
     c._merge_kvduo_hot_pages(1, 0)  # Establish a real merge base, even with no release.
     c._ensure_kvduo_hot_capacity_targets_batch({(1, 0): 2 * c.hot_page_size})
     return c, pool, allocator
@@ -1163,14 +1194,15 @@ def test_generic_kvduo_resolver_reads_full_hot_and_host_across_layers_after_grap
         c.swap_in_selected_pages(*args)
     c.kvduo_observe.fill_(1)
     before = allocator.hisparse_attn_allocator.available_size()
+    c.kvduo_capacity_steps[1, 0] = 65
+    c.kvduo_capacity_ema[1, 0] = 0
     assert c._merge_kvduo_hot_pages(1, 0) == 64
     assert allocator.hisparse_attn_allocator.available_size() == before + 64
     graph.replay()
     torch.cuda.synchronize()
     assert backing[output[0].long(), 0, 0].tolist() == [10, 20, 30, 40]
-    # The first H2D insert was never observed as a later HOT hit. Merge drops
-    # it, so replay fetches it again while both visited HOT entries survive.
-    assert c.kvduo_prefill_ema[1, 0].tolist() == [0, 1]
+    # MRU retention includes the freshly inserted item; compaction is not an access.
+    assert c.kvduo_prefill_ema[1, 0].tolist() == [0, 0]
     assert c.kvduo_prefill_steps[1, 0].item() == 1
     assert pointers == [
         bank.data_ptr()
@@ -1194,7 +1226,6 @@ def test_generic_kvduo_fast_rollback_keeps_base_payload_and_filters_lru(monkeypa
         2 * k, device=DEVICE, dtype=torch.bfloat16
     )[:, None, None]
     c.lru_slots[1, 0, : 2 * k] = torch.arange(2 * k, device=DEVICE).flip(0)
-    c.hot_visited[1, 0, : 2 * k] = True
     expected = pool.get_flat_key_buffer().clone()
     base = c._kvduo_hot_base_pages[1, 0]
     before = allocator.hisparse_attn_allocator.available_size()
@@ -1205,8 +1236,6 @@ def test_generic_kvduo_fast_rollback_keeps_base_payload_and_filters_lru(monkeypa
     assert c.lru_slots[1, 0, :k].tolist() == list(reversed(range(k)))
     assert torch.all(c.req_device_buffer_tokens[1, 0, k:] == -1)
     assert torch.all(c.req_device_buffer_token_locs[1, 0, k:] == -1)
-    assert torch.all(c.hot_visited[1, 0, :k])
-    assert not torch.any(c.hot_visited[1, 0, k:])
     c.destroy()
 
 
@@ -1218,7 +1247,10 @@ def test_generic_resolver_preserves_lru_slots_above_int16_range():
     kwargs.update(
         device_buffer_tokens=tokens,
         device_buffer_locs=torch.full_like(tokens, 5),
-        hot_visited=torch.zeros_like(tokens, dtype=torch.bool),
+        capacity_ema=torch.zeros(
+            (tokens.size(0), 9), dtype=torch.float32, device=DEVICE
+        ),
+        capacity_steps=torch.zeros(tokens.size(0), dtype=torch.int64, device=DEVICE),
         lru_slots=torch.arange(capacity, dtype=torch.int32, device=DEVICE).unsqueeze(0),
         hot_buffer_size=capacity,
         req_hot_buffer_sizes=torch.tensor([capacity], dtype=torch.int32, device=DEVICE),
@@ -1232,7 +1264,6 @@ def test_generic_resolver_preserves_lru_slots_above_int16_range():
     load_cache_to_device_buffer_mla(**kwargs)
     torch.cuda.synchronize()
     assert kwargs["lru_slots"][0, -2:].tolist() == [capacity - 2, capacity - 1]
-    assert kwargs["hot_visited"][0, capacity - 2 : capacity].all()
     assert kwargs["prefill_ema"].tolist() == [[1, 0]]
 
 
@@ -1253,10 +1284,8 @@ def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru
     slot_dtype = torch.int32 if capacity > 32767 else torch.int16
     order = torch.arange(capacity, dtype=slot_dtype, device=DEVICE).flip(0)
     lru = torch.stack([order.roll(i) for i in range(6)]).view(2, 3, capacity)
-    visited = (tokens % 3 != 0).clone()
-    visited[:, :, capacity:] = True
     capacities = torch.full((2, 3), capacity, dtype=torch.int32, device=DEVICE)
-    banks = (tokens, locations, lru, visited, capacities)
+    banks = (tokens, locations, lru, capacities)
     before = [bank.clone() for bank in banks]
     addresses = [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
     selected = {(0, 1): capacity // 2, (1, 0): capacity // 4, (1, 2): capacity * 3 // 4}
@@ -1266,7 +1295,6 @@ def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru
         tokens,
         locations,
         lru,
-        visited,
         capacities,
     )
     torch.cuda.synchronize()
@@ -1281,13 +1309,10 @@ def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru
             old_order = before[2][owner]
             assert torch.equal(lru[owner][:target], old_order[old_order < target])
             assert torch.all(lru[owner][target:] == -1)
-            for bank, original in zip(
-                (tokens, locations, visited), (before[0], before[1], before[3])
-            ):
+            for bank, original in zip((tokens, locations), (before[0], before[1])):
                 assert torch.equal(bank[owner][:target], original[owner][:target])
             assert torch.all(tokens[owner][target:] == -1)
             assert torch.all(locations[owner][target:] == -1)
-            assert not torch.any(visited[owner][target:])
             assert capacities[owner].item() == target
     assert addresses == [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
 
@@ -1364,7 +1389,10 @@ def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_sc
         req_hot_buffer_sizes=torch.full(
             (requests,), active_capacity, dtype=torch.int32, device=DEVICE
         ),
-        hot_visited=torch.zeros_like(tokens, dtype=torch.bool),
+        capacity_ema=torch.zeros(
+            (tokens.size(0), 9), dtype=torch.float32, device=DEVICE
+        ),
+        capacity_steps=torch.zeros(tokens.size(0), dtype=torch.int64, device=DEVICE),
         req_to_logical_token=logical,
         full_to_device_loc=full_mapping,
         full_last_touch=torch.zeros_like(full_mapping),
@@ -1413,22 +1441,19 @@ def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_sc
         assert torch.all(scratch[:, words:] == 31)
 
 
-@pytest.mark.parametrize("bad_bank", ["locations", "visited", "lru"])
+@pytest.mark.parametrize("bad_bank", ["locations", "lru"])
 def test_kvduo_rollback_rejects_incompatible_bank_shapes_before_mutation(bad_bank):
     from sglang.kernels.ops.kvcache.hisparse import rollback_kvduo_hot_metadata
 
     tokens = torch.ones((2, 3, 10), dtype=torch.int32, device=DEVICE)
     locations = tokens.clone()
-    visited = torch.ones_like(tokens, dtype=torch.bool)
     lru = torch.arange(8, dtype=torch.int16, device=DEVICE).repeat(2, 3, 1)
     if bad_bank == "locations":
         locations = torch.ones((2, 3, 9), dtype=torch.int32, device=DEVICE)
-    elif bad_bank == "visited":
-        visited = torch.ones((2, 3, 9), dtype=torch.bool, device=DEVICE)
     else:
         lru = torch.arange(12, dtype=torch.int16, device=DEVICE).repeat(2, 3, 1)
     capacities = torch.full((2, 3), 8, dtype=torch.int32, device=DEVICE)
-    banks = (tokens, locations, lru, visited, capacities)
+    banks = (tokens, locations, lru, capacities)
     before = [bank.clone() for bank in banks]
     with pytest.raises(RuntimeError, match="Size mismatch|Padded metadata"):
         rollback_kvduo_hot_metadata(
@@ -1457,11 +1482,12 @@ def test_kvduo_resolver_graph_replays_after_no_copy_rollback_without_recapture()
         "device_buffer_tokens",
         "device_buffer_locs",
         "lru_slots",
-        "hot_visited",
         "req_hot_buffer_sizes",
         "hot_base_capacities",
         "prefill_ema",
         "prefill_steps",
+        "capacity_ema",
+        "capacity_steps",
     )
     addresses = [
         (kwargs[key].data_ptr(), kwargs[key].shape, kwargs[key].stride())
@@ -1473,12 +1499,10 @@ def test_kvduo_resolver_graph_replays_after_no_copy_rollback_without_recapture()
         kwargs["device_buffer_tokens"].unsqueeze(0),
         kwargs["device_buffer_locs"].unsqueeze(0),
         kwargs["lru_slots"].unsqueeze(0),
-        kwargs["hot_visited"].unsqueeze(0),
         kwargs["req_hot_buffer_sizes"].unsqueeze(0),
     )
     assert torch.all(kwargs["device_buffer_tokens"][:, 2:] == -1)
     assert torch.all(kwargs["device_buffer_locs"][:, 2:] == -1)
-    assert not torch.any(kwargs["hot_visited"][:, 2:])
     kwargs["prefill_ema"].zero_()
     kwargs["prefill_steps"].zero_()
     kwargs["observe_cache"].fill_(1)
@@ -1501,15 +1525,15 @@ def test_kvduo_graph_observes_new_capacity_without_recapture_or_synthetic_reuse(
     kwargs = _kvduo_observation_case(selected=(1, 4), capacity=2, lru=(0, 1, 2, 3))
     load_cache_to_device_buffer_mla(**kwargs)
     torch.cuda.synchronize()
-    assert kwargs["hot_visited"].cpu().tolist() == [[True, True, False, False, False]]
     kwargs["observe_cache"].zero_()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         load_cache_to_device_buffer_mla(**kwargs)
     keys = (
-        "hot_visited",
         "prefill_ema",
         "prefill_steps",
+        "capacity_ema",
+        "capacity_steps",
         "req_hot_buffer_sizes",
         "lru_slots",
     )
@@ -1529,11 +1553,9 @@ def test_kvduo_graph_observes_new_capacity_without_recapture_or_synthetic_reuse(
     graph.replay()
     torch.cuda.synchronize()
     assert kwargs["prefill_ema"].cpu().tolist() == [[0, 2]]
-    assert kwargs["hot_visited"].cpu().tolist() == [[True, True, False, False, False]]
     graph.replay()
     torch.cuda.synchronize()
     assert kwargs["prefill_ema"].cpu().tolist() == [[2 / 64, 2 * 63 / 64]]
-    assert kwargs["hot_visited"][0, :4].all()
     assert kwargs["prefill_steps"].item() == 2
     assert addresses == [
         (kwargs[key].data_ptr(), kwargs[key].shape, kwargs[key].stride())

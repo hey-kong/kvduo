@@ -529,7 +529,6 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator._mixed_slots = [True]
         coordinator.kvduo_req_hot_capacity = torch.zeros((2, 1), dtype=torch.int64)
         coordinator.kvduo_req_hot_capacity_gpu = torch.zeros((2, 1), dtype=torch.int32)
-        coordinator.hot_visited = torch.zeros((2, 1, 32), dtype=torch.bool)
         coordinator._init_kvduo_prefill_rollback_state(1)
         coordinator._active_kvduo_reqs = {0: object()}
         coordinator.req_device_buffer_token_locs = torch.full(
@@ -579,6 +578,12 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         self.assertEqual(coordinator._kvduo_req_layer_pages[(1, 0)], [20, 24])
 
+        from sglang.srt.mem_cache.sparsity.core.kvduo_prefill_rollback import (
+            KVDuoPrefillPolicy,
+        )
+
+        coordinator.kvduo_prefill_policy = KVDuoPrefillPolicy()
+        coordinator.kvduo_capacity_steps[1, 0] = 65
         coordinator._merge_kvduo_hot_pages(1, 0)
         self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
         returned = (
@@ -642,13 +647,6 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator._init_kvduo_prefill_rollback_state(
             coordinator.kvduo_req_hot_capacity.shape[1]
-        )
-        coordinator.hot_visited = torch.zeros(
-            (
-                *coordinator.kvduo_req_hot_capacity.shape,
-                getattr(coordinator, "device_buffer_size", 8),
-            ),
-            dtype=torch.bool,
         )
         coordinator._ensure_kvduo_hot_capacity_targets_batch = MagicMock(
             side_effect=allocate
@@ -784,13 +782,6 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator._init_kvduo_prefill_rollback_state(
             coordinator.kvduo_req_hot_capacity.shape[1]
         )
-        coordinator.hot_visited = torch.zeros(
-            (
-                *coordinator.kvduo_req_hot_capacity.shape,
-                getattr(coordinator, "device_buffer_size", 8),
-            ),
-            dtype=torch.bool,
-        )
         coordinator.prepare_kvduo_graph_replay(torch.tensor([0, 1]))
 
         physical.alloc.assert_called_once_with(42)
@@ -827,13 +818,6 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator._init_kvduo_prefill_rollback_state(
             coordinator.kvduo_req_hot_capacity.shape[1]
-        )
-        coordinator.hot_visited = torch.zeros(
-            (
-                *coordinator.kvduo_req_hot_capacity.shape,
-                getattr(coordinator, "device_buffer_size", 8),
-            ),
-            dtype=torch.bool,
         )
         with self.assertRaisesRegex(RuntimeError, "whole-page HOT allocation failed"):
             coordinator._ensure_kvduo_hot_capacity_targets_batch(
@@ -882,13 +866,6 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         coordinator._init_kvduo_prefill_rollback_state(
             coordinator.kvduo_req_hot_capacity.shape[1]
-        )
-        coordinator.hot_visited = torch.zeros(
-            (
-                *coordinator.kvduo_req_hot_capacity.shape,
-                getattr(coordinator, "device_buffer_size", 8),
-            ),
-            dtype=torch.bool,
         )
         return coordinator, allocator, physical
 

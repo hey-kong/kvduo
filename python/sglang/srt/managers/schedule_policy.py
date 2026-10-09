@@ -580,6 +580,7 @@ class PrefillAdder:
             indices,
             tree_cache=self.tree_cache,
             prefix_indices=req.prefix_indices,
+            prefill_req=req,
         )
         if token is None:
             self.kvduo_prefill_blocked = True
@@ -881,6 +882,12 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        if self._kvduo_prefill_enabled():
+            end = min(
+                len(req.full_untruncated_fill_ids),
+                len(req.prefix_indices) + max(0, self.rem_chunk_tokens),
+            )
+            self.kvduo_coordinator.protect_kvduo_prefill_plan(req, end)
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -1088,7 +1095,11 @@ class PrefillAdder:
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 
-        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+        if (
+            req.sampling_params.ignore_eos
+            and getattr(self.tree_cache, "disable", True)
+            and not self._kvduo_prefill_enabled()
+        ):
             return self.add_one_req_ignore_eos(req)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
@@ -1101,6 +1112,12 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        if self._kvduo_prefill_enabled():
+            end = len(req.full_untruncated_fill_ids)
+            if self.rem_chunk_tokens is not None:
+                end = min(end, len(req.prefix_indices) + max(0, self.rem_chunk_tokens))
+            self.kvduo_coordinator.protect_kvduo_prefill_plan(req, end)
+
         total_tokens = cand_extend_input_len + max_new + self.page_size
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.

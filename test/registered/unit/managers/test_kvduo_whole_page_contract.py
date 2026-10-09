@@ -44,7 +44,7 @@ def test_owner_keys_keep_asymmetric_requests_and_layers_separate():
 
     c, _ = make_merge_coordinator({(3, 17): 3, (17, 3): 3}, layers=18)
     untouched = c._kvduo_req_layer_pages[17, 3].copy()
-    c.hot_visited[3, 17, 0] = True
+    c.kvduo_capacity_ema[3, 17] = 0
     assert c._merge_kvduo_hot_pages(3, 17) == 2 * c.page_size
     assert len(c._kvduo_req_layer_pages[3, 17]) == 1
     assert c._kvduo_req_layer_pages[17, 3] == untouched

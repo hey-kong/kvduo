@@ -25,8 +25,8 @@ from test_kvduo_prefill_rollback import adder_and_req, ready_coordinator
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def restore_setup(*, dsv4, requests=1, cache_type=RadixCache):
-    c, physical = ready_coordinator(extra=2, requests=requests)
+def restore_setup(*, dsv4, requests=1, cache_type=RadixCache, extra=2):
+    c, physical = ready_coordinator(extra=extra, requests=requests)
     physical.free = c.token_to_kv_pool_allocator.free_hisparse_indices.side_effect
     adder, req = adder_and_req(c, dsv4=dsv4, chunk=2 * (4 if dsv4 else 1))
     c.token_to_kv_pool_allocator = adder.token_to_kv_pool_allocator
@@ -108,7 +108,7 @@ def restore_params(req, token):
 def test_real_prefill_reservation_funds_restore_and_keeps_fresh_tail_quota(
     dsv4, cache_type
 ):
-    c, physical, adder, req = restore_setup(dsv4=dsv4, cache_type=cache_type)
+    c, physical, adder, req = restore_setup(dsv4=dsv4, cache_type=cache_type, extra=3)
     assert physical.free_pages == 0
     assert adder.token_to_kv_pool_allocator.available_size() == 0
 
@@ -116,7 +116,9 @@ def test_real_prefill_reservation_funds_restore_and_keeps_fresh_tail_quota(
 
     assert adder.can_run_list == [req]
     assert req.extend_range == Range(2 * adder.page_size, 3 * adder.page_size)
-    assert physical.free_pages == c._kvduo_reserved_prefill_pages() == 1
+    assert physical.free_pages == 2
+    assert c._kvduo_reserved_prefill_pages() == 1
+    assert c._kvduo_mandatory_hot_pages() == 1
     assert c._kvduo_prefill_budget_cost == {(0, 0): 1}
     assert c._kvduo_request_limited(0)
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_called_once()
@@ -208,14 +210,14 @@ def test_restore_rejects_invalid_reservation_without_reclaim(invalid):
 
 
 def test_failed_restore_cancels_prefill_quota_and_limits_without_spending_pages():
-    c, physical, adder, req = restore_setup(dsv4=True)
+    c, physical, adder, req = restore_setup(dsv4=True, extra=3)
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.return_value = None
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.side_effect = None
 
     assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
 
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_called_once()
-    assert physical.free_pages == 2
+    assert physical.free_pages == 3
     assert not c._kvduo_prefill_reservations
     assert not c._kvduo_prefill_limited_requests
     assert not c._kvduo_prefill_budget_cost

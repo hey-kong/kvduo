@@ -170,7 +170,12 @@ def test_generic_merge_moves_payload_across_storage_layers_before_whole_page_fre
         torch.arange(3 * k).remainder(251).to(pool.store_dtype)[:, None, None]
     )
     survivors = [0, k + 64, 2 * k + 64, 2 * k + 65]
-    c.hot_visited[owner][survivors] = True
+    c.req_device_buffer_tokens[owner][: 3 * k] = -1
+    c.req_device_buffer_tokens[owner][survivors] = torch.tensor(
+        survivors, dtype=torch.int32
+    )
+    c.kvduo_capacity_steps[owner] = 65
+    c.kvduo_capacity_ema[owner] = 0
     payloads = pool.get_flat_key_buffer()[locations[survivors]].clone()
     free = allocator.free_hisparse_indices
 
@@ -195,7 +200,6 @@ def test_generic_merge_moves_payload_across_storage_layers_before_whole_page_fre
         == survivors
     )
     assert c._kvduo_hot_base_pages[owner] == (pages[2],)
-    assert not torch.any(c.hot_visited[owner])
     allocator.free_hisparse_indices.assert_called_once()
 
 
@@ -355,7 +359,6 @@ def test_large_generic_rollback_preserves_int32_lru_and_base_contents(monkeypatc
     c._ensure_kvduo_hot_capacity_targets_batch({owner: 8 * k})
     c.lru_slots[owner] = torch.arange(8 * k, dtype=torch.int32).flip(0)
     c.req_device_buffer_tokens[owner] = torch.arange(c.padded_buffer_size)
-    c.hot_visited[owner] = True
     backing = pool.get_flat_key_buffer().clone()
     before = allocator.hisparse_attn_allocator.available_size()
     c._rollback_kvduo_hot_batch((owner,))
@@ -366,8 +369,6 @@ def test_large_generic_rollback_preserves_int32_lru_and_base_contents(monkeypatc
     assert torch.all(c.lru_slots[owner][k:] == -1)
     assert c.req_device_buffer_tokens[owner][:k].tolist() == list(range(k))
     assert torch.all(c.req_device_buffer_tokens[owner][k:] == -1)
-    assert torch.all(c.hot_visited[owner][:k])
-    assert not torch.any(c.hot_visited[owner][k:])
 
 
 @pytest.mark.parametrize("kvduo", [False, True])

@@ -6,11 +6,19 @@
 #define KVDUO_HOST_DEVICE
 #endif
 namespace sglang {
-KVDUO_HOST_DEVICE inline void kvduo_record_hot_hit(bool& visited, bool observe) {
-  if (observe) visited = true;
+KVDUO_HOST_DEVICE inline int kvduo_lru_segment(int capacity, int position, int k) {
+  return (capacity - 1 - position) / k;
 }
-KVDUO_HOST_DEVICE inline void kvduo_record_hot_insert(bool& visited) {
-  visited = false;
+// Counts are taken at pre-update LRU ranks, from MRU segment 0 to LRU.
+KVDUO_HOST_DEVICE inline void kvduo_update_capacity_ema(
+    const int* hits, int misses, int accesses, int pages, float* counts, int64_t& steps) {
+  if (accesses <= 0 || pages <= 0) return;
+  constexpr float alpha = 1.0f / 64.0f;
+  for (int j = 0; j < 9; ++j) {
+    const float value = j == 8 ? static_cast<float>(misses) : (j < pages ? static_cast<float>(hits[j]) : 0.0f);
+    counts[j] = steps == 0 ? value : (1.0f - alpha) * counts[j] + alpha * value;
+  }
+  ++steps;
 }
 // Actual extra-page reuse and actual H2D misses, including valid zero/zero steps.
 KVDUO_HOST_DEVICE inline void
