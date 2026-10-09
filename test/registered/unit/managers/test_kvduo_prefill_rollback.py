@@ -483,6 +483,109 @@ def merged_and_expanded(page_counts, expanded, *, layers=1):
     return c, physical
 
 
+def test_rollback_cuda_entry_uses_unpadded_lru_capacity_and_passes_full_banks(
+    monkeypatch,
+):
+    import sglang.kernels.ops.kvcache.hisparse as ops
+
+    c, _ = make_merge_coordinator(
+        {(layer, req): 4 for req in range(3) for layer in range(2)}, layers=2
+    )
+    assert c.req_device_buffer_tokens.shape == (2, 3, 34)
+    assert c.req_device_buffer_token_locs.shape == c.hot_visited.shape == (2, 3, 34)
+    assert c.lru_slots.shape == (2, 3, 32)
+    owners = torch.tensor([[0, 1], [1, 2]], dtype=torch.int64)
+    targets = torch.tensor([8, 12], dtype=torch.int32)
+    module = MagicMock()
+    load_module = MagicMock(return_value=module)
+    monkeypatch.setattr(ops, "_jit_kvduo_rollback_module", load_module)
+    # Exercise CUDA dispatch/argument wiring without requiring a GPU. Actual
+    # padded-kernel execution is covered by the registered kernel regressions.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda _: True))
+    banks = (
+        c.req_device_buffer_tokens,
+        c.req_device_buffer_token_locs,
+        c.lru_slots,
+        c.hot_visited,
+        c.kvduo_req_hot_capacity_gpu,
+    )
+    ops.rollback_kvduo_hot_metadata(owners, targets, *banks)
+    load_module.assert_called_once_with(32, 256)
+    module.rollback.assert_called_once()
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            module.rollback.call_args.args, (owners, targets, *banks)
+        )
+    )
+
+
+def test_multi_request_layer_rollback_with_coordinator_padding_publishes_before_free():
+    page_counts = {(layer, req): 4 for req in range(3) for layer in range(2)}
+    c, physical = merged_and_expanded(
+        page_counts, {owner: 3 for owner in page_counts}, layers=2
+    )
+    banks = (
+        c.req_device_buffer_tokens,
+        c.req_device_buffer_token_locs,
+        c.lru_slots,
+        c.hot_visited,
+        c.kvduo_req_hot_capacity_gpu,
+    )
+    assert banks[0].size(2) == c.device_buffer_size + c.page_size
+    assert banks[2].size(2) == c.device_buffer_size
+    c.req_device_buffer_tokens[:, :, 32:] = 999
+    c.req_device_buffer_token_locs[:, :, 32:] = 999
+    c.hot_visited.fill_(True)
+    c.hot_visited[:, :, 1] = False
+    c.lru_slots[:, :, :12] = torch.tensor(
+        [9, 3, 10, 7, 0, 11, 6, 2, 8, 1, 5, 4], dtype=torch.int16
+    )
+    before = [bank.clone() for bank in banks]
+    addresses = [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
+    payloads = [bank.clone() for bank in c.mem_pool_device.kv_buffer]
+    c._move_kvduo_hot_entries = MagicMock()
+    c.token_to_kv_pool_allocator.free_hisparse_indices.reset_mock()
+    free = c.token_to_kv_pool_allocator.free_hisparse_indices.side_effect
+
+    def check_then_free(indices):
+        # The most recently processed requests (2 and 1) each release two
+        # pages; request 0, including its padding, must remain untouched.
+        assert indices.numel() == 4 * c.page_size
+        for bank, original in zip(banks, before):
+            assert torch.equal(bank[:, 0], original[:, 0])
+        for layer in range(2):
+            for req in (1, 2):
+                owner = (layer, req)
+                assert c.kvduo_req_hot_capacity[owner].item() == 8
+                assert c.kvduo_req_hot_capacity_gpu[owner].item() == 8
+                assert c.lru_slots[owner][:8].tolist() == [3, 7, 0, 6, 2, 1, 5, 4]
+                assert torch.all(c.lru_slots[owner][8:] == -1)
+                for bank, original in zip(
+                    (banks[0], banks[1], banks[3]), (before[0], before[1], before[3])
+                ):
+                    assert torch.equal(bank[owner][:8], original[owner][:8])
+                assert torch.all(c.req_device_buffer_tokens[owner][8:] == -1)
+                assert torch.all(c.req_device_buffer_token_locs[owner][8:] == -1)
+                assert not c.hot_visited[owner][8:].any()
+                assert c._kvduo_req_layer_pages[owner] == list(
+                    c._kvduo_hot_base_pages[owner]
+                )
+        free(indices)
+
+    c.token_to_kv_pool_allocator.free_hisparse_indices.side_effect = check_then_free
+    reservation = c.reserve_kvduo_prefill(3, [0, 1, 2])
+    assert reservation is not None and physical.free_pages == 4
+    assert c._kvduo_reserved_prefill_pages() == 3
+    c.token_to_kv_pool_allocator.free_hisparse_indices.assert_called_once()
+    c._move_kvduo_hot_entries.assert_not_called()
+    assert addresses == [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
+    assert all(
+        torch.equal(bank, original)
+        for bank, original in zip(c.mem_pool_device.kv_buffer, payloads)
+    )
+
+
 def test_first_growth_starts_evaluation_without_reference_stage_later_growth_keeps_history():
     c, p = merged_and_expanded({(0, 0): 4}, {(0, 0): 3})
     assert c._kvduo_hot_base_pages[0, 0] == tuple(c._kvduo_req_layer_pages[0, 0][:2])

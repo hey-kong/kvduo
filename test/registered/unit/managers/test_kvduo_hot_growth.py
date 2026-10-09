@@ -20,6 +20,9 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
     coordinator.top_k = top_k
     coordinator.min_hot_pages = (top_k + 3) // 4
     coordinator.device_buffer_size = 32
+    coordinator.padded_buffer_size = (
+        coordinator.device_buffer_size + coordinator.page_size
+    )
     coordinator.mem_pool_device = SimpleNamespace(
         layer_num=layers,
         flat_layer_slot_stride=10000,
@@ -45,7 +48,9 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
     coordinator.kvduo_prefill_policy = KVDuoPrefillPolicy()
     coordinator._init_kvduo_prefill_rollback_state(requests)
     coordinator.kvduo_observe = torch.ones(1, dtype=torch.int32)
-    coordinator.hot_visited = torch.zeros((layers, requests, 32), dtype=torch.bool)
+    # Match production: LRU has HOT capacity, other banks have page padding.
+    metadata_shape = (layers, requests, coordinator.padded_buffer_size)
+    coordinator.hot_visited = torch.zeros(metadata_shape, dtype=torch.bool)
     coordinator.kvduo_hot_growth_events = torch.zeros(
         (layers, requests), dtype=torch.int32
     )
@@ -59,10 +64,10 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
         (layers, requests), dtype=torch.int32
     )
     coordinator.req_device_buffer_token_locs = torch.full(
-        (layers, requests, 32), -1, dtype=torch.int32
+        metadata_shape, -1, dtype=torch.int32
     )
     coordinator.req_device_buffer_tokens = torch.full(
-        (layers, requests, 32), -1, dtype=torch.int32
+        metadata_shape, -1, dtype=torch.int32
     )
     coordinator.lru_slots = torch.arange(32, dtype=torch.int16).repeat(
         layers, requests, 1

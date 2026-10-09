@@ -431,7 +431,10 @@ def rollback_kvduo_hot_metadata(
     assert targets.numel() == owners.size(0)
     for tensor in (tokens, locations, lru, visited, capacities):
         assert tensor.is_contiguous() and tensor.device == owners.device
-    _jit_kvduo_rollback_module(tokens.size(2), 256).rollback(
+    # The coordinator pads token/location/visited rows by one page, but LRU
+    # contains only HOT slots. Compile the scan for LRU's logical capacity;
+    # the wrapper passes each bank's actual strides and padded width.
+    _jit_kvduo_rollback_module(lru.size(2), 256).rollback(
         owners,
         targets,
         tokens,

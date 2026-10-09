@@ -1055,49 +1055,85 @@ def test_kvduo_ema_decays_on_valid_zero_counts_and_marks_reuse_after_h2d():
     assert kwargs["prefill_steps"].item() == 2
 
 
-def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru():
+@pytest.mark.parametrize("capacity", [8, 512])
+@pytest.mark.parametrize("page_size", [2, 64])
+def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru(
+    capacity, page_size
+):
     from sglang.kernels.ops.kvcache.hisparse import rollback_kvduo_hot_metadata
 
-    # Two selected owners and one untouched owner; physical slot ids differ
-    # from LRU rank, so truncating the permutation would be incorrect.
-    tokens = torch.arange(24, dtype=torch.int32, device=DEVICE).view(1, 3, 8)
+    # Match the coordinator's padded banks and unpadded LRU. Selected owners
+    # cross both request and layer boundaries, exposing incorrect row strides.
+    padded_capacity = capacity + page_size
+    tokens = torch.arange(
+        2 * 3 * padded_capacity, dtype=torch.int32, device=DEVICE
+    ).view(2, 3, padded_capacity)
     locations = (tokens + 100).clone()
-    lru = torch.tensor(
-        [
-            [
-                [7, 3, 0, 6, 1, 5, 2, 4],
-                [6, 5, 4, 3, 2, 1, 0, 7],
-                [0, 1, 2, 3, 4, 5, 6, 7],
-            ]
-        ],
-        dtype=torch.int16,
-        device=DEVICE,
-    )
-    touch = torch.ones((1, 3, 8), dtype=torch.bool, device=DEVICE)
-    capacities = torch.full((1, 3), 8, dtype=torch.int32, device=DEVICE)
-    addresses = [t.data_ptr() for t in (tokens, locations, lru, touch, capacities)]
+    order = torch.arange(capacity, dtype=torch.int16, device=DEVICE).flip(0)
+    lru = torch.stack([order.roll(i) for i in range(6)]).view(2, 3, capacity)
+    visited = (tokens % 3 != 0).clone()
+    visited[:, :, capacity:] = True
+    capacities = torch.full((2, 3), capacity, dtype=torch.int32, device=DEVICE)
+    banks = (tokens, locations, lru, visited, capacities)
+    before = [bank.clone() for bank in banks]
+    addresses = [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
+    selected = {(0, 1): capacity // 2, (1, 0): capacity // 4, (1, 2): capacity * 3 // 4}
     rollback_kvduo_hot_metadata(
-        torch.tensor([[0, 0], [0, 1]], dtype=torch.int64, device=DEVICE),
-        torch.tensor([4, 6], dtype=torch.int32, device=DEVICE),
+        torch.tensor(list(selected), dtype=torch.int64, device=DEVICE),
+        torch.tensor(list(selected.values()), dtype=torch.int32, device=DEVICE),
         tokens,
         locations,
         lru,
-        touch,
+        visited,
         capacities,
     )
     torch.cuda.synchronize()
-    assert lru.cpu().tolist() == [
-        [[3, 0, 1, 2, -1, -1, -1, -1], [5, 4, 3, 2, 1, 0, -1, -1], list(range(8))]
-    ]
-    assert capacities.cpu().tolist() == [[4, 6, 8]]
-    assert touch.cpu().tolist() == [
-        [[True] * 4 + [False] * 4, [True] * 6 + [False] * 2, [True] * 8]
-    ]
-    assert addresses == [
-        t.data_ptr() for t in (tokens, locations, lru, touch, capacities)
-    ]
-    assert tokens[0, 0].cpu().tolist() == [0, 1, 2, 3, -1, -1, -1, -1]
-    assert locations[0, 1].cpu().tolist() == [108, 109, 110, 111, 112, 113, -1, -1]
+    for layer in range(2):
+        for req in range(3):
+            owner = (layer, req)
+            if owner not in selected:
+                for bank, original in zip(banks, before):
+                    assert torch.equal(bank[owner], original[owner])
+                continue
+            target = selected[owner]
+            old_order = before[2][owner]
+            assert torch.equal(lru[owner][:target], old_order[old_order < target])
+            assert torch.all(lru[owner][target:] == -1)
+            for bank, original in zip(
+                (tokens, locations, visited), (before[0], before[1], before[3])
+            ):
+                assert torch.equal(bank[owner][:target], original[owner][:target])
+            assert torch.all(tokens[owner][target:] == -1)
+            assert torch.all(locations[owner][target:] == -1)
+            assert not torch.any(visited[owner][target:])
+            assert capacities[owner].item() == target
+    assert addresses == [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
+
+
+@pytest.mark.parametrize("bad_bank", ["locations", "visited", "lru"])
+def test_kvduo_rollback_rejects_incompatible_bank_shapes_before_mutation(bad_bank):
+    from sglang.kernels.ops.kvcache.hisparse import rollback_kvduo_hot_metadata
+
+    tokens = torch.ones((2, 3, 10), dtype=torch.int32, device=DEVICE)
+    locations = tokens.clone()
+    visited = torch.ones_like(tokens, dtype=torch.bool)
+    lru = torch.arange(8, dtype=torch.int16, device=DEVICE).repeat(2, 3, 1)
+    if bad_bank == "locations":
+        locations = torch.ones((2, 3, 9), dtype=torch.int32, device=DEVICE)
+    elif bad_bank == "visited":
+        visited = torch.ones((2, 3, 9), dtype=torch.bool, device=DEVICE)
+    else:
+        lru = torch.arange(12, dtype=torch.int16, device=DEVICE).repeat(2, 3, 1)
+    capacities = torch.full((2, 3), 8, dtype=torch.int32, device=DEVICE)
+    banks = (tokens, locations, lru, visited, capacities)
+    before = [bank.clone() for bank in banks]
+    with pytest.raises(RuntimeError, match="Size mismatch|Padded metadata"):
+        rollback_kvduo_hot_metadata(
+            torch.tensor([[1, 2]], dtype=torch.int64, device=DEVICE),
+            torch.tensor([4], dtype=torch.int32, device=DEVICE),
+            *banks,
+        )
+    assert all(torch.equal(bank, original) for bank, original in zip(banks, before))
 
 
 def test_kvduo_resolver_graph_replays_after_no_copy_rollback_without_recapture():
@@ -1118,21 +1154,28 @@ def test_kvduo_resolver_graph_replays_after_no_copy_rollback_without_recapture()
         "device_buffer_tokens",
         "device_buffer_locs",
         "lru_slots",
+        "hot_visited",
         "req_hot_buffer_sizes",
         "hot_base_capacities",
         "prefill_ema",
         "prefill_steps",
     )
-    pointers = [kwargs[key].data_ptr() for key in keys]
+    addresses = [
+        (kwargs[key].data_ptr(), kwargs[key].shape, kwargs[key].stride())
+        for key in keys
+    ]
     rollback_kvduo_hot_metadata(
         torch.tensor([[0, 0]], dtype=torch.int64, device=DEVICE),
         torch.tensor([2], dtype=torch.int32, device=DEVICE),
-        kwargs["device_buffer_tokens"][:, :4].unsqueeze(0),
-        kwargs["device_buffer_locs"][:, :4].unsqueeze(0),
+        kwargs["device_buffer_tokens"].unsqueeze(0),
+        kwargs["device_buffer_locs"].unsqueeze(0),
         kwargs["lru_slots"].unsqueeze(0),
-        kwargs["hot_visited"][:, :4].unsqueeze(0),
+        kwargs["hot_visited"].unsqueeze(0),
         kwargs["req_hot_buffer_sizes"].unsqueeze(0),
     )
+    assert torch.all(kwargs["device_buffer_tokens"][:, 2:] == -1)
+    assert torch.all(kwargs["device_buffer_locs"][:, 2:] == -1)
+    assert not torch.any(kwargs["hot_visited"][:, 2:])
     kwargs["prefill_ema"].zero_()
     kwargs["prefill_steps"].zero_()
     kwargs["observe_cache"].fill_(1)
@@ -1144,7 +1187,10 @@ def test_kvduo_resolver_graph_replays_after_no_copy_rollback_without_recapture()
     assert kwargs["top_k_device_locs"].cpu().tolist() == [[9, 7]]
     assert kwargs["prefill_ema"].cpu().tolist() == [[0, 1]]
     assert kwargs["prefill_steps"].item() == 1
-    assert pointers == [kwargs[key].data_ptr() for key in keys]
+    assert addresses == [
+        (kwargs[key].data_ptr(), kwargs[key].shape, kwargs[key].stride())
+        for key in keys
+    ]
     assert torch.equal(kwargs["device_buffer"][7].cpu(), kwargs["host_cache"][6])
 
 
