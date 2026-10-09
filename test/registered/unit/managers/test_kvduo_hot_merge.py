@@ -23,9 +23,9 @@ def make_merge_coordinator(page_counts, *, layers=1, top_k=2):
     coordinator._kvduo_pending_hot_minimum.clear()
     # Linear backing lets CPU tests exercise actual production index copies.
     # Locations include the synthetic storage-layer stride used by the fixture.
-    coordinator.mem_pool_device.kv_buffer = [
-        torch.full((12000, 4), -999, dtype=torch.int64) for _ in range(layers)
-    ]
+    backing = torch.full((12000, 4), -999, dtype=torch.int64)
+    coordinator.mem_pool_device.get_flat_key_buffer = lambda: backing
+    coordinator.mem_pool_device.kv_buffer = [backing for _ in range(layers)]
     for (layer, req), pages in page_counts.items():
         capacity = pages * 4
         coordinator.req_device_buffer_tokens[layer, req, :capacity] = torch.arange(

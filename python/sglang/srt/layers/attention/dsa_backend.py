@@ -2260,6 +2260,12 @@ class DeepseekSparseAttnBackend(
                 topk_indices,
                 layer.layer_id,
             )
+            if self.hisparse_coordinator.enable_mixed_residency:
+                # Resolver locations encode storage layers for FULL and HOT.
+                # Model writes/prefill still use the ordinary per-layer views.
+                kv_cache = self.token_to_kv_pool.get_flat_key_buffer().view(
+                    self.token_to_kv_pool.dtype
+                )
         elif self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:

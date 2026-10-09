@@ -111,6 +111,9 @@ def _load_cache_to_device_buffer_mla(
     assert (
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    assert lru_slots.dtype == (
+        torch.int32 if hot_buffer_size > torch.iinfo(torch.int16).max else torch.int16
+    ), "LRU slot dtype must match the compiled HOT capacity"
 
     module = _jit_sparse_module(
         item_size_bytes,
@@ -431,6 +434,9 @@ def rollback_kvduo_hot_metadata(
     assert targets.numel() == owners.size(0)
     for tensor in (tokens, locations, lru, visited, capacities):
         assert tensor.is_contiguous() and tensor.device == owners.device
+    assert lru.dtype == (
+        torch.int32 if lru.size(2) > torch.iinfo(torch.int16).max else torch.int16
+    ), "LRU slot dtype must match the compiled HOT capacity"
     # The coordinator pads token/location/visited rows by one page, but LRU
     # contains only HOT slots. Compile the scan for LRU's logical capacity;
     # the wrapper passes each bank's actual strides and padded width.

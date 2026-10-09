@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <stdint.h>
 #include <string>
+#include <type_traits>
 
 namespace {
 
@@ -163,16 +164,16 @@ __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int
 }
 
 // Shared memory size calculation for dynamic allocation.
-// Layout: int32_t region (4-byte aligned) followed by int16_t region (2-byte aligned).
+// Layout: int32_t scratch followed by slots (int16 or int32 for large HOT banks).
 template <int NUM_TOP_K, int HOT_BUFFER_SIZE>
 struct SmemLayout {
+  using SlotT = std::conditional_t<(HOT_BUFFER_SIZE > INT16_MAX), int32_t, int16_t>;
   static constexpr int HASH_SIZE = NUM_TOP_K * 2;
   static constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
   // int32_t region: top_k_tokens + offsets + hash_keys + hit/miss counters
   static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 4;
-  // int16_t region: lru_slots_out + hash_vals
-  static constexpr int TOTAL_INT16 = HOT_BUFFER_SIZE + HASH_SIZE;
-  static constexpr size_t BYTES = TOTAL_INT32 * sizeof(int32_t) + TOTAL_INT16 * sizeof(int16_t);
+  static constexpr int TOTAL_SLOTS = HOT_BUFFER_SIZE + HASH_SIZE;
+  static constexpr size_t BYTES = TOTAL_INT32 * sizeof(int32_t) + TOTAL_SLOTS * sizeof(SlotT);
 };
 
 // Each block processes one request
@@ -203,7 +204,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     int32_t* __restrict__ top_k_device_locs,
     const ReqPoolIndicesT* __restrict__ req_pool_indices,
     const SeqLensT* __restrict__ seq_lens,
-    int16_t* __restrict__ lru_slots,
+    typename SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::SlotT* __restrict__ lru_slots,
     const int32_t* __restrict__ num_real_reqs,
     const int32_t* __restrict__ req_hot_buffer_sizes,
     bool* __restrict__ hot_visited,
@@ -236,6 +237,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+  using SlotT = typename SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::SlotT;
   constexpr int NUM_TOKEN_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
   constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
 
@@ -274,7 +276,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
   bool* req_visited = hot_visited != nullptr ? hot_visited + rid * hot_visited_stride_0 : nullptr;
   const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
-  int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
+  SlotT* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
   if (tid == 0 && enable_full_lookup) swap_status[rid] = 0;
   __syncthreads();
 
@@ -354,7 +356,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     return;
   }
 
-  // Dynamic shared memory layout: int32_t arrays first, then int16_t arrays.
+  // Dynamic shared memory layout: int32_t scratch first, then slot arrays.
   extern __shared__ char smem_raw[];
   using Layout = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>;
   constexpr int HASH_SIZE = Layout::HASH_SIZE;
@@ -374,11 +376,11 @@ __global__ void load_cache_to_device_buffer_kernel(
   int32_t& s_full_hits = s_hash_keys[HASH_SIZE + 2];
   int32_t& s_total_misses = s_hash_keys[HASH_SIZE + 3];
 
-  int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
+  SlotT* smem_slots = reinterpret_cast<SlotT*>(smem_i32 + Layout::TOTAL_INT32);
   // Compacted slot ordering: [hits fwd->  ...  <-evictables bwd]
-  int16_t* s_lru_slots_out = smem_i16;
+  SlotT* s_lru_slots_out = smem_slots;
   // Open-addressing hash table: top-k token_id -> top-k index (values)
-  int16_t* s_hash_vals = s_lru_slots_out + HOT_BUFFER_SIZE;
+  SlotT* s_hash_vals = s_lru_slots_out + HOT_BUFFER_SIZE;
 
   // Initialize shared memory: counters, hash table, prefix-sum offsets.
   if (tid == 0) {
@@ -443,7 +445,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       while (true) {
         int32_t old = atomicCAS(&s_hash_keys[slot], HASH_EMPTY, token_idx);
         if (old == HASH_EMPTY || old == token_idx) {
-          s_hash_vals[slot] = static_cast<int16_t>(i);
+          s_hash_vals[slot] = static_cast<SlotT>(i);
           break;
         }
         slot = (slot + 1) % HASH_SIZE;
@@ -462,7 +464,7 @@ __global__ void load_cache_to_device_buffer_kernel(
 
     const int slot_idx = chunk_idx * WARP_SIZE + lane_id;
     const bool has_valid_slot = has_valid_chunk && (slot_idx < hot_buffer_size);
-    const int16_t buf_slot = has_valid_slot ? req_lru_slots[slot_idx] : -1;
+    const SlotT buf_slot = has_valid_slot ? req_lru_slots[slot_idx] : -1;
     int32_t my_buffer_token = (buf_slot >= 0) ? req_device_buffer_tokens[buf_slot] : -1;
     int my_found_top_k_idx = -1;
     if (my_buffer_token >= 0) {
@@ -599,7 +601,7 @@ __global__ void load_cache_to_device_buffer_kernel(
 
     if (is_miss) {
       int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
-      int16_t evict_slot = s_lru_slots_out[hot_buffer_size - 1 - miss_offset];
+      SlotT evict_slot = s_lru_slots_out[hot_buffer_size - 1 - miss_offset];
       // An H2D miss that consumes an empty slot needs no capacity increase.
       // Replacing any occupied slot emits exactly one event for this request
       // and logical layer, regardless of the number of missed entries.
@@ -679,7 +681,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
     const int32_t miss_token = s_top_k_tokens[miss_idx];
-    const int16_t evict_slot = s_lru_slots_out[hot_buffer_size - 1 - miss_idx];
+    const SlotT evict_slot = s_lru_slots_out[hot_buffer_size - 1 - miss_idx];
 
     const int64_t src_loc = req_host_cache_locs[miss_token];
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
@@ -769,6 +771,8 @@ void load_cache_to_device_buffer(
     uint64_t prefill_steps_ptr) {
   using namespace host;
 
+  using SlotT = typename SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::SlotT;
+
   const auto stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(stream_ptr));
 
   // Generic lambda: int32/int64 kernel variants are compiled for both
@@ -793,7 +797,7 @@ void load_cache_to_device_buffer(
         reinterpret_cast<int32_t*>(static_cast<uintptr_t>(top_k_device_locs_ptr)),
         req_pool_indices_ptr,
         seq_lens_ptr,
-        reinterpret_cast<int16_t*>(static_cast<uintptr_t>(lru_slots_ptr)),
+        reinterpret_cast<SlotT*>(static_cast<uintptr_t>(lru_slots_ptr)),
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(num_real_reqs_ptr)),
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(req_hot_buffer_sizes_ptr)),
         reinterpret_cast<bool*>(static_cast<uintptr_t>(hot_visited_ptr)),

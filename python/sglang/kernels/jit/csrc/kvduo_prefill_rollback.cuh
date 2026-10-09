@@ -2,6 +2,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
+#include <type_traits>
 #ifdef USE_ROCM
 #include <hipcub/hipcub.hpp>
 namespace rollback_cub = hipcub;
@@ -17,13 +18,16 @@ struct KVDuoRollbackStrides {
   int64_t request;
 };
 
+template <int CAPACITY>
+using KVDuoRollbackSlot = std::conditional_t<(CAPACITY > INT16_MAX), int32_t, int16_t>;
+
 template <int CAPACITY, int BLOCK_SIZE>
 __global__ void kvduo_prefill_rollback_kernel(
     const int64_t* owners,
     const int32_t* targets,
     int32_t* tokens,
     int32_t* locations,
-    int16_t* lru,
+    KVDuoRollbackSlot<CAPACITY>* lru,
     bool* visited,
     int32_t* capacities,
     int requests,
@@ -33,9 +37,11 @@ __global__ void kvduo_prefill_rollback_kernel(
     KVDuoRollbackStrides lru_strides,
     KVDuoRollbackStrides visited_strides) {
   constexpr int ITEMS = (CAPACITY + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  using SlotT = KVDuoRollbackSlot<CAPACITY>;
   using Scan = rollback_cub::BlockScan<int, BLOCK_SIZE>;
   __shared__ typename Scan::TempStorage scratch;
-  extern __shared__ int16_t compacted[];
+  extern __shared__ char slot_scratch[];
+  SlotT* compacted = reinterpret_cast<SlotT*>(slot_scratch);
   const int tid = threadIdx.x;
   const int64_t layer = owners[blockIdx.x * 2];
   const int64_t request = owners[blockIdx.x * 2 + 1];
@@ -46,7 +52,7 @@ __global__ void kvduo_prefill_rollback_kernel(
   visited += layer * visited_strides.layer + request * visited_strides.request;
   const int target = targets[blockIdx.x];
   const int old_capacity = capacities[owner];
-  int16_t slots[ITEMS];
+  SlotT slots[ITEMS];
   int flags[ITEMS], offsets[ITEMS];
   // Blocked ordering gives a stable scan across the full old permutation.
   for (int i = 0; i < ITEMS; ++i) {
@@ -82,6 +88,7 @@ void kvduo_prefill_rollback(
     tvm::ffi::TensorView visited,
     tvm::ffi::TensorView capacities) {
   using namespace host;
+  using SlotT = KVDuoRollbackSlot<CAPACITY>;
   auto n = SymbolicSize{"objects"};
   auto layers = SymbolicSize{"layers"};
   auto requests = SymbolicSize{"requests"};
@@ -95,7 +102,7 @@ void kvduo_prefill_rollback(
       .with_device(device)
       .verify(tokens)
       .verify(locations);
-  TensorMatcher({layers, requests, CAPACITY}).with_dtype<int16_t>().with_device(device).verify(lru);
+  TensorMatcher({layers, requests, CAPACITY}).with_dtype<SlotT>().with_device(device).verify(lru);
   // bool is integral in C++; TensorMatcher's generic integral trait maps it
   // to uint8. PyTorch exports a distinct DLPack bool8 dtype.
   TensorMatcher({layers, requests, padded_capacity})
@@ -104,7 +111,7 @@ void kvduo_prefill_rollback(
       .verify(visited);
   TensorMatcher({layers, requests}).with_dtype<int32_t>().with_device(device).verify(capacities);
   RuntimeCheck(padded_capacity.unwrap() >= CAPACITY, "Padded metadata cannot be smaller than LRU capacity");
-  constexpr size_t smem_bytes = CAPACITY * sizeof(int16_t);
+  constexpr size_t smem_bytes = CAPACITY * sizeof(SlotT);
 #ifndef USE_ROCM
   if constexpr (smem_bytes > 46u * 1024u) {
     cudaFuncSetAttribute(
@@ -117,7 +124,7 @@ void kvduo_prefill_rollback(
       static_cast<const int32_t*>(targets.data_ptr()),
       static_cast<int32_t*>(tokens.data_ptr()),
       static_cast<int32_t*>(locations.data_ptr()),
-      static_cast<int16_t*>(lru.data_ptr()),
+      static_cast<SlotT*>(lru.data_ptr()),
       static_cast<bool*>(visited.data_ptr()),
       static_cast<int32_t*>(capacities.data_ptr()),
       static_cast<int>(requests.unwrap()),

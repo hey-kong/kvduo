@@ -216,12 +216,10 @@ class HiSparseCoordinator:
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
         if self.enable_mixed_residency:
-            # A KVDuo physical page is the same page number across every C4
+            # A KVDuo physical page is the same page number across every KV
             # storage layer.  A HOT(request, logical_layer) owner may use all
-            # of those fragments through global flat C4 locations.
-            self.hot_storage_layers = (
-                self.mem_pool_device.layer_num if self.is_dsv4_hisparse else 1
-            )
+            # of those fragments through global flat locations.
+            self.hot_storage_layers = self.mem_pool_device.layer_num
             self.hot_page_size = self.hot_storage_layers * self.page_size
             self.min_hot_pages = (top_k + self.hot_page_size - 1) // self.hot_page_size
             if self.min_hot_pages > 8:
@@ -231,10 +229,6 @@ class HiSparseCoordinator:
                 )
             # Fixed graph metadata covers the promised 1K..8K physical pages.
             max_hot_capacity = 8 * self.hot_page_size
-            if max_hot_capacity > torch.iinfo(torch.int16).max:
-                raise ValueError(
-                    "KVDuo 8-page capacity exceeds the int16 resolver slot type"
-                )
             self.device_buffer_size = max_hot_capacity
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
@@ -422,7 +416,13 @@ class HiSparseCoordinator:
             device=device,
         )
         self._lru_init = torch.arange(
-            self.device_buffer_size, dtype=torch.int16, device=device
+            self.device_buffer_size,
+            dtype=(
+                torch.int32
+                if self.device_buffer_size > torch.iinfo(torch.int16).max
+                else torch.int16
+            ),
+            device=device,
         )
         self.lru_slots = (
             self._lru_init.view(1, 1, -1)
@@ -1733,7 +1733,7 @@ class HiSparseCoordinator:
         evaluation_snapshots = {}
         try:
             # This control path is outside graph replay. Read all page numbers
-            # with one D2H synchronization, then construct flat C4 locations.
+            # with one D2H synchronization, then construct flat KV locations.
             physical_pages = physical.view(-1, self.page_size)
             page_starts_device = physical_pages[:, 0].to(torch.int64)
             page_starts = page_starts_device.to(device="cpu").tolist()
@@ -1794,7 +1794,7 @@ class HiSparseCoordinator:
                                 torch.arange(
                                     current,
                                     target,
-                                    dtype=torch.int16,
+                                    dtype=self.lru_slots.dtype,
                                     device=self.device,
                                 ),
                                 previous_lru[:current],
@@ -2176,7 +2176,7 @@ class HiSparseCoordinator:
             )
             transfer_cache_dsv4_mla(ptrs, ptrs, src_locs, dst_locs)
         else:
-            cache = self.mem_pool_device.kv_buffer[layer_id]
+            cache = self.mem_pool_device.get_flat_key_buffer()
             cache.index_copy_(0, dst_locs, cache.index_select(0, src_locs))
 
     def _merge_kvduo_hot_pages(self, layer_id: int, req_idx: int) -> int:
@@ -2249,7 +2249,7 @@ class HiSparseCoordinator:
             retained_locs, dtype=torch.int32, device=self.device
         )
         new_lru[:new_capacity] = torch.tensor(
-            plan.lru_slots, dtype=torch.int16, device=self.device
+            plan.lru_slots, dtype=self.lru_slots.dtype, device=self.device
         )
         src_locs = torch.tensor(
             [locs[slot] for slot in plan.source_slots],
@@ -3513,6 +3513,8 @@ class HiSparseCoordinator:
         layer_id: int,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices."""
+        if not self.is_dsv4_hisparse:
+            layer_id -= getattr(self.mem_pool_device, "start_layer", 0)
         num_reqs = req_pool_indices.size(0)
 
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
@@ -3532,7 +3534,7 @@ class HiSparseCoordinator:
             host_cache=self.mem_pool_host.kv_buffer[layer_id],
             device_buffer=(
                 self.mem_pool_device.get_flat_key_buffer()
-                if self.enable_mixed_residency and self.is_dsv4_hisparse
+                if self.enable_mixed_residency
                 else self.mem_pool_device.kv_buffer[layer_id]
             ),
             top_k_device_locs=top_k_indices,
@@ -3606,7 +3608,7 @@ class HiSparseCoordinator:
             ),
             full_location_base=(
                 layer_id * self.mem_pool_device.flat_layer_slot_stride
-                if self.enable_mixed_residency and self.is_dsv4_hisparse
+                if self.enable_mixed_residency
                 else 0
             ),
         )
