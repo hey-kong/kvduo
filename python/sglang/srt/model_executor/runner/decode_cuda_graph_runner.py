@@ -271,7 +271,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if not self.model_runner.spec_algorithm.supports_target_verify_for_draft():
+                if (
+                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
+                ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
         elif self.is_dllm:
@@ -815,7 +817,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.hisparse_coordinator is not None:
             forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
             if forward_batch.hisparse_coordinator.enable_mixed_residency:
-                forward_batch.hisparse_coordinator.kvduo_hot_tail_ema_observe.zero_()
+                forward_batch.hisparse_coordinator.kvduo_observe.zero_()
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
@@ -926,9 +928,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if self.model_runner.server_args.debug_cuda_graph:
-            assert isinstance(self.backend, BreakableCudaGraphBackend), (
-                "Breakable CUDA graph is required for --debug-cuda-graph"
-            )
+            assert isinstance(
+                self.backend, BreakableCudaGraphBackend
+            ), "Breakable CUDA graph is required for --debug-cuda-graph"
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens

@@ -1,4 +1,4 @@
-#include <sgl_kernel/kvduo_hot_tail_ema.h>
+#include <sgl_kernel/kvduo_cache_observation.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -206,7 +206,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     int16_t* __restrict__ lru_slots,
     const int32_t* __restrict__ num_real_reqs,
     const int32_t* __restrict__ req_hot_buffer_sizes,
-    int64_t* __restrict__ hot_page_last_touch,
+    bool* __restrict__ hot_visited,
     const int64_t* __restrict__ req_to_logical_token,
     const int64_t* __restrict__ full_to_device_loc,
     int64_t* __restrict__ full_last_touch,
@@ -223,19 +223,16 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t buffer_stride_0,
     int64_t host_stride,
     int64_t lru_slot_stride_0,
-    int64_t hot_page_stride_0,
+    int64_t hot_visited_stride_0,
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t page_size,
     int64_t item_size_bytes,
     int64_t full_location_base,
-    float* __restrict__ hot_tail_ema,
-    int64_t* __restrict__ hot_tail_observation_steps,
-    float hot_tail_ema_alpha,
-    const int32_t* __restrict__ hot_tail_ema_observe,
+    const int32_t* __restrict__ observe_cache,
     const int32_t* __restrict__ hot_base_capacities,
-    float* __restrict__ prefill_hit_ema,
-    int64_t* __restrict__ prefill_hit_steps) {
+    float* __restrict__ prefill_ema,
+    int64_t* __restrict__ prefill_steps) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
@@ -264,14 +261,8 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int hot_buffer_size =
       enable_dynamic_hot_view ? min(max(req_hot_buffer_sizes[rid], 0), HOT_BUFFER_SIZE) : HOT_BUFFER_SIZE;
   const int num_buffer_chunks = (hot_buffer_size + WARP_SIZE - 1) / WARP_SIZE;
-  const bool observe_hot_tail =
-      hot_tail_ema != nullptr && (hot_tail_ema_observe == nullptr || hot_tail_ema_observe[0] != 0);
-  const int releasable_hot_pages = observe_hot_tail && enable_full_lookup && enable_dynamic_hot_view
-                                       ? sglang::kvduo_hot_releasable_pages(hot_buffer_size, page_size, NUM_TOP_K)
-                                       : 0;
-  const int discarded_hot_slots = releasable_hot_pages * page_size;
-  const bool observe_prefill =
-      prefill_hit_ema != nullptr && (hot_tail_ema_observe == nullptr || hot_tail_ema_observe[0] != 0);
+  const bool observe = observe_cache == nullptr || observe_cache[0] != 0;
+  const bool observe_prefill = prefill_ema != nullptr && observe;
   const int base_capacity =
       hot_base_capacities != nullptr && hot_base_capacities[rid] > 0 ? hot_base_capacities[rid] : hot_buffer_size;
 
@@ -281,6 +272,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int64_t buffer_offset = rid * buffer_stride_0;
   int32_t* req_device_buffer_tokens = device_buffer_tokens + buffer_offset;
   const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
+  bool* req_visited = hot_visited != nullptr ? hot_visited + rid * hot_visited_stride_0 : nullptr;
   const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
   int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
   if (tid == 0 && enable_full_lookup) swap_status[rid] = 0;
@@ -299,13 +291,11 @@ __global__ void load_cache_to_device_buffer_kernel(
   __shared__ int needs_hot_resolver;
   __shared__ int full_resident_accesses;
   __shared__ int needs_hot_growth;
-  __shared__ int tail_hot_hits;
   __shared__ int base_hot_hits;
   if (tid == 0) {
     needs_hot_resolver = 0;
     full_resident_accesses = 0;
     needs_hot_growth = 0;
-    tail_hot_hits = 0;
     base_hot_hits = 0;
   }
   __syncthreads();
@@ -341,14 +331,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       if (tid == 0) {
         atomicAdd(&resolver_stats[rid * resolver_stats_stride + 1], full_resident_accesses);
         if (observe_prefill && swap_status[rid] == 0) {
-          sglang::kvduo_update_prefill_hit_ema(
-              full_resident_accesses,
-              full_resident_accesses,
-              0,
-              0,
-              hot_tail_ema_alpha,
-              prefill_hit_ema + rid * 4,
-              prefill_hit_steps[rid]);
+          sglang::kvduo_update_prefill_ema(0, 0, full_resident_accesses, prefill_ema + rid * 2, prefill_steps[rid]);
         }
       }
       return;
@@ -505,10 +488,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     if (is_hit) {
       s_top_k_tokens[my_found_top_k_idx] = TOKEN_HIT;
       req_top_k_device_locs[my_found_top_k_idx] = req_device_buffer_locs[buf_slot];
-      if (enable_dynamic_hot_view) {
-        atomicMax(
-            reinterpret_cast<unsigned long long*>(&hot_page_last_touch[rid * hot_page_stride_0 + buf_slot / page_size]),
-            static_cast<unsigned long long>(touch_clock[0]));
+      if (req_visited != nullptr) {
+        sglang::kvduo_record_hot_hit(req_visited[buf_slot], observe && swap_status[rid] == 0);
       }
     }
 
@@ -517,14 +498,6 @@ __global__ void load_cache_to_device_buffer_kernel(
     if (has_valid_chunk) {
       const BallotMask hit_mask = __ballot_sync(FULL_WARP_MASK, is_hit);
       const BallotMask evict_mask = __ballot_sync(FULL_WARP_MASK, is_evictable);
-      // slot_idx is the rank in the OLD LRU permutation, not buf_slot's
-      // physical index. FULL/tail hits never enter this HOT hash table.
-      if (releasable_hot_pages > 0) {
-        const BallotMask tail_hit_mask = __ballot_sync(FULL_WARP_MASK, is_hit && slot_idx < discarded_hot_slots);
-        if (lane_id == 0 && tail_hit_mask != 0) {
-          atomicAdd(&tail_hot_hits, popc_mask(tail_hit_mask));
-        }
-      }
       if (observe_prefill) {
         const BallotMask base_mask = __ballot_sync(FULL_WARP_MASK, is_hit && buf_slot < base_capacity);
         if (lane_id == 0) atomicAdd(&base_hot_hits, popc_mask(base_mask));
@@ -630,7 +603,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       // An H2D miss that consumes an empty slot needs no capacity increase.
       // Replacing any occupied slot emits exactly one event for this request
       // and logical layer, regardless of the number of missed entries.
-      if (hot_growth_events != nullptr && hot_buffer_size < HOT_BUFFER_SIZE &&
+      if (observe && swap_status[rid] == 0 && hot_growth_events != nullptr && hot_buffer_size < HOT_BUFFER_SIZE &&
           req_device_buffer_tokens[evict_slot] >= 0) {
         atomicExch(&needs_hot_growth, 1);
       }
@@ -639,12 +612,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       s_top_k_tokens[miss_offset] = my_token;
       req_top_k_device_locs[my_token_idx] = req_device_buffer_locs[evict_slot];
       req_device_buffer_tokens[evict_slot] = my_token;
-      if (enable_dynamic_hot_view) {
-        atomicMax(
-            reinterpret_cast<unsigned long long*>(
-                &hot_page_last_touch[rid * hot_page_stride_0 + evict_slot / page_size]),
-            static_cast<unsigned long long>(touch_clock[0]));
-      }
+      if (req_visited != nullptr) sglang::kvduo_record_hot_insert(req_visited[evict_slot]);
     }
   }
   __syncthreads();
@@ -661,25 +629,12 @@ __global__ void load_cache_to_device_buffer_kernel(
         atomicAdd(&hot_growth_events[rid], 1);
       }
       if (observe_prefill && swap_status[rid] == 0) {
-        sglang::kvduo_update_prefill_hit_ema(
-            total_misses + s_total_hits + s_full_hits + s_newest_hit,
-            s_full_hits + s_newest_hit,
-            base_hot_hits,
+        sglang::kvduo_update_prefill_ema(
             s_total_hits - base_hot_hits,
-            hot_tail_ema_alpha,
-            prefill_hit_ema + rid * 4,
-            prefill_hit_steps[rid]);
-      }
-      // One CTA owns this (request, logical_layer) in the decode batch.
-      // Zero tail hits still constitute an observation; padded CTAs already
-      // returned, and minimum-capacity objects have releasable_hot_pages == 0.
-      if (releasable_hot_pages > 0 && swap_status[rid] == 0) {
-        sglang::kvduo_update_hot_tail_ema(
-            tail_hot_hits,
-            releasable_hot_pages,
-            hot_tail_ema_alpha,
-            hot_tail_ema[rid],
-            hot_tail_observation_steps[rid]);
+            total_misses,
+            total_misses + s_total_hits + s_full_hits + s_newest_hit,
+            prefill_ema + rid * 2,
+            prefill_steps[rid]);
       }
     }
   }
@@ -781,7 +736,7 @@ void load_cache_to_device_buffer(
     uint64_t lru_slots_ptr,
     uint64_t num_real_reqs_ptr,
     uint64_t req_hot_buffer_sizes_ptr,
-    uint64_t hot_page_last_touch_ptr,
+    uint64_t hot_visited_ptr,
     uint64_t req_to_logical_token_ptr,
     uint64_t full_to_device_loc_ptr,
     uint64_t full_last_touch_ptr,
@@ -796,7 +751,7 @@ void load_cache_to_device_buffer(
     int64_t host_stride,
     int64_t buffer_stride_0,
     int64_t lru_slot_stride_0,
-    int64_t hot_page_stride_0,
+    int64_t hot_visited_stride_0,
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t req_to_logical_stride,
@@ -808,13 +763,10 @@ void load_cache_to_device_buffer(
     int64_t page_size,
     int64_t item_size_bytes,
     int64_t full_location_base,
-    uint64_t hot_tail_ema_ptr,
-    uint64_t hot_tail_observation_steps_ptr,
-    double hot_tail_ema_alpha,
-    uint64_t hot_tail_ema_observe_ptr,
+    uint64_t observe_cache_ptr,
     uint64_t hot_base_capacities_ptr,
-    uint64_t prefill_hit_ema_ptr,
-    uint64_t prefill_hit_steps_ptr) {
+    uint64_t prefill_ema_ptr,
+    uint64_t prefill_steps_ptr) {
   using namespace host;
 
   const auto stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(stream_ptr));
@@ -844,7 +796,7 @@ void load_cache_to_device_buffer(
         reinterpret_cast<int16_t*>(static_cast<uintptr_t>(lru_slots_ptr)),
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(num_real_reqs_ptr)),
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(req_hot_buffer_sizes_ptr)),
-        reinterpret_cast<int64_t*>(static_cast<uintptr_t>(hot_page_last_touch_ptr)),
+        reinterpret_cast<bool*>(static_cast<uintptr_t>(hot_visited_ptr)),
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(req_to_logical_token_ptr)),
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(full_to_device_loc_ptr)),
         reinterpret_cast<int64_t*>(static_cast<uintptr_t>(full_last_touch_ptr)),
@@ -861,19 +813,16 @@ void load_cache_to_device_buffer(
         buffer_stride_0,
         host_stride,
         lru_slot_stride_0,
-        hot_page_stride_0,
+        hot_visited_stride_0,
         top_k_tokens_stride,
         top_k_device_locs_stride,
         page_size,
         item_size_bytes,
         full_location_base,
-        reinterpret_cast<float*>(static_cast<uintptr_t>(hot_tail_ema_ptr)),
-        reinterpret_cast<int64_t*>(static_cast<uintptr_t>(hot_tail_observation_steps_ptr)),
-        static_cast<float>(hot_tail_ema_alpha),
-        reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(hot_tail_ema_observe_ptr)),
+        reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(observe_cache_ptr)),
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(hot_base_capacities_ptr)),
-        reinterpret_cast<float*>(static_cast<uintptr_t>(prefill_hit_ema_ptr)),
-        reinterpret_cast<int64_t*>(static_cast<uintptr_t>(prefill_hit_steps_ptr)));
+        reinterpret_cast<float*>(static_cast<uintptr_t>(prefill_ema_ptr)),
+        reinterpret_cast<int64_t*>(static_cast<uintptr_t>(prefill_steps_ptr)));
   };
 
   if (seq_is_i64 && rpi_is_i64) {

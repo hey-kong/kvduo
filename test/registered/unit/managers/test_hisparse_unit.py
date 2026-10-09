@@ -510,10 +510,6 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
         coordinator.decode_producer_stream = None
-        coordinator.kvduo_hot_tail_ema = torch.zeros((2, 1), dtype=torch.float32)
-        coordinator.kvduo_hot_tail_observation_steps = torch.zeros(
-            (2, 1), dtype=torch.int64
-        )
         coordinator.device = "cpu"
         coordinator.page_size = 4
         coordinator.hot_storage_layers = 1
@@ -524,7 +520,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator._mixed_slots = [True]
         coordinator.kvduo_req_hot_capacity = torch.zeros((2, 1), dtype=torch.int64)
         coordinator.kvduo_req_hot_capacity_gpu = torch.zeros((2, 1), dtype=torch.int32)
-        coordinator.hot_page_last_touch = torch.zeros((2, 1, 8), dtype=torch.int64)
+        coordinator.hot_visited = torch.zeros((2, 1, 32), dtype=torch.bool)
+        coordinator._init_kvduo_prefill_rollback_state(1)
+        coordinator._active_kvduo_reqs = {0: object()}
         coordinator.req_device_buffer_token_locs = torch.full(
             (2, 1, 32), -1, dtype=torch.int32
         )
@@ -598,7 +596,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
-        coordinator.kvduo_hot_tail_ema_observe = torch.ones(1, dtype=torch.int32)
+        coordinator.kvduo_observe = torch.ones(1, dtype=torch.int32)
         coordinator.decode_producer_stream = None
         coordinator.device = "cpu"
         coordinator.page_size = 4
@@ -633,6 +631,16 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             for (layer_id, req_idx), capacity in targets.items():
                 coordinator.kvduo_req_hot_capacity[layer_id, req_idx] = capacity
 
+        coordinator._init_kvduo_prefill_rollback_state(
+            coordinator.kvduo_req_hot_capacity.shape[1]
+        )
+        coordinator.hot_visited = torch.zeros(
+            (
+                *coordinator.kvduo_req_hot_capacity.shape,
+                getattr(coordinator, "device_buffer_size", 8),
+            ),
+            dtype=torch.bool,
+        )
         coordinator._ensure_kvduo_hot_capacity_targets_batch = MagicMock(
             side_effect=allocate
         )
@@ -720,7 +728,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
-        coordinator.kvduo_hot_tail_ema_observe = torch.ones(1, dtype=torch.int32)
+        coordinator.kvduo_observe = torch.ones(1, dtype=torch.int32)
         coordinator.decode_producer_stream = None
         coordinator.device = "cpu"
         coordinator.page_size = 1
@@ -764,6 +772,16 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             free_hisparse_indices=MagicMock(),
         )
 
+        coordinator._init_kvduo_prefill_rollback_state(
+            coordinator.kvduo_req_hot_capacity.shape[1]
+        )
+        coordinator.hot_visited = torch.zeros(
+            (
+                *coordinator.kvduo_req_hot_capacity.shape,
+                getattr(coordinator, "device_buffer_size", 8),
+            ),
+            dtype=torch.bool,
+        )
         coordinator.prepare_kvduo_graph_replay(torch.tensor([0, 1]))
 
         physical.alloc.assert_called_once_with(42)
@@ -778,6 +796,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.device = "cpu"
         coordinator.page_size = 1
         coordinator.hot_page_size = 1
         coordinator.device_buffer_size = 8
@@ -797,6 +816,16 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         coordinator._require_allocation_ready = MagicMock()
 
+        coordinator._init_kvduo_prefill_rollback_state(
+            coordinator.kvduo_req_hot_capacity.shape[1]
+        )
+        coordinator.hot_visited = torch.zeros(
+            (
+                *coordinator.kvduo_req_hot_capacity.shape,
+                getattr(coordinator, "device_buffer_size", 8),
+            ),
+            dtype=torch.bool,
+        )
         with self.assertRaisesRegex(RuntimeError, "whole-page HOT allocation failed"):
             coordinator._ensure_kvduo_hot_capacity_targets_batch(
                 {
@@ -842,12 +871,24 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             hisparse_attn_allocator=allocator,
             free_hisparse_indices=MagicMock(),
         )
+        coordinator._init_kvduo_prefill_rollback_state(
+            coordinator.kvduo_req_hot_capacity.shape[1]
+        )
+        coordinator.hot_visited = torch.zeros(
+            (
+                *coordinator.kvduo_req_hot_capacity.shape,
+                getattr(coordinator, "device_buffer_size", 8),
+            ),
+            dtype=torch.bool,
+        )
         return coordinator, allocator, physical
 
     def _assert_batched_hot_failure_rolled_back(self, coordinator, physical):
         coordinator.token_to_kv_pool_allocator.free_hisparse_indices.assert_called_once()
         self.assertIs(
-            coordinator.token_to_kv_pool_allocator.free_hisparse_indices.call_args.args[0],
+            coordinator.token_to_kv_pool_allocator.free_hisparse_indices.call_args.args[
+                0
+            ],
             physical,
         )
         self.assertEqual(coordinator._kvduo_req_layer_pages, {})
