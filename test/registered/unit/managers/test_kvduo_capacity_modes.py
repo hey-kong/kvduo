@@ -236,6 +236,16 @@ def _tp_modes_worker(rank, init_file):
         assert c.kvduo_req_hot_capacity[:, 0].tolist() == [8, 8]
         c.consume_kvduo_prefill_reservation(token, 2)
         c.finish_kvduo_prefill_reservation(token, cancelled=False)
+        # No applicant means no ordinary merge, even if only one TP rank
+        # locally has enough pages to cover the waiting prefill protection.
+        c._kvduo_next_prefill_pages = 5
+        p.free_pages = 6 * rank
+        reclaim = MagicMock(wraps=c.reclaim_kvduo_hot_pages)
+        c.reclaim_kvduo_hot_pages = reclaim
+        c.prepare_kvduo_graph_replay(torch.tensor([0]))
+        reclaim.assert_not_called()
+        assert c._kvduo_request_limited(0)
+        assert c.kvduo_req_hot_capacity[:, 0].tolist() == [8, 8]
         c._kvduo_next_prefill_pages = 1
         p.free_pages = 2 + rank  # Only rank1 could fund the whole request locally.
         c.kvduo_hot_growth_events[:, 0] = 1
@@ -247,6 +257,20 @@ def _tp_modes_worker(rank, init_file):
         assert not c._kvduo_request_limited(0)
         assert c.kvduo_req_hot_capacity[:, 0].tolist() == [12, 8]
         assert c._kvduo_recovery_credits == 0
+
+        from test_kvduo_hot_merge import prefill_protected_growth_coordinator
+
+        c, p = prefill_protected_growth_coordinator(free_pages=4 + 2 * rank)
+        c.tp_world_size = 2
+        c.tp_group = dist.group.WORLD
+        c.kvduo_hot_growth_events[0, 1] = 1
+        # Rank1 locally covers protection plus one growth page; the common
+        # inventory does not cover protection, so both ranks must defer.
+        c.prepare_kvduo_graph_replay(torch.tensor([0, 1, 2]))
+        c.reclaim_kvduo_hot_pages.assert_not_called()
+        p.alloc.assert_not_called()
+        assert c.kvduo_req_hot_capacity[0].tolist() == [8, 8, 32]
+        assert p.free_pages == 4 + 2 * rank
     finally:
         dist.destroy_process_group()
 

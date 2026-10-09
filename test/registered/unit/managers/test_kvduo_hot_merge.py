@@ -76,6 +76,94 @@ def assert_payloads_match_tokens(coordinator, layer, req):
     )
 
 
+def prefill_protected_growth_coordinator(*, free_pages, applicant_pages=2):
+    c, p = make_merge_coordinator({(0, 0): 2, (0, 1): applicant_pages, (0, 2): 8})
+    key = c._kvduo_request_key(0)
+    c._establish_kvduo_hot_base((0, 0), c._kvduo_req_layer_pages[0, 0])
+    c._kvduo_prefill_limited_requests.add(key)
+    c._kvduo_prefill_budget_cost[key] = 1.0
+    c.kvduo_hot_page_limit[:, 0] = 2
+    # Keep the lock pending complete-prefill conversion even when pages appear.
+    prefill_key = c._kvduo_prefill_key(SimpleNamespace(rid="prefilling"))
+    c._kvduo_prefill_associations[key] = {prefill_key}
+    c._kvduo_next_prefill_pages = 5
+    p.free_pages = free_pages
+    p.alloc.reset_mock()
+    c.reclaim_kvduo_hot_pages = MagicMock(wraps=c.reclaim_kvduo_hot_pages)
+    return c, p
+
+
+@pytest.mark.parametrize(
+    "events,free_pages,applicant_pages",
+    [(0, 0, 2), (1, 0, 2), (1, 4, 2), (0, 5, 2), (1, 0, 8)],
+)
+def test_optional_growth_never_merges_to_cover_waiting_prefill(
+    events, free_pages, applicant_pages
+):
+    c, p = prefill_protected_growth_coordinator(
+        free_pages=free_pages, applicant_pages=applicant_pages
+    )
+    banks = (
+        c.req_device_buffer_tokens,
+        c.req_device_buffer_token_locs,
+        c.lru_slots,
+        c.kvduo_req_hot_capacity,
+        c.kvduo_req_hot_capacity_gpu,
+        c.kvduo_capacity_ema,
+        c.kvduo_capacity_steps,
+        c.kvduo_prefill_ema,
+        c.kvduo_prefill_steps,
+    )
+    before = [bank.clone() for bank in banks]
+    c.kvduo_hot_growth_events[0, 1] = events
+
+    c.prepare_kvduo_graph_replay(torch.tensor([0, 1, 2]))
+
+    c.reclaim_kvduo_hot_pages.assert_not_called()
+    p.alloc.assert_not_called()
+    c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
+    assert all(torch.equal(bank, old) for bank, old in zip(banks, before))
+    assert p.free_pages == free_pages and c._kvduo_hand == 0
+    assert c._kvduo_request_limited(0)
+    assert c._kvduo_prefill_budget_cost[c._kvduo_request_key(0)] == 1.0
+    assert not c.kvduo_hot_growth_events.any()
+    # A deferred capacity event cannot be replayed when space later appears.
+    p.free_pages = 6
+    c.prepare_kvduo_graph_replay(torch.tensor([0, 1, 2]))
+    c.reclaim_kvduo_hot_pages.assert_not_called()
+    p.alloc.assert_not_called()
+    assert all(torch.equal(bank, old) for bank, old in zip(banks, before))
+
+
+@pytest.mark.parametrize(
+    "free_pages,protected_pages,merge_needed",
+    [(5, 5, True), (6, 5, False), (0, 0, True)],
+)
+def test_optional_growth_merges_only_for_real_applicants_after_prefill_is_covered(
+    free_pages, protected_pages, merge_needed
+):
+    c, p = prefill_protected_growth_coordinator(free_pages=free_pages)
+    c._kvduo_next_prefill_pages = protected_pages
+    c.kvduo_hot_growth_events[0, 1] = 1
+    applicant_lru = live_lru(c, 0, 1)
+
+    c.prepare_kvduo_graph_replay(torch.tensor([0, 1, 2]))
+
+    if merge_needed:
+        c.reclaim_kvduo_hot_pages.assert_called_once_with(2, excluded_owners={(0, 1)})
+        assert c.kvduo_req_hot_capacity[0, 2] == 8
+        assert_payloads_match_tokens(c, 0, 2)
+    else:
+        c.reclaim_kvduo_hot_pages.assert_not_called()
+        assert c.kvduo_req_hot_capacity[0, 2] == 32
+    p.alloc.assert_called_once_with(2)
+    assert c.kvduo_req_hot_capacity[0, 1] == 12
+    assert live_lru(c, 0, 1) == applicant_lru
+    assert p.free_pages == free_pages + (6 if merge_needed else 0) - 1
+    assert p.free_pages >= protected_pages
+    assert c._kvduo_request_limited(0)
+
+
 @pytest.mark.parametrize(
     "steps,misses,hits,target",
     [

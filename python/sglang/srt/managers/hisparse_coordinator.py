@@ -2123,12 +2123,21 @@ class HiSparseCoordinator:
             if events > 0 and not self._kvduo_request_limited(owner[1])
         }
         applicants = {owner: pages for owner, pages in applicants.items() if pages > 0}
-        if not self._kvduo_consensus(tuple(sorted(applicants.items()))):
+        if not self._kvduo_consensus(
+            (reserved_pages, tuple(sorted(applicants.items())))
+        ):
+            return
+        if not applicants:
             return
         common_free = self._kvduo_common_available(
             allocator.available_size() // self.page_size
         )
-        shortfall = sum(applicants.values()) + reserved_pages - common_free
+        # Protection only limits optional allocation. Its own shortfall belongs
+        # to prefill admission, which evaluates whole-request rollback and the
+        # frozen miss budget before releasing active HOT pages.
+        if common_free < reserved_pages:
+            return
+        shortfall = sum(applicants.values()) - (common_free - reserved_pages)
         if shortfall > 0:
             self.reclaim_kvduo_hot_pages(
                 shortfall * self.page_size, excluded_owners=set(applicants)
