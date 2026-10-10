@@ -21,9 +21,9 @@ struct FullTouchMax {
   }
 };
 
-template <int BLOCK_SIZE>
+template <int BLOCK_SIZE, typename LogicalT>
 __global__ void kvduo_full_page_summary_kernel(
-    const int64_t* logical_pages,
+    const LogicalT* logical_pages,
     const int64_t* mapping,
     const int64_t* data_versions,
     const int64_t* host_versions,
@@ -184,7 +184,7 @@ void kvduo_full_page_select(
       charge_minimum);
 }
 
-template <int BLOCK_SIZE>
+template <int BLOCK_SIZE, typename LogicalT>
 void kvduo_full_page_summary(
     tvm::ffi::TensorView logical_pages,
     tvm::ffi::TensorView mapping,
@@ -201,11 +201,8 @@ void kvduo_full_page_summary(
   auto logical_size = SymbolicSize{"logical_size"};
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA, kDLROCM>();
-  TensorMatcher({pages, page_size})
-      .with_dtype<int64_t>()
-      .with_device(device)
-      .verify(logical_pages)
-      .verify(physical_pages);
+  TensorMatcher({pages, page_size}).with_dtype<LogicalT>().with_device(device).verify(logical_pages);
+  TensorMatcher({pages, page_size}).with_dtype<int64_t>().with_device(device).verify(physical_pages);
   TensorMatcher({logical_size})
       .with_dtype<int64_t>()
       .with_device(device)
@@ -221,8 +218,8 @@ void kvduo_full_page_summary(
   RuntimeCheck(page_size.unwrap() > 0 && logical_size.unwrap() > 0, "Invalid FULL page geometry");
   if (pages.unwrap() == 0) return;
   LaunchKernel(pages.unwrap(), BLOCK_SIZE, device.unwrap())(
-      kvduo_full_page_summary_kernel<BLOCK_SIZE>,
-      static_cast<const int64_t*>(logical_pages.data_ptr()),
+      kvduo_full_page_summary_kernel<BLOCK_SIZE, LogicalT>,
+      static_cast<const LogicalT*>(logical_pages.data_ptr()),
       static_cast<const int64_t*>(mapping.data_ptr()),
       static_cast<const int64_t*>(data_versions.data_ptr()),
       static_cast<const int64_t*>(host_versions.data_ptr()),

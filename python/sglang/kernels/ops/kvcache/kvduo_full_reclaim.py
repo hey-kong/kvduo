@@ -14,7 +14,8 @@ def _jit_full_reclaim_module():
         "kvduo_full_reclaim",
         cuda_files=["kvduo_full_reclaim.cuh"],
         cuda_wrappers=[
-            ("summarize", "kvduo_full_page_summary<128>"),
+            ("summarize_i32", "kvduo_full_page_summary<128, int32_t>"),
+            ("summarize_i64", "kvduo_full_page_summary<128, int64_t>"),
             ("select", "kvduo_full_page_select<128>"),
         ],
     )
@@ -34,25 +35,43 @@ def summarize_kvduo_full_pages(
     banks = (mapping, data_versions, host_versions, touches)
     if any(bank.ndim != 1 or bank.shape != mapping.shape for bank in banks):
         raise ValueError("FULL metadata banks must share the logical address space")
-    if mapping.numel() == 0 or any(
-        bank.device != logical_pages.device
-        or bank.dtype != torch.int64
-        or not bank.is_contiguous()
-        for bank in (logical_pages, *banks)
+    if (
+        logical_pages.dtype not in (torch.int32, torch.int64)
+        or not logical_pages.is_contiguous()
+        or mapping.numel() == 0
+        or any(
+            bank.device != logical_pages.device
+            or bank.dtype != torch.int64
+            or not bank.is_contiguous()
+            for bank in banks
+        )
     ):
-        raise ValueError("FULL metadata must be contiguous int64 on one device")
+        raise ValueError(
+            "FULL tables must be contiguous int64 with int32/int64 page indices on one device"
+        )
     protected_pages = None
     if protected is not None:
-        if protected.device != logical_pages.device or protected.dtype != torch.int64:
+        if protected.device != logical_pages.device or protected.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
             raise ValueError("FULL protection must use the logical address space")
         protected_pages = torch.isin(logical_pages, protected).any(dim=1).int()
-    physical = torch.empty_like(logical_pages)
+    physical = torch.empty(
+        logical_pages.shape, dtype=torch.int64, device=mapping.device
+    )
     scores = torch.empty(
         logical_pages.size(0), dtype=torch.int64, device=mapping.device
     )
     valid = torch.empty_like(scores, dtype=torch.int32)
     if logical_pages.is_cuda:
-        _jit_full_reclaim_module().summarize(
+        module = _jit_full_reclaim_module()
+        summarize = (
+            module.summarize_i32
+            if logical_pages.dtype == torch.int32
+            else module.summarize_i64
+        )
+        summarize(
             logical_pages,
             mapping,
             data_versions,

@@ -20,8 +20,11 @@ from test_kvduo_pressure_admission import make_full_coordinator
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def test_full_summary_rejects_partial_mapping_stale_version_and_partial_protection():
-    pages = torch.arange(12).view(6, 2)
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_full_summary_rejects_partial_mapping_stale_version_and_partial_protection(
+    index_dtype,
+):
+    pages = torch.arange(12, dtype=index_dtype).view(6, 2)
     mapping = torch.arange(12) + 10
     mapping[3] = 0
     versions = torch.ones(12, dtype=torch.int64)
@@ -30,7 +33,7 @@ def test_full_summary_rejects_partial_mapping_stale_version_and_partial_protecti
     touches = torch.tensor([2, 8, 7, 1, 3, 6, 4, 9, 5, 0, 11, 10])
     originals = [bank.clone() for bank in (pages, mapping, versions, host, touches)]
     physical, scores, valid = summarize_kvduo_full_pages(
-        pages, mapping, versions, host, touches, torch.tensor([7])
+        pages, mapping, versions, host, touches, torch.tensor([7], dtype=index_dtype)
     )
     assert physical.tolist() == mapping[pages].tolist()
     assert scores.tolist() == [8, 7, 6, 9, 5, 11]
@@ -41,8 +44,11 @@ def test_full_summary_rejects_partial_mapping_stale_version_and_partial_protecti
     )
 
 
-def test_full_summary_rejects_invalid_logical_addresses_without_indexing_them():
-    pages = torch.tensor([[-1, 0], [2, 3], [99, -2]])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_full_summary_rejects_invalid_logical_addresses_without_indexing_them(
+    index_dtype,
+):
+    pages = torch.tensor([[-1, 0], [2, 3], [99, -2]], dtype=index_dtype)
     mapping = torch.arange(4) + 10
     versions = torch.ones(4, dtype=torch.int64)
     _, scores, valid = summarize_kvduo_full_pages(
@@ -120,7 +126,9 @@ def test_full_reclaim_keeps_request_page_ties_protection_and_publication_before_
     req1 = SimpleNamespace(**vars(req0))
     req1.req_pool_idx = 1
     req0.cache_protected_len = 1
-    c.req_to_token_pool.req_to_token = torch.arange(2 * count).view(2, -1)
+    c.req_to_token_pool.req_to_token = torch.arange(2 * count, dtype=torch.int32).view(
+        2, -1
+    )
     mapping = torch.arange(2 * count) + 2
     c.mem_pool_device.full_to_hisparse_device_index_mapping = mapping
     c.full_data_version = torch.ones(2 * count, dtype=torch.int64)
@@ -130,7 +138,7 @@ def test_full_reclaim_keeps_request_page_ties_protection_and_publication_before_
     c._kvduo_host_valid_len = [count, count - 6]
     c._mixed_slots = [False, False]
     c._active_kvduo_reqs = {1: req1, 0: req0}
-    c._kvduo_pressure_protected = torch.tensor([3])
+    c._kvduo_pressure_protected = torch.tensor([3], dtype=torch.int32)
     c.full_host_version[count + 1] = 0
     c._kvduo_consensus = MagicMock(return_value=True)
     released = list(range(4, 12)) + list(range(count + 2, count + 10))
@@ -166,6 +174,20 @@ def test_full_plan_tp_rejection_leaves_all_residency_untouched():
     )
     c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
     assert not c._mixed_slots[0]
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_full_reclaim_accepts_real_int32_request_table_for_generic_and_c4(ratio):
+    c, _, _ = make_full_coordinator(ratio=ratio)
+    c.req_to_token_pool.req_to_token = c.req_to_token_pool.req_to_token.int()
+    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
+    original = mapping.clone()
+    assert c.reclaim_kvduo_full_pages(4) == 4
+    assert torch.all(mapping[:4] == 0)
+    assert torch.equal(mapping[4:], original[4:])
+    indices = c.token_to_kv_pool_allocator.free_hisparse_indices.call_args.args[0]
+    assert indices.dtype == torch.int64
+    assert torch.equal(indices, original[:4])
 
 
 def prefix_coordinator():

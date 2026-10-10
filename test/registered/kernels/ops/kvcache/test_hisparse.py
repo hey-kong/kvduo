@@ -1476,23 +1476,24 @@ def test_full_reclaim_gpu_selection_scans_multiple_tiles_and_charges_interleaved
 
 @pytest.mark.parametrize("page_size", [1, 64, 129])
 @pytest.mark.parametrize("release_all", [False, True])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 def test_full_reclaim_gpu_summary_and_selection_match_cpu_with_multiple_requests(
-    page_size, release_all
+    page_size, release_all, index_dtype
 ):
     from sglang.kernels.ops.kvcache.kvduo_full_reclaim import (
         select_kvduo_full_pages,
         summarize_kvduo_full_pages,
     )
 
-    pages = torch.arange(12 * page_size).view(12, page_size)
-    mapping = pages.flatten().clone() + 10
+    pages = torch.arange(12 * page_size, dtype=index_dtype).view(12, page_size)
+    mapping = pages.flatten().long() + 10
     versions = torch.ones_like(mapping)
     host_versions = versions.clone()
     mapping[page_size] = 0
     host_versions[3 * page_size] = 0
     touches = torch.arange(page_size).repeat(12)
     touches[5 * page_size : 6 * page_size] = torch.iinfo(torch.int64).max
-    protected = torch.tensor([9 * page_size])
+    protected = torch.tensor([9 * page_size], dtype=index_dtype)
     cpu = summarize_kvduo_full_pages(
         pages, mapping, versions, host_versions, touches, protected
     )
