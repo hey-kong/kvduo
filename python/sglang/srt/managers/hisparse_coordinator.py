@@ -1474,11 +1474,9 @@ class HiSparseCoordinator:
             # Staging materializes the complete prefill range. Appending to an
             # incomplete final page will lower this boundary to its page start.
             self._kvduo_host_valid_len[req.req_pool_idx] = compressed_len
-            # Until the first demotion, decode can extend the complete prefix.
-            # An initial prefill-length cap would discard those complete pages
-            # at finish. Clear a previous incarnation's first-hole marker.
-            if hasattr(req, "kvduo_radix_insert_len"):
-                del req.kvduo_radix_insert_len
+            req.kvduo_radix_insert_len = (
+                compressed_len // self.page_size * self.page_size * self.compress_ratio
+            )
 
             # A fully-resident KVDuo request does not own a speculative hot
             # buffer. The first FULL demotion schedules the whole-page minimum
@@ -3757,8 +3755,8 @@ class HiSparseCoordinator:
             allocated_locs
         )
         is_mixed = self.enable_mixed_residency and self._mixed_slots[req.req_pool_idx]
-        if is_mixed:
-            req.kvduo_mixed_residency = True
+        if self.enable_mixed_residency:
+            req.kvduo_mixed_residency = is_mixed
             # RadixCache cannot represent host-only holes. Free every surviving
             # request-owned fragment beyond kvduo_radix_insert_len; the cache
             # implementations retain only the already-contiguous full prefix.
@@ -3787,14 +3785,6 @@ class HiSparseCoordinator:
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 compressed_locs
             ] = 0
-        elif self.req_reserved_logical[req.req_pool_idx] >= 0:
-            # A decode append slot is transient, not a sealed full page. Keep
-            # the prefill full mappings for Radix insertion, but invalidate the
-            # final append owner before its private buffer is returned.
-            self.mem_pool_device.full_to_hisparse_device_index_mapping[
-                self.req_reserved_logical[req.req_pool_idx]
-            ] = 0
-
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
             req.req_pool_idx,

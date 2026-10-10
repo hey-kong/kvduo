@@ -299,7 +299,7 @@ def test_prefill_does_not_demote_full_when_new_hot_minimum_consumes_all_gain():
     assert physical.free_pages == 0
     assert not coordinator._mixed_slots[0]
     assert not coordinator._kvduo_pending_hot_minimum
-    assert not hasattr(req, "kvduo_radix_insert_len")
+    assert req.kvduo_radix_insert_len == 4
     coordinator.reclaim_kvduo_hot_pages.assert_not_called()
 
 
@@ -319,19 +319,19 @@ def test_prefill_full_reclaim_preserves_incoming_prefix_and_earlier_reservations
 
 @pytest.mark.parametrize("ratio", [1, 4])
 @pytest.mark.parametrize("protected_pages", [0, 1])
-def test_finish_retains_decode_extended_complete_prefix_until_first_real_hole(
+def test_finish_retains_only_prefill_prefix_even_when_decode_prefix_is_resident(
     ratio, protected_pages
 ):
     coordinator, physical, req = make_full_coordinator(ratio=ratio)
     req.cache_protected_len = protected_pages * 2 * ratio
     coordinator.full_last_touch[8:10] = 0
     assert coordinator.reclaim_kvduo_full_pages(2) == 2
-    assert req.kvduo_radix_insert_len == 8 * ratio
+    assert req.kvduo_radix_insert_len == 4 * ratio
     coordinator.request_finished(req)
     mapping = coordinator.mem_pool_device.full_to_hisparse_device_index_mapping
-    assert torch.all(mapping[:8] > 0)
-    assert torch.all(mapping[8:] == 0)
-    assert physical.free_pages == 4  # hole and three request-private tail pages
+    assert torch.all(mapping[:4] > 0)
+    assert torch.all(mapping[4:] == 0)
+    assert physical.free_pages == 6
     assert not coordinator._active_kvduo_reqs
 
     cache = RadixCache.__new__(RadixCache)
@@ -342,13 +342,11 @@ def test_finish_retains_decode_extended_complete_prefix_until_first_real_hole(
     cache.insert = MagicMock(return_value=InsertResult(prefix_len=0))
     cache.cache_finished_req(req, kv_len_to_handle=16 * ratio)
     params = cache.insert.call_args.args[0]
-    assert len(params.key) == len(params.value) == 8 * ratio
+    assert len(params.key) == len(params.value) == 4 * ratio
 
 
-@pytest.mark.parametrize("committed,expected", [(15, 14), (16, 16)])
-def test_fully_resident_finish_caches_decode_pages_without_an_initial_prefill_cap(
-    committed, expected
-):
+@pytest.mark.parametrize("committed,expected", [(15, 4), (16, 4)])
+def test_fully_resident_finish_caches_only_prefill_pages(committed, expected):
     coordinator, _, req = make_full_coordinator()
     coordinator.request_finished(req)
     cache = RadixCache.__new__(RadixCache)
