@@ -2026,6 +2026,9 @@ class HiSparseCoordinator:
             for layer_id, req_idx in torch.nonzero(events_cpu > 0).tolist()
             if req_idx in self._active_kvduo_reqs and self._mixed_slots[req_idx]
         }
+        event_capacities = {
+            owner: int(self.kvduo_req_hot_capacity[owner]) for owner in growth_events
+        }
         if (
             not pending_minimum
             and not growth_events
@@ -2107,9 +2110,15 @@ class HiSparseCoordinator:
         if getattr(self, "_kvduo_pending_hot_minimum", None) is not None:
             self._kvduo_pending_hot_minimum.difference_update(requested)
 
-        # Optional growth can reclaim Hand-eligible HOT owners, never FULL pages.
-        # Exclude every applicant for this boundary, including applicants that
-        # cannot all fit. Released surplus pages stay in the common free pool.
+        # Mandatory allocations may already have shrunk an applicant after its
+        # event was consumed. Cancel that event at this boundary as well.
+        growth_events = {
+            owner: events
+            for owner, events in growth_events.items()
+            if int(self.kvduo_req_hot_capacity[owner]) >= event_capacities[owner]
+        }
+        # Optional growth can reclaim any Hand-eligible HOT owner, including
+        # applicants, never FULL pages. Released surplus stays in the free pool.
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         self._recover_kvduo_requests(growth_events)
         reserved_pages = self._kvduo_optional_protected_pages()
@@ -2139,9 +2148,12 @@ class HiSparseCoordinator:
             return
         shortfall = sum(applicants.values()) - (common_free - reserved_pages)
         if shortfall > 0:
-            self.reclaim_kvduo_hot_pages(
-                shortfall * self.page_size, excluded_owners=set(applicants)
-            )
+            self.reclaim_kvduo_hot_pages(shortfall * self.page_size)
+            applicants = {
+                owner: pages
+                for owner, pages in applicants.items()
+                if int(self.kvduo_req_hot_capacity[owner]) >= event_capacities[owner]
+            }
         free_pages = max(
             0,
             self._kvduo_common_available(allocator.available_size() // self.page_size)
@@ -2339,6 +2351,10 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[layer_id, req_idx].copy_(new_locs)
         self.lru_slots[layer_id, req_idx].copy_(new_lru)
         self.kvduo_req_hot_capacity_gpu[owner] = new_capacity
+        # A Hand scan can precede replay's event consumption (e.g. mandatory
+        # decode allocation). Shrinking consumes any pending event as well as
+        # the host-side event filtered by prepare_kvduo_graph_replay.
+        self.kvduo_hot_growth_events[owner] = 0
         if finished is not None:
             finished.record(device_module.current_stream(self.device))
             finished.synchronize()
@@ -2352,14 +2368,11 @@ class HiSparseCoordinator:
             self.token_to_kv_pool_allocator.free_hisparse_indices(released)
         return len(released_starts) * self.page_size
 
-    def reclaim_kvduo_hot_pages(
-        self, num_tokens: int, *, excluded_owners: set[tuple[int, int]] | None = None
-    ) -> int:
+    def reclaim_kvduo_hot_pages(self, num_tokens: int) -> int:
         """Scan request-major Hand order, including zero-release and repeated merges."""
         if not self.enable_mixed_residency or num_tokens <= 0:
             return 0
         self._wait_kvduo_hot_merge_boundary()
-        excluded = set(excluded_owners or ())
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         target = allocator.available_size() + num_tokens
         layers = self.mem_pool_device.layer_num
@@ -2372,7 +2385,7 @@ class HiSparseCoordinator:
         for offset in range(objects):
             req, layer = divmod((self._kvduo_hand + offset) % objects, layers)
             owner = (layer, req)
-            if owner in excluded or not self._kvduo_can_merge(owner):
+            if not self._kvduo_can_merge(owner):
                 continue
             values = counts[layer][req]
             pages = len(self._kvduo_req_layer_pages[owner])
@@ -2513,7 +2526,14 @@ class HiSparseCoordinator:
             self._kvduo_hot_processed[owner] = self._kvduo_hand_sequence
 
     def _observe_kvduo_hot_growth(self, owner, old_capacity, new_capacity) -> None:
-        self._reset_kvduo_capacity_stats(owner)
+        if old_capacity == 0:
+            self._reset_kvduo_capacity_stats(owner)
+        else:
+            # Empty slots are prepended at the LRU end. Existing MRU ranks and
+            # segments stay unchanged; miss EMA and maturity remain a prior.
+            first_new_segment = old_capacity // self.hot_page_size
+            end_segment = new_capacity // self.hot_page_size
+            self.kvduo_capacity_ema[owner][first_new_segment:end_segment] = 0
         base = self._kvduo_hot_base_pages.get(owner)
         if (
             base

@@ -2,7 +2,7 @@
 
 import itertools
 import random
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -150,7 +150,10 @@ def test_optional_growth_merges_only_for_real_applicants_after_prefill_is_covere
     c.prepare_kvduo_graph_replay(torch.tensor([0, 1, 2]))
 
     if merge_needed:
-        c.reclaim_kvduo_hot_pages.assert_called_once_with(2, excluded_owners={(0, 1)})
+        c.reclaim_kvduo_hot_pages.assert_called_once_with(2)
+        # Scanning without shrinking the applicant preserves its event.
+        assert (0, 1) in c._kvduo_hot_processed
+        assert len(c._kvduo_hot_base_pages[0, 1]) == 2
         assert c.kvduo_req_hot_capacity[0, 2] == 8
         assert_payloads_match_tokens(c, 0, 2)
     else:
@@ -254,15 +257,84 @@ def test_hand_resumes_request_major_and_never_erases_cost_to_force_progress():
     assert c._kvduo_hand == 2 and c._kvduo_hot_processed[(1, 0)] == 2
 
 
-def test_scan_skips_generation_staging_protection_applicants_and_fixed_mode():
+def test_scan_skips_generation_staging_protection_and_fixed_mode():
     c, p = make_merge_coordinator({(0, req): 3 for req in range(5)})
+    c._kvduo_request_generation[0] += 1
     c._kvduo_hot_pressure_protected.add((0, 1, 0))
     c._active_kvduo_reqs[2] = SimpleNamespace(hisparse_staging=True)
     c._kvduo_prefill_limited_requests.add(c._kvduo_request_key(3))
-    assert c.reclaim_kvduo_hot_pages(2, excluded_owners={(0, 0)}) == 2
+    assert c.reclaim_kvduo_hot_pages(2) == 2
     assert c._kvduo_hot_processed == {(0, 4): 1}
     c._kvduo_request_generation[4] += 1
-    assert c.reclaim_kvduo_hot_pages(2, excluded_owners={(0, 0)}) == 0
+    assert c.reclaim_kvduo_hot_pages(2) == 0
+
+
+def test_applicant_can_shrink_without_growing_back_at_same_boundary():
+    c, p = make_merge_coordinator({(0, 0): 7, (0, 1): 2})
+    c.kvduo_hot_growth_events[0, 0] = 1
+    p.alloc.reset_mock()
+    c.prepare_kvduo_graph_replay(torch.tensor([0, 1]))
+    assert c.kvduo_req_hot_capacity[0].tolist() == [8, 8]
+    assert p.free_pages == 5
+    p.alloc.assert_not_called()
+    assert not c.kvduo_hot_growth_events.any()
+    assert not c.kvduo_capacity_ema[0, 0].any()
+    assert c.kvduo_capacity_steps[0, 0] == 0
+    assert_payloads_match_tokens(c, 0, 0)
+    c.prepare_kvduo_graph_replay(torch.tensor([0, 1]))
+    p.alloc.assert_not_called()
+
+
+def test_only_shrunk_applicants_lose_their_events():
+    c, p = make_merge_coordinator({(0, 0): 7, (0, 1): 2})
+    c.kvduo_hot_growth_events[0] = 1
+    p.alloc.reset_mock()
+    c.prepare_kvduo_graph_replay(torch.tensor([0, 1]))
+    assert c.kvduo_req_hot_capacity[0].tolist() == [8, 12]
+    assert p.free_pages == 4
+    p.alloc.assert_called_once_with(2)
+    assert c.kvduo_capacity_steps[0].tolist() == [0, 65]
+    assert c.kvduo_capacity_ema[0, 1].tolist() == [100, 100, 0, 0, 0, 0, 0, 0, 0]
+
+
+@pytest.mark.parametrize("consume_before_merge", [False, True])
+def test_mandatory_merge_consumes_event_before_or_after_replay_reads_it(
+    consume_before_merge,
+):
+    c, p = make_merge_coordinator({(0, 0): 7, (0, 1): 0})
+    c.item_size_bytes = 1
+    c._kvduo_pending_hot_minimum.add(1)
+    c._reclaim_for_physical_allocation = MethodType(
+        type(c)._reclaim_for_physical_allocation, c
+    )
+    c._require_allocation_ready = type(c)._require_allocation_ready
+    c.kvduo_hot_growth_events[0, 0] = 1
+    p.alloc.reset_mock()
+    if not consume_before_merge:
+        # A scheduler allocation can scan Hand before replay reads GPU events.
+        c._ensure_kvduo_hot_capacity_targets_batch({(0, 1): 4})
+        assert not c.kvduo_hot_growth_events.any()
+    c.prepare_kvduo_graph_replay(torch.tensor([0, 1]))
+    assert c.kvduo_req_hot_capacity[0].tolist() == [8, 4]
+    assert p.free_pages == 4
+    p.alloc.assert_called_once_with(2)
+    c.reclaim_kvduo_full_pages.assert_called_once()
+    assert not c.kvduo_hot_growth_events.any()
+
+
+def test_mature_grown_object_can_immediately_reclaim_its_new_tail():
+    c, p = make_merge_coordinator({(0, 0): 2})
+    p.free_pages = 1
+    old_lru = live_lru(c, 0, 0)
+    c.kvduo_hot_growth_events[0, 0] = 1
+    c.prepare_kvduo_graph_replay(torch.tensor([0]))
+    assert c.kvduo_req_hot_capacity.item() == 12
+    assert c.kvduo_capacity_steps.item() == 65
+    assert c.reclaim_kvduo_hot_pages(2) == 2
+    assert c.kvduo_req_hot_capacity.item() == 8
+    assert live_lru(c, 0, 0) == old_lru
+    assert not c.kvduo_capacity_ema.any() and not c.kvduo_capacity_steps.any()
+    assert_payloads_match_tokens(c, 0, 0)
 
 
 def test_copy_failure_does_not_publish_or_free():
