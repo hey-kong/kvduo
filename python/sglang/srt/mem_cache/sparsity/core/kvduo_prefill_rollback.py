@@ -64,12 +64,8 @@ def plan_kvduo_prefill_rollback(
     policy: KVDuoPrefillPolicy,
     reference_misses: Mapping[tuple[int, int], float] | None = None,
     reserved_cost: float = 0,
-) -> tuple[int, ...] | None:
-    """Select whole requests by most recent Hand merge, with a fixed round budget.
-
-    All established HOT layers must have safe bases. Only expanded layers add
-    observations, miss budget, or rollback cost; a base-only layer can be young.
-    """
+) -> tuple[tuple[int, int], ...] | None:
+    """Select HOT objects by most recent Hand processing and a fixed round budget."""
     if required_pages <= 0:
         return ()
     if reference_misses is None:
@@ -82,41 +78,30 @@ def plan_kvduo_prefill_rollback(
         return None
     rho = policy.max_relative_miss_increase
     budget = rho * sum(reference_misses.values())
-    requests = {}
-    for obj in objects:
-        requests.setdefault(obj.owner[1], []).append(obj)
-    candidates = []
-    for req, layers in requests.items():
-        if any(
-            not obj.eligible or not 0 < obj.base_pages <= obj.current_pages <= 8
-            for obj in layers
-        ):
-            continue
-        expanded = [obj for obj in layers if obj.current_pages > obj.base_pages]
-        if not expanded or any(
-            not obj.mature
-            or obj.owner not in reference_misses
-            or obj.extra_hits > rho * obj.misses
-            for obj in expanded
-        ):
-            continue
-        extra = sum(obj.extra_hits for obj in expanded)
-        sequence = max(obj.processed for obj in layers)
-        if sequence <= 0:
-            continue
-        freed = sum(obj.current_pages - obj.base_pages for obj in expanded)
-        candidates.append((sequence, req, freed, extra))
+    candidates = sorted(
+        objects,
+        key=lambda obj: (-obj.processed, obj.owner[1], obj.owner[0]),
+    )
     selected = []
+    seen = set()
     freed_pages = 0
     cost = reserved_cost
-    for _, req, freed, extra in sorted(candidates, key=lambda item: -item[0]):
-        # A request that exceeds the remaining cumulative budget is not
-        # eligible for this plan. Continue checking older requests safely.
-        if cost + extra > budget:
+    for obj in candidates:
+        if obj.owner in seen:
             continue
-        selected.append(req)
-        freed_pages += freed
-        cost += extra
+        seen.add(obj.owner)
+        if (
+            not obj.eligible
+            or not obj.mature
+            or obj.processed <= 0
+            or obj.owner not in reference_misses
+            or obj.extra_hits > rho * obj.misses
+            or cost + obj.extra_hits > budget
+        ):
+            continue
+        selected.append(obj.owner)
+        freed_pages += obj.current_pages - obj.base_pages
+        cost += obj.extra_hits
         if freed_pages >= required_pages:
             return tuple(selected)
     return None

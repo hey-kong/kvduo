@@ -78,9 +78,9 @@ def assert_payloads_match_tokens(coordinator, layer, req):
 
 def prefill_protected_growth_coordinator(*, free_pages, applicant_pages=2):
     c, p = make_merge_coordinator({(0, 0): 2, (0, 1): applicant_pages, (0, 2): 8})
-    key = c._kvduo_request_key(0)
+    key = c._kvduo_owner_key((0, 0))
     c._establish_kvduo_hot_base((0, 0), c._kvduo_req_layer_pages[0, 0])
-    c._kvduo_prefill_limited_requests.add(key)
+    c._kvduo_prefill_limited_objects.add(key)
     c._kvduo_prefill_budget_cost[key] = 1.0
     c.kvduo_hot_page_limit[:, 0] = 2
     # Keep the lock pending complete-prefill conversion even when pages appear.
@@ -124,8 +124,8 @@ def test_optional_growth_never_merges_to_cover_waiting_prefill(
     c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
     assert all(torch.equal(bank, old) for bank, old in zip(banks, before))
     assert p.free_pages == free_pages and c._kvduo_hand == 0
-    assert c._kvduo_request_limited(0)
-    assert c._kvduo_prefill_budget_cost[c._kvduo_request_key(0)] == 1.0
+    assert c._kvduo_object_limited((0, 0))
+    assert c._kvduo_prefill_budget_cost[c._kvduo_owner_key((0, 0))] == 1.0
     assert not c.kvduo_hot_growth_events.any()
     # A deferred capacity event cannot be replayed when space later appears.
     p.free_pages = 6
@@ -164,7 +164,7 @@ def test_optional_growth_merges_only_for_real_applicants_after_prefill_is_covere
     assert live_lru(c, 0, 1) == applicant_lru
     assert p.free_pages == free_pages + (6 if merge_needed else 0) - 1
     assert p.free_pages >= protected_pages
-    assert c._kvduo_request_limited(0)
+    assert c._kvduo_object_limited((0, 0))
 
 
 @pytest.mark.parametrize(
@@ -262,7 +262,7 @@ def test_scan_skips_generation_staging_protection_and_fixed_mode():
     c._kvduo_request_generation[0] += 1
     c._kvduo_hot_pressure_protected.add((0, 1, 0))
     c._active_kvduo_reqs[2] = SimpleNamespace(hisparse_staging=True)
-    c._kvduo_prefill_limited_requests.add(c._kvduo_request_key(3))
+    c._kvduo_prefill_limited_objects.add(c._kvduo_owner_key((0, 3)))
     assert c.reclaim_kvduo_hot_pages(2) == 2
     assert c._kvduo_hot_processed == {(0, 4): 1}
     c._kvduo_request_generation[4] += 1

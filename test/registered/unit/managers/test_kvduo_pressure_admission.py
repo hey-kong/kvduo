@@ -152,7 +152,7 @@ def test_prefill_evicts_radix_before_rejecting_an_immature_hot_rollback(path):
     adder.tree_cache.evict.assert_called_once()
     coordinator.reclaim_kvduo_full_pages.assert_not_called()
     assert physical.free_pages == coordinator._kvduo_reserved_prefill_pages() == 2
-    assert not coordinator._kvduo_prefill_limited_requests
+    assert not coordinator._kvduo_prefill_limited_objects
     assert int(coordinator.kvduo_req_hot_capacity[0, 0]) == 28
 
 
