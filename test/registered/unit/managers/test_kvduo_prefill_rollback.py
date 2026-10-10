@@ -59,16 +59,59 @@ def test_requests_use_recent_hand_order_not_loss_or_remaining_deficit():
     )
 
 
-def test_request_aggregates_same_expanded_layers_and_allows_layer_budget_sharing():
+def test_request_cannot_share_budget_between_expanded_layers():
     layers = [
-        obj(layer=0, counts=(8, 10)),
-        obj(layer=1, counts=(0, 90)),
+        obj(layer=0, counts=(7, 60)),
+        obj(layer=1, counts=(2, 40)),
         obj(layer=2, base_pages=2, current_pages=2, counts=(999, 9999), steps=0),
     ]
-    assert plan_kvduo_prefill_rollback(layers, 4, KVDuoPrefillPolicy()) == (0,)
-    # Base-only misses cannot hide excessive extra-page contribution.
-    layers[1] = replace(layers[1], counts=(0, 10))
+    assert sum(layer.extra_hits for layer in layers[:2]) <= 0.1 * sum(
+        layer.misses for layer in layers[:2]
+    )
     assert plan_kvduo_prefill_rollback(layers, 1, KVDuoPrefillPolicy()) is None
+    layers[0] = replace(layers[0], counts=(6, 60))
+    assert plan_kvduo_prefill_rollback(layers, 4, KVDuoPrefillPolicy()) == (0,)
+
+
+@pytest.mark.parametrize("extra", [0, 1e-12])
+def test_expanded_layer_with_zero_misses_requires_zero_extra_hits(extra):
+    layers = [obj(layer=0, counts=(extra, 0)), obj(layer=1, counts=(1, 1000))]
+    expected = (0,) if extra == 0 else None
+    assert plan_kvduo_prefill_rollback(layers, 1, KVDuoPrefillPolicy()) == expected
+
+
+def test_failed_recent_request_is_skipped_without_partial_layer_rollback():
+    objects = [
+        obj(0, layer=0, counts=(7, 60), processed=9),
+        obj(0, layer=1, counts=(2, 40), processed=8),
+        obj(1, layer=0, counts=(1, 20), processed=1),
+    ]
+    assert plan_kvduo_prefill_rollback(objects, 1, KVDuoPrefillPolicy()) == (1,)
+    assert plan_kvduo_prefill_rollback(objects, 3, KVDuoPrefillPolicy()) is None
+
+
+def test_individual_layer_budgets_do_not_override_fixed_cumulative_budget():
+    layers = [obj(layer=0, counts=(6, 60)), obj(layer=1, counts=(4, 40))]
+    references = {(0, 0): 60, (1, 0): 40}
+    assert plan_kvduo_prefill_rollback(layers, 1, KVDuoPrefillPolicy(), references) == (
+        0,
+    )
+    assert (
+        plan_kvduo_prefill_rollback(layers, 1, KVDuoPrefillPolicy(), references, 1)
+        is None
+    )
+
+
+@pytest.mark.parametrize("rho", [0, 0.1, 0.25])
+def test_each_expanded_layer_uses_configured_relative_miss_budget(rho):
+    layers = [
+        obj(layer=0, counts=(rho * 20, 20)),
+        obj(layer=1, counts=(0, 1000)),
+    ]
+    policy = KVDuoPrefillPolicy(rho)
+    assert plan_kvduo_prefill_rollback(layers, 1, policy) == (0,)
+    layers[0] = replace(layers[0], counts=(rho * 20 + 0.001, 20))
+    assert plan_kvduo_prefill_rollback(layers, 1, policy) is None
 
 
 @pytest.mark.parametrize(
@@ -626,7 +669,7 @@ def test_whole_request_releases_all_extra_pages_and_limits_base_only_and_later_h
     c, p = merged_and_expanded(
         {(0, 0): 4, (1, 0): 4, (2, 0): 2}, {(0, 0): 4, (1, 0): 3}, layers=4
     )
-    c.kvduo_prefill_ema[0, 0] = torch.tensor([8, 10])
+    c.kvduo_prefill_ema[0, 0] = torch.tensor([1, 10])
     c.kvduo_prefill_ema[1, 0] = torch.tensor([0, 90])
     c.lru_slots[0, 0, :16] = torch.tensor(
         [9, 3, 10, 7, 0, 11, 6, 12, 2, 8, 1, 13, 5, 14, 4, 15], dtype=torch.int16
@@ -641,7 +684,7 @@ def test_whole_request_releases_all_extra_pages_and_limits_base_only_and_later_h
     assert torch.equal(c.req_device_buffer_tokens[:3, 0, :8], before[:3, 0, :8])
     assert c._kvduo_request_limited(0) and not c._kvduo_can_merge((2, 0))
     move.assert_not_called()
-    assert c._kvduo_prefill_budget_cost[c._kvduo_request_key(0)] == 8
+    assert c._kvduo_prefill_budget_cost[c._kvduo_request_key(0)] == 1
     assert not c._kvduo_prefill_budget_reference
     # No established HOT cache in layer3: its later mandatory allocation is
     # allowed, but never above the minimum, and inherits the request limit.
@@ -661,7 +704,17 @@ def test_whole_request_releases_all_extra_pages_and_limits_base_only_and_later_h
 
 
 @pytest.mark.parametrize(
-    "unsafe", ["immature", "no_base", "protected", "staging", "generation"]
+    "unsafe",
+    [
+        "immature",
+        "no_base",
+        "protected",
+        "staging",
+        "generation",
+        "layer_budget",
+        "late_layer_budget",
+        "zero_miss",
+    ],
 )
 def test_whole_request_safety_failure_never_partially_releases_other_layers(unsafe):
     c, p = merged_and_expanded({(0, 0): 4, (1, 0): 4}, {(0, 0): 3, (1, 0): 3}, layers=2)
@@ -675,12 +728,61 @@ def test_whole_request_safety_failure_never_partially_releases_other_layers(unsa
         c._active_kvduo_reqs[0] = SimpleNamespace(hisparse_staging=True)
     if unsafe == "generation":
         c._kvduo_hot_base_generation[1, 0] = -1
-    before = c.req_device_buffer_tokens.clone()
+    if unsafe == "layer_budget":
+        c.kvduo_prefill_ema[0, 0] = torch.tensor([7, 60])
+        c.kvduo_prefill_ema[1, 0] = torch.tensor([2, 40])
+    if unsafe == "late_layer_budget":
+        c.kvduo_prefill_ema[0, 0] = torch.tensor([2, 40])
+        c.kvduo_prefill_ema[1, 0] = torch.tensor([7, 60])
+    if unsafe == "zero_miss":
+        c.kvduo_prefill_ema[0, 0] = torch.tensor([1e-12, 0])
+        c.kvduo_prefill_ema[1, 0] = torch.tensor([0, 100])
+    banks = (
+        c.req_device_buffer_tokens,
+        c.req_device_buffer_token_locs,
+        c.lru_slots,
+        c.kvduo_req_hot_capacity,
+        c.kvduo_req_hot_capacity_gpu,
+        c.kvduo_hot_page_limit,
+        c.kvduo_capacity_ema,
+        c.kvduo_capacity_steps,
+        c.kvduo_prefill_ema,
+        c.kvduo_prefill_steps,
+    )
+    before = [bank.clone() for bank in banks]
     c.token_to_kv_pool_allocator.free_hisparse_indices.reset_mock()
     assert c.reserve_kvduo_prefill(1, [0]) is None
-    assert torch.equal(c.req_device_buffer_tokens, before)
+    assert all(torch.equal(bank, saved) for bank, saved in zip(banks, before))
     assert p.free_pages == 0 and not c._kvduo_prefill_limited_requests
+    assert not c._kvduo_prefill_reservations
+    assert not c._kvduo_prefill_budget_reference
+    assert not c._kvduo_prefill_budget_cost
+    assert not c._kvduo_fixed_queue
     c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
+
+
+def test_coordinator_skips_request_failing_one_layer_and_reclaims_older_whole_request():
+    page_counts = {(layer, req): 4 for req in range(2) for layer in range(2)}
+    c, p = merged_and_expanded(
+        page_counts, {owner: 3 for owner in page_counts}, layers=2
+    )
+    c._kvduo_hot_processed[0, 0] = 20
+    c.kvduo_prefill_ema[0, 0] = torch.tensor([7, 60])
+    c.kvduo_prefill_ema[1, 0] = torch.tensor([2, 40])
+    before = c.req_device_buffer_tokens[:, 0].clone()
+    p_before = {owner: list(pages) for owner, pages in c._kvduo_req_layer_pages.items()}
+    token = c.reserve_kvduo_prefill(1, [0, 1])
+    assert token is not None
+    assert p.free_pages == 2
+    assert c.kvduo_req_hot_capacity[:, 0].tolist() == [12, 12]
+    assert c.kvduo_req_hot_capacity[:, 1].tolist() == [8, 8]
+    assert torch.equal(c.req_device_buffer_tokens[:, 0], before)
+    assert not c._kvduo_request_limited(0)
+    assert c._kvduo_request_limited(1)
+    assert c._kvduo_prefill_reservations[token][1] == {c._kvduo_request_key(1)}
+    assert c._kvduo_prefill_budget_cost == {c._kvduo_request_key(1): 2}
+    for layer in range(2):
+        assert c._kvduo_req_layer_pages[layer, 0] == p_before[layer, 0]
 
 
 def test_multiple_selected_requests_are_revalidated_independent_of_recency_order():

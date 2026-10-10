@@ -94,13 +94,15 @@ def plan_kvduo_prefill_rollback(
             continue
         expanded = [obj for obj in layers if obj.current_pages > obj.base_pages]
         if not expanded or any(
-            not obj.mature or obj.owner not in reference_misses for obj in expanded
+            not obj.mature
+            or obj.owner not in reference_misses
+            or obj.extra_hits > rho * obj.misses
+            for obj in expanded
         ):
             continue
         extra = sum(obj.extra_hits for obj in expanded)
-        misses = sum(obj.misses for obj in expanded)
         sequence = max(obj.processed for obj in layers)
-        if sequence <= 0 or extra > rho * misses:
+        if sequence <= 0:
             continue
         freed = sum(obj.current_pages - obj.base_pages for obj in expanded)
         candidates.append((sequence, req, freed, extra))
