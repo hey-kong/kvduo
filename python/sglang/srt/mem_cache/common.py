@@ -149,6 +149,9 @@ def evict_from_tree_cache(
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # the two resources currently have the same lifecycle, thus simplify logic below
     assert (req.req_pool_idx is None) == (req.kv is None)
+    coordinator = getattr(tree_cache, "kvduo_coordinator", None)
+    if coordinator is not None:
+        coordinator.end_kvduo_prefill(req)
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
         assert (

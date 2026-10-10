@@ -2743,6 +2743,11 @@ class HiSparseCoordinator:
         for key, (req, _) in list(self._kvduo_prefill_lifecycle.items()):
             if req is not request:
                 continue
+            for token, prefill in list(
+                self._kvduo_prefill_reservation_requests.items()
+            ):
+                if prefill == key:
+                    self.finish_kvduo_prefill_reservation(token, cancelled=True)
             self._release_kvduo_prefill_host(key)
             self._kvduo_prefill_hot_commitments.pop(key, None)
             self._kvduo_full_conversion_pending.pop(key, None)
@@ -2751,6 +2756,12 @@ class HiSparseCoordinator:
             del self._kvduo_prefill_lifecycle[key]
         if request is not None and hasattr(request, "kvduo_prefill_generation"):
             del request.kvduo_prefill_generation
+
+    def end_kvduo_prefill(self, req: Req) -> None:
+        if not self.enable_mixed_residency:
+            return
+        self._end_kvduo_prefill_lifecycle(req.req_pool_idx, req)
+        self.release_kvduo_match_refs(req)
 
     def _kvduo_optional_protected_pages(self) -> int:
         return (

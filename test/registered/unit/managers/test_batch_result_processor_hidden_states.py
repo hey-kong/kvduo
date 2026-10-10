@@ -149,7 +149,9 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                     patch(
                         "sglang.srt.managers.scheduler_components."
                         "batch_result_processor.get_memory",
-                        return_value=SimpleNamespace(enable_hisparse=False),
+                        return_value=SimpleNamespace(
+                            enable_hisparse=False, enable_kvduo=False
+                        ),
                     ),
                 ):
                     processor.process_batch_result_prefill(batch, result)
