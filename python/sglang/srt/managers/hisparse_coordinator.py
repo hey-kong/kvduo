@@ -29,7 +29,7 @@ from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.sparsity.core.kvduo_hot_merge import (
     kvduo_shrink_target,
-    plan_kvduo_hot_merge,
+    prepare_kvduo_hot_merge,
 )
 from sglang.srt.mem_cache.sparsity.core.kvduo_capacity_modes import (
     KVDuoRecoveryObject,
@@ -2256,64 +2256,20 @@ class HiSparseCoordinator:
             self._establish_kvduo_hot_base(owner, pages)
             return 0
 
-        # One synchronous snapshot of the REAL cache, only under pressure.
-        # It cannot outlive this boundary or be applied to a recycled owner.
-        tokens, locs, lru = (
-            torch.stack(
-                [
-                    self.req_device_buffer_tokens[layer_id, req_idx, :capacity].to(
-                        torch.int64
-                    ),
-                    self.req_device_buffer_token_locs[layer_id, req_idx, :capacity].to(
-                        torch.int64
-                    ),
-                    self.lru_slots[layer_id, req_idx, :capacity].to(torch.int64),
-                ]
-            )
-            .cpu()
-            .tolist()
+        plan = prepare_kvduo_hot_merge(
+            self.req_device_buffer_tokens[layer_id, req_idx],
+            self.req_device_buffer_token_locs[layer_id, req_idx],
+            self.lru_slots[layer_id, req_idx],
+            capacity,
+            self.hot_page_size,
+            self.top_k,
+            target_pages,
         )
-        plan = plan_kvduo_hot_merge(
-            tokens, lru, self.hot_page_size, self.top_k, target_pages
-        )
-        if any(loc < 0 for loc in locs) or len(set(locs)) != capacity:
-            raise RuntimeError("KVDuo HOT merge has invalid physical slot locations")
         kept_starts = [pages[index] for index in plan.kept_pages]
         released_starts = [pages[index] for index in plan.released_pages]
-        retained_locs = [
-            locs[index * self.hot_page_size + offset]
-            for index in plan.kept_pages
-            for offset in range(self.hot_page_size)
-        ]
-        new_capacity = len(plan.tokens)
-        # Stage allocations before the first payload write, so allocation
-        # failure cannot leave a partially published compaction.
-        new_tokens = torch.full_like(
-            self.req_device_buffer_tokens[layer_id, req_idx], -1
-        )
-        new_locs = torch.full_like(
-            self.req_device_buffer_token_locs[layer_id, req_idx], -1
-        )
-        new_lru = torch.full_like(self.lru_slots[layer_id, req_idx], -1)
-        new_tokens[:new_capacity] = torch.tensor(
-            plan.tokens, dtype=torch.int32, device=self.device
-        )
-        new_locs[:new_capacity] = torch.tensor(
-            retained_locs, dtype=torch.int32, device=self.device
-        )
-        new_lru[:new_capacity] = torch.tensor(
-            plan.lru_slots, dtype=self.lru_slots.dtype, device=self.device
-        )
-        src_locs = torch.tensor(
-            [locs[slot] for slot in plan.source_slots],
-            dtype=torch.int64,
-            device=self.device,
-        )
-        dst_locs = torch.tensor(
-            [locs[slot] for slot in plan.destination_slots],
-            dtype=torch.int64,
-            device=self.device,
-        )
+        new_capacity = target_pages * self.hot_page_size
+        new_tokens, new_locs, new_lru = plan.tokens, plan.locations, plan.lru_slots
+        src_locs, dst_locs = plan.source_locations, plan.destination_locations
         released = torch.tensor(
             [
                 slot

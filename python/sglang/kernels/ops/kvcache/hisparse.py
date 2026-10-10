@@ -482,6 +482,64 @@ def load_cache_to_device_buffer_dsv4_mla(
 
 
 @functools.cache
+def _jit_kvduo_merge_module(capacity: int, block_size: int):
+    args = make_cpp_args(capacity, block_size)
+    return load_jit(
+        "kvduo_hot_merge",
+        capacity,
+        block_size,
+        cuda_files=["kvduo_hot_merge.cuh"],
+        cuda_wrappers=[("plan", f"kvduo_hot_merge_plan<{args}>")],
+    )
+
+
+def build_kvduo_hot_merge_plan(
+    tokens: torch.Tensor,
+    locations: torch.Tensor,
+    lru: torch.Tensor,
+    capacity: int,
+    k: int,
+    target_pages: int,
+) -> tuple[torch.Tensor, ...]:
+    assert tokens.is_cuda
+    assert tokens.ndim == locations.ndim == lru.ndim == 1
+    assert tokens.shape == locations.shape and tokens.numel() >= lru.numel()
+    assert tokens.dtype == locations.dtype == torch.int32
+    assert lru.dtype == (
+        torch.int32 if lru.numel() > torch.iinfo(torch.int16).max else torch.int16
+    )
+    for tensor in (tokens, locations, lru):
+        assert tensor.device == tokens.device and tensor.is_contiguous()
+    hash_size = 1 << (2 * capacity - 1).bit_length()
+    workspace = torch.empty(
+        4 * capacity + hash_size, dtype=torch.int32, device=tokens.device
+    )
+    summary = torch.empty(3, dtype=torch.int32, device=tokens.device)
+    new_tokens = torch.empty_like(tokens)
+    new_locations = torch.empty_like(locations)
+    new_lru = torch.empty_like(lru)
+    sources = torch.empty(capacity, dtype=torch.int64, device=tokens.device)
+    destinations = torch.empty_like(sources)
+    _jit_kvduo_merge_module(lru.numel(), 256).plan(
+        tokens,
+        locations,
+        lru,
+        new_tokens,
+        new_locations,
+        new_lru,
+        sources,
+        destinations,
+        workspace,
+        summary,
+        capacity,
+        k,
+        target_pages,
+        hash_size,
+    )
+    return summary, new_tokens, new_locations, new_lru, sources, destinations
+
+
+@functools.cache
 def _jit_kvduo_rollback_module(capacity: int, block_size: int):
     args = make_cpp_args(capacity, block_size)
     return load_jit(

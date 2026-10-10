@@ -989,6 +989,112 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
 
 
+@pytest.mark.parametrize("k", [1, 4, 63, 4992])
+def test_kvduo_gpu_merge_plan_matches_reference_with_padding_and_multiple_owners(k):
+    from sglang.srt.mem_cache.sparsity.core.kvduo_hot_merge import (
+        plan_kvduo_hot_merge,
+        prepare_kvduo_hot_merge,
+    )
+
+    generator = torch.Generator().manual_seed(821)
+    slot_dtype = torch.int32 if 8 * k > 32767 else torch.int16
+    tokens = torch.full((2, 2, 8 * k + 64), 999, dtype=torch.int32, device=DEVICE)
+    locations = torch.full_like(tokens, 999)
+    lru = torch.full((2, 2, 8 * k), -1, dtype=slot_dtype, device=DEVICE)
+    addresses = [
+        (bank.data_ptr(), bank.shape, bank.stride())
+        for bank in (tokens, locations, lru)
+    ]
+    for case in range(12):
+        n = 8 if case < 3 else int(torch.randint(1, 9, (), generator=generator))
+        m = int(torch.randint(1, n + 1, (), generator=generator))
+        capacity = n * k
+        owner = (case % 2, (case // 2) % 2)
+        ids = torch.arange(capacity, dtype=torch.int32)
+        validity = torch.rand(capacity, generator=generator) < 0.6
+        if case == 0:
+            validity.fill_(False)
+        if case == 1:
+            validity.fill_(True)
+        ids[~validity] = -1
+        order = torch.randperm(capacity, generator=generator).to(slot_dtype)
+        locs = torch.randperm(capacity, generator=generator).to(torch.int32) * 8192 + 17
+        tokens[owner][:capacity] = ids.to(DEVICE)
+        locations[owner][:capacity] = locs.to(DEVICE)
+        lru[owner][:capacity] = order.to(DEVICE)
+        originals = [bank.cpu().clone() for bank in (tokens, locations, lru)]
+        expected = plan_kvduo_hot_merge(ids.tolist(), order.tolist(), k, 1, m)
+        plan = prepare_kvduo_hot_merge(
+            tokens[owner], locations[owner], lru[owner], capacity, k, 1, m
+        )
+        assert (
+            plan.kept_pages == expected.kept_pages
+            and plan.released_pages == expected.released_pages
+        )
+        assert plan.tokens[: m * k].cpu().tolist() == list(expected.tokens)
+        assert plan.lru_slots[: m * k].cpu().tolist() == list(expected.lru_slots)
+        assert plan.locations[: m * k].cpu().tolist() == [
+            int(locs[p * k + offset])
+            for p in expected.kept_pages
+            for offset in range(k)
+        ]
+        assert plan.source_locations.cpu().tolist() == [
+            int(locs[s]) for s in expected.source_slots
+        ]
+        assert plan.destination_locations.cpu().tolist() == [
+            int(locs[s]) for s in expected.destination_slots
+        ]
+        assert all(
+            torch.all(bank[m * k :] == -1)
+            for bank in (plan.tokens, plan.locations, plan.lru_slots)
+        )
+        assert all(
+            torch.equal(bank.cpu(), saved)
+            for bank, saved in zip((tokens, locations, lru), originals)
+        )
+        assert addresses == [
+            (bank.data_ptr(), bank.shape, bank.stride())
+            for bank in (tokens, locations, lru)
+        ]
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "duplicate_lru",
+        "negative_lru",
+        "out_of_range_lru",
+        "duplicate_location",
+        "negative_location",
+    ],
+)
+def test_kvduo_gpu_merge_rejects_corrupt_metadata_without_modifying_inputs(corruption):
+    from sglang.srt.mem_cache.sparsity.core.kvduo_hot_merge import (
+        prepare_kvduo_hot_merge,
+    )
+
+    tokens = torch.arange(34, dtype=torch.int32, device=DEVICE)
+    locs = tokens.clone() + 100
+    lru = torch.arange(32, dtype=torch.int16, device=DEVICE)
+    if corruption == "duplicate_lru":
+        lru[1] = 0
+    elif corruption == "negative_lru":
+        lru[1] = -1
+    elif corruption == "out_of_range_lru":
+        lru[1] = 16
+    elif corruption == "duplicate_location":
+        locs[1] = locs[0]
+    else:
+        locs[1] = -1
+    before = [bank.clone() for bank in (tokens, locs, lru)]
+    with pytest.raises((ValueError, RuntimeError)):
+        prepare_kvduo_hot_merge(tokens, locs, lru, 16, 4, 1, 2)
+    torch.cuda.synchronize()
+    assert all(
+        torch.equal(bank, saved) for bank, saved in zip((tokens, locs, lru), before)
+    )
+
+
 def test_kvduo_merge_copies_flat_c4_values_and_scales_before_freeing_pages():
     from types import SimpleNamespace
     from unittest.mock import MagicMock

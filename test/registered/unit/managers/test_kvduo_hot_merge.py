@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.mem_cache.sparsity.core.kvduo_hot_merge import (
     plan_kvduo_hot_merge,
+    prepare_kvduo_hot_merge,
     kvduo_shrink_target,
 )
 from test_kvduo_hot_growth import make_coordinator
@@ -392,3 +393,156 @@ def test_random_plans_preserve_mru_set_relative_order_and_optimal_page_choice():
             sorted(range(n), key=lambda p: (-counts[p], p))[:m]
         )
         assert sorted(plan.lru_slots) == list(range(m * k))
+
+
+def test_prepared_tensor_plans_match_reference_and_leave_padded_inputs_unchanged():
+    rng = random.Random(12)
+    for _ in range(80):
+        k = rng.choice([1, 4, 31])
+        n = rng.randrange(1, 9)
+        m = rng.randrange(1, n + 1)
+        capacity = n * k
+        tokens = torch.full((8 * k + 3,), 999, dtype=torch.int32)
+        tokens[:capacity] = torch.tensor(
+            [slot if rng.random() < 0.6 else -1 for slot in range(capacity)]
+        )
+        locs = torch.randperm(tokens.numel(), dtype=torch.int32) + 100
+        order = list(range(capacity))
+        rng.shuffle(order)
+        lru = torch.full((8 * k,), -1, dtype=torch.int16)
+        lru[:capacity] = torch.tensor(order, dtype=torch.int16)
+        before = [bank.clone() for bank in (tokens, locs, lru)]
+        expected = plan_kvduo_hot_merge(tokens[:capacity].tolist(), order, k, 1, m)
+        plan = prepare_kvduo_hot_merge(tokens, locs, lru, capacity, k, 1, m)
+        assert plan.kept_pages == expected.kept_pages
+        assert plan.released_pages == expected.released_pages
+        assert plan.tokens[: m * k].tolist() == list(expected.tokens)
+        assert plan.lru_slots[: m * k].tolist() == list(expected.lru_slots)
+        assert plan.source_locations.tolist() == [
+            int(locs[s]) for s in expected.source_slots
+        ]
+        assert plan.destination_locations.tolist() == [
+            int(locs[s]) for s in expected.destination_slots
+        ]
+        assert plan.locations[: m * k].tolist() == [
+            int(locs[page * k + offset])
+            for page in expected.kept_pages
+            for offset in range(k)
+        ]
+        assert all(
+            torch.all(bank[m * k :] == -1)
+            for bank in (plan.tokens, plan.locations, plan.lru_slots)
+        )
+        assert all(
+            torch.equal(bank, saved) for bank, saved in zip((tokens, locs, lru), before)
+        )
+
+
+@pytest.mark.parametrize(
+    "status,match",
+    [(1, "LRU slot permutation"), (2, "invalid physical slot locations")],
+)
+def test_gpu_plan_reads_only_summary_and_rejects_invalid_metadata_before_copy(
+    monkeypatch, status, match
+):
+    import sglang.kernels.ops.kvcache.hisparse as ops
+
+    c, p = make_merge_coordinator({(0, 0): 4})
+    rows = (
+        c.req_device_buffer_tokens[0, 0],
+        c.req_device_buffer_token_locs[0, 0],
+        c.lru_slots[0, 0],
+    )
+    before = [row.clone() for row in rows]
+    staged = (
+        torch.empty_like(rows[0]),
+        torch.empty_like(rows[1]),
+        torch.empty_like(rows[2]),
+        torch.empty(16, dtype=torch.int64),
+        torch.empty(16, dtype=torch.int64),
+    )
+    summary = torch.tensor([status, 0, 3], dtype=torch.int32)
+    launch = MagicMock(return_value=(summary, *staged))
+    monkeypatch.setattr(ops, "build_kvduo_hot_merge_plan", launch)
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda _: True))
+    cpu = torch.Tensor.cpu
+    reads = []
+
+    def read_summary(tensor, *args, **kwargs):
+        assert tensor is summary
+        reads.append(tensor)
+        return cpu(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", read_summary)
+    c._move_kvduo_hot_entries = MagicMock()
+    with pytest.raises((ValueError, RuntimeError), match=match):
+        c._merge_kvduo_hot_pages(0, 0, 2)
+    assert len(reads) == 1 and launch.call_count == 1
+    assert all(torch.equal(row, saved) for row, saved in zip(rows, before))
+    c._move_kvduo_hot_entries.assert_not_called()
+    c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
+    assert p.free_pages == 0 and c.kvduo_req_hot_capacity.item() == 16
+
+
+def test_gpu_plan_returns_device_metadata_and_only_small_host_ownership_result(
+    monkeypatch,
+):
+    import sglang.kernels.ops.kvcache.hisparse as ops
+
+    tokens = torch.arange(34, dtype=torch.int32)
+    locs = torch.arange(34, dtype=torch.int32) + 100
+    lru = torch.arange(32, dtype=torch.int16)
+    summary = torch.tensor([0, 1, 10], dtype=torch.int32)
+    outputs = (
+        torch.full_like(tokens, -1),
+        torch.full_like(locs, -1),
+        torch.full_like(lru, -1),
+    )
+    sources = torch.tensor([101] * 16, dtype=torch.int64)
+    destinations = torch.tensor([107] * 16, dtype=torch.int64)
+    monkeypatch.setattr(
+        ops,
+        "build_kvduo_hot_merge_plan",
+        MagicMock(return_value=(summary, *outputs, sources, destinations)),
+    )
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda _: True))
+    cpu = torch.Tensor.cpu
+
+    def read_summary(tensor):
+        assert tensor is summary and tensor.numel() == 3
+        return cpu(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", read_summary)
+    plan = prepare_kvduo_hot_merge(tokens, locs, lru, 16, 4, 2, 2)
+    assert plan.kept_pages == (1, 3) and plan.released_pages == (0, 2)
+    assert (
+        plan.tokens is outputs[0]
+        and plan.locations is outputs[1]
+        and plan.lru_slots is outputs[2]
+    )
+    assert plan.source_locations.tolist() == [101]
+    assert plan.destination_locations.tolist() == [107]
+
+
+def test_gpu_merge_dispatch_compiles_real_lru_width_and_uses_global_workspace(
+    monkeypatch,
+):
+    import sglang.kernels.ops.kvcache.hisparse as ops
+
+    k = 78 * 64
+    capacity = 4 * k
+    tokens = torch.empty(8 * k + 64, dtype=torch.int32)
+    locs = torch.empty_like(tokens)
+    lru = torch.empty(8 * k, dtype=torch.int32)
+    module = MagicMock()
+    load = MagicMock(return_value=module)
+    monkeypatch.setattr(ops, "_jit_kvduo_merge_module", load)
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda _: True))
+    outputs = ops.build_kvduo_hot_merge_plan(tokens, locs, lru, capacity, k, 2)
+    load.assert_called_once_with(39936, 256)
+    args = module.plan.call_args.args
+    assert args[:3] == (tokens, locs, lru)
+    assert args[8].numel() == 4 * capacity + 65536
+    assert args[9].numel() == 3
+    assert args[10:] == (capacity, k, 2, 65536)
+    assert outputs[1].shape == tokens.shape and outputs[3].shape == lru.shape
