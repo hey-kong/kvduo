@@ -1031,6 +1031,9 @@ def test_kvduo_merge_copies_flat_c4_values_and_scales_before_freeing_pages():
     coordinator.mem_pool_device.layer_num = 1
     coordinator._active_kvduo_reqs = {0: object()}
     coordinator._init_kvduo_prefill_rollback_state(1)
+    coordinator.kvduo_hot_growth_events = torch.ones(
+        (1, 1), dtype=torch.int32, device=DEVICE
+    )
     coordinator._kvduo_hot_generation[0, 0] = 0
     coordinator.kvduo_capacity_steps.fill_(65)
     coordinator.kvduo_capacity_ema[..., :2] = 100
@@ -1072,6 +1075,7 @@ def test_kvduo_merge_copies_flat_c4_values_and_scales_before_freeing_pages():
     coordinator.token_to_kv_pool_allocator = SimpleNamespace(free_hisparse_indices=free)
     coordinator.kvduo_capacity_ema[..., :2] = 100
     assert coordinator._merge_kvduo_hot_pages(0, 0) == 2 * DSV4_PAGE_SIZE
+    assert not coordinator.kvduo_hot_growth_events.any()
     free.assert_called_once()
     assert coordinator.lru_slots[0, 0, : 2 * k].cpu().tolist() == [2 * k - 1] + list(
         range(2 * k - 1)
@@ -1121,6 +1125,9 @@ def test_kvduo_resolver_graph_replays_after_actual_merge_without_recapture():
     coordinator.mem_pool_device.layer_num = 1
     coordinator._active_kvduo_reqs = {0: object()}
     coordinator._init_kvduo_prefill_rollback_state(1)
+    coordinator.kvduo_hot_growth_events = torch.ones(
+        (1, 1), dtype=torch.int32, device=DEVICE
+    )
     coordinator.kvduo_hot_base_capacity = kwargs["hot_base_capacities"].unsqueeze(0)
     coordinator.kvduo_prefill_ema = kwargs["prefill_ema"].unsqueeze(0)
     coordinator.kvduo_prefill_steps = kwargs["prefill_steps"].unsqueeze(0)
@@ -1136,6 +1143,7 @@ def test_kvduo_resolver_graph_replays_after_actual_merge_without_recapture():
     )
     coordinator.kvduo_capacity_ema[..., :2] = 100
     assert coordinator._merge_kvduo_hot_pages(0, 0) == 2
+    assert not coordinator.kvduo_hot_growth_events.any()
     assert pointers == [
         kwargs[key].data_ptr()
         for key in (

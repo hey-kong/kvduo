@@ -530,6 +530,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.kvduo_req_hot_capacity = torch.zeros((2, 1), dtype=torch.int64)
         coordinator.kvduo_req_hot_capacity_gpu = torch.zeros((2, 1), dtype=torch.int32)
         coordinator._init_kvduo_prefill_rollback_state(1)
+        coordinator.kvduo_hot_growth_events = torch.zeros((2, 1), dtype=torch.int32)
         coordinator._active_kvduo_reqs = {0: object()}
         coordinator.req_device_buffer_token_locs = torch.full(
             (2, 1, 32), -1, dtype=torch.int32

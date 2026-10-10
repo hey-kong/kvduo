@@ -50,6 +50,11 @@ def test_recovery_needs_all_established_layers_and_uses_only_latest_events():
     p.free_pages = 10
     # The earlier event in layers 1 and 3 cannot be replayed on recovery.
     c.kvduo_hot_growth_events[[0, 2], 0] = 1
+    c.kvduo_capacity_ema[:, 0, :2] = torch.tensor([8, 4])
+    c.kvduo_capacity_ema[:, 0, 8] = 2
+    c.kvduo_capacity_steps[:, 0] = 100
+    c.kvduo_prefill_ema[:, 0] = 7
+    c.kvduo_prefill_steps[:, 0] = 66
     cost = c._kvduo_prefill_budget_cost[key]
     allocate = p.alloc.side_effect
 
@@ -67,6 +72,17 @@ def test_recovery_needs_all_established_layers_and_uses_only_latest_events():
     assert c.kvduo_hot_base_capacity[:, 0].tolist() == [8] * 4
     assert p.free_pages == 8 and c._kvduo_recovery_credits == 0
     assert not c._kvduo_prefill_budget_cost
+    assert c.kvduo_capacity_steps[:, 0].tolist() == [100] * 4
+    assert c.kvduo_capacity_ema[:, 0, :3].tolist() == [
+        [8, 4, 4],
+        [8, 4, 0],
+        [8, 4, 4],
+        [8, 4, 0],
+    ]
+    assert c.kvduo_capacity_ema[:, 0, 8].tolist() == [2] * 4
+    # Design 3 still starts a new phase only on first growth from the base.
+    assert c.kvduo_prefill_steps[:, 0].tolist() == [0, 66, 0, 66]
+    assert c.kvduo_prefill_ema[:, 0].tolist() == [[0, 0], [7, 7], [0, 0], [7, 7]]
 
 
 def test_recovery_failure_keeps_request_fixed_and_cost_reserved():
@@ -271,6 +287,18 @@ def _tp_modes_worker(rank, init_file):
         p.alloc.assert_not_called()
         assert c.kvduo_req_hot_capacity[0].tolist() == [8, 8, 32]
         assert p.free_pages == 4 + 2 * rank
+
+        from test_kvduo_hot_merge import make_merge_coordinator
+
+        c, p = make_merge_coordinator({(0, 0): 7, (0, 1): 2})
+        c.tp_world_size = 2
+        c.tp_group = dist.group.WORLD
+        p.free_pages = rank
+        c.kvduo_hot_growth_events[0] = 1
+        c.prepare_kvduo_graph_replay(torch.tensor([0, 1]))
+        assert c.kvduo_req_hot_capacity[0].tolist() == [8, 12]
+        assert c.kvduo_capacity_steps[0].tolist() == [0, 65]
+        assert p.free_pages == 4 + rank
     finally:
         dist.destroy_process_group()
 

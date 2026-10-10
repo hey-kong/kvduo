@@ -136,7 +136,7 @@ def test_production_ema_initializes_and_includes_valid_zero_count_steps(
     assert list(counts) == [8 * 63 / 64, 20 * 63 / 64] and steps.value == 2
 
 
-def test_replay_reenables_real_observation_and_growth_resets_capacity_only():
+def test_replay_reenables_observation_and_growth_keeps_capacity_history():
     c, _ = make_coordinator()
     c.kvduo_observe.zero_()
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
@@ -148,11 +148,127 @@ def test_replay_reenables_real_observation_and_growth_resets_capacity_only():
     pointer = c.kvduo_capacity_ema.data_ptr()
     c.kvduo_hot_growth_events[0, 0] = 1
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
-    assert not c.kvduo_capacity_ema.any() and not c.kvduo_capacity_steps.any()
+    assert c.kvduo_capacity_ema[0, 0].tolist() == [3] * 9
+    assert c.kvduo_capacity_steps.item() == 65
     assert c.kvduo_prefill_steps.item() == 66 and c.kvduo_prefill_ema[
         0, 0
     ].tolist() == [7, 7]
     assert c.kvduo_capacity_ema.data_ptr() == pointer
+
+
+def test_growth_preserves_mru_segments_and_continues_production_ema(
+    native_observation,
+):
+    c, _ = make_coordinator(layers=2, requests=2)
+    owner = (1, 1)
+    c._ensure_kvduo_hot_capacity_targets_batch({owner: 8})
+    c.kvduo_capacity_ema[owner] = torch.tensor([8, 4, 9, 9, 0, 0, 0, 0, 2])
+    c.kvduo_capacity_steps[owner] = 100
+    old_lru = c.lru_slots[owner][:8].tolist()
+    old_segments = [native_observation.segment(8, i, 4) for i in range(8)]
+    shapes_and_pointers = [
+        (bank.shape, bank.stride(), bank.data_ptr())
+        for bank in (c.lru_slots, c.kvduo_capacity_ema, c.kvduo_capacity_steps)
+    ]
+    other_counts = c.kvduo_capacity_ema[:, 0].clone()
+
+    c._ensure_kvduo_hot_capacity_targets_batch({owner: 16})
+
+    assert c.lru_slots[owner][:16].tolist() == list(range(8, 16)) + old_lru
+    assert old_segments == [native_observation.segment(16, i + 8, 4) for i in range(8)]
+    assert c.kvduo_capacity_ema[owner].tolist() == [8, 4, 4, 4, 0, 0, 0, 0, 2]
+    assert c.kvduo_capacity_steps[owner] == 100
+    assert torch.equal(c.kvduo_capacity_ema[:, 0], other_counts)
+    assert shapes_and_pointers == [
+        (bank.shape, bank.stride(), bank.data_ptr())
+        for bank in (c.lru_slots, c.kvduo_capacity_ema, c.kvduo_capacity_steps)
+    ]
+    counts = (ctypes.c_float * 9)(*c.kvduo_capacity_ema[owner].tolist())
+    steps = ctypes.c_int64(int(c.kvduo_capacity_steps[owner]))
+    native_observation.capacity(
+        (ctypes.c_int * 8)(4, 0, 2, 0, 0, 0, 0, 0),
+        0,
+        6,
+        4,
+        counts,
+        ctypes.byref(steps),
+    )
+    assert list(counts) == [
+        8 - 4 / 64,
+        4 * 63 / 64,
+        4 - 2 / 64,
+        4 * 63 / 64,
+        0,
+        0,
+        0,
+        0,
+        2 * 63 / 64,
+    ]
+    assert steps.value == 101
+    # A later expansion must use the latest last segment, including its EMA
+    # updates, rather than the original seed or another more-recent segment.
+    c.kvduo_capacity_ema[owner] = torch.tensor(list(counts))
+    c.kvduo_capacity_steps[owner] = steps.value
+    c._ensure_kvduo_hot_capacity_targets_batch({owner: 20})
+    assert c.kvduo_capacity_ema[owner].tolist() == list(counts)[:4] + [
+        counts[3],
+        0,
+        0,
+        0,
+        counts[8],
+    ]
+    assert c.kvduo_capacity_steps[owner] == 101
+
+
+def test_first_hot_allocation_starts_fresh_observation():
+    c, _ = make_coordinator(top_k=5)
+    c.kvduo_capacity_ema.fill_(99)
+    c.kvduo_capacity_steps.fill_(100)
+    c.prepare_kvduo_graph_replay(torch.tensor([0]))
+    assert c.kvduo_req_hot_capacity.item() == 8
+    assert not c.kvduo_capacity_ema.any() and not c.kvduo_capacity_steps.any()
+
+
+def test_failed_growth_restores_capacity_and_prefill_histories():
+    c, p = make_coordinator(layers=2)
+    c.prepare_kvduo_graph_replay(torch.tensor([0]))
+    for layer in range(2):
+        owner = (layer, 0)
+        c._establish_kvduo_hot_base(owner, c._kvduo_req_layer_pages[owner])
+        c._kvduo_prefill_budget_reference[c._kvduo_owner_key(owner)] = 2.0
+    c.kvduo_capacity_ema.fill_(3)
+    c.kvduo_capacity_ema[:, :, 1] = 9
+    c.kvduo_capacity_steps.fill_(65)
+    c.kvduo_prefill_ema.fill_(7)
+    c.kvduo_prefill_steps.fill_(66)
+    banks = (
+        c.req_device_buffer_tokens,
+        c.req_device_buffer_token_locs,
+        c.lru_slots,
+        c.kvduo_req_hot_capacity,
+        c.kvduo_req_hot_capacity_gpu,
+        c.kvduo_capacity_ema,
+        c.kvduo_capacity_steps,
+        c.kvduo_prefill_ema,
+        c.kvduo_prefill_steps,
+    )
+    before = [bank.clone() for bank in banks]
+    references = dict(c._kvduo_prefill_budget_reference)
+    owners = dict(c._kvduo_hot_page_owners)
+    free_pages = p.free_pages
+    observe = c._observe_kvduo_hot_growth
+
+    def fail_after_observing(owner, old, new):
+        observe(owner, old, new)
+        if owner == (1, 0):
+            raise RuntimeError("publication failed")
+
+    c._observe_kvduo_hot_growth = fail_after_observing
+    with pytest.raises(RuntimeError, match="publication failed"):
+        c._ensure_kvduo_hot_capacity_targets_batch({(0, 0): 8, (1, 0): 8})
+    assert all(torch.equal(bank, old) for bank, old in zip(banks, before))
+    assert c._kvduo_prefill_budget_reference == references
+    assert c._kvduo_hot_page_owners == owners and p.free_pages == free_pages
 
 
 def test_reset_waits_old_decode_then_clears_only_reused_request_generation():
