@@ -1,5 +1,6 @@
 """CPU regressions exercising the production HOT allocation/replay boundary."""
 
+import threading
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -7,6 +8,17 @@ import pytest
 import torch
 
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import KVDuoHostPrefixCache
+
+
+def make_host_pool(size=1024, page_size=2):
+    pool = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
+    pool.size = size
+    pool.page_size = pool.slot_page_size = page_size
+    pool.lock = threading.RLock()
+    pool.clear()
+    return pool
 
 
 def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
@@ -41,6 +53,11 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
     coordinator._kvduo_pressure_protected = None
     coordinator.is_dsv4_hisparse = False
     coordinator.compress_ratio = 1
+    coordinator.mem_pool_host = make_host_pool()
+    coordinator.host_prefix_cache = KVDuoHostPrefixCache(coordinator.mem_pool_host.size)
+    coordinator.req_to_host_pool_allocated_len = torch.zeros(
+        requests, dtype=torch.int64
+    )
     from sglang.srt.mem_cache.sparsity.core.kvduo_prefill_rollback import (
         KVDuoPrefillPolicy,
     )

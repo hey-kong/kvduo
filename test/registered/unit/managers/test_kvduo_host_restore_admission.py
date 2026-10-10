@@ -19,8 +19,8 @@ from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
+from test_kvduo_hot_growth import make_host_pool
 from test_kvduo_prefill_rollback import adder_and_req, ready_coordinator
-
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -40,7 +40,9 @@ def restore_setup(*, dsv4, requests=1, cache_type=RadixCache, extra=2):
         setattr(c, name, torch.zeros(2048, dtype=torch.int64))
     c.full_host_version = torch.full((2048,), -1, dtype=torch.int64)
     c.host_prefix_cache = KVDuoHostPrefixCache(8)
-    c.mem_pool_host = SimpleNamespace(load_to_device_per_layer=MagicMock())
+    c.mem_pool_host = make_host_pool(8, c.page_size)
+    c.mem_pool_host.load_to_device_per_layer = MagicMock()
+    cached_locations = tuple(c.mem_pool_host.alloc(c.page_size).tolist())
     c.mem_pool_device.translate_loc_from_full_to_compressed = (
         lambda indices: indices[c.compress_ratio - 1 :: c.compress_ratio]
         // c.compress_ratio
@@ -63,7 +65,7 @@ def restore_setup(*, dsv4, requests=1, cache_type=RadixCache, extra=2):
         HostPrefixRecord(
             identity=identity,
             domains=("main_kv",),
-            host_locations={"main_kv": (20, 21)},
+            host_locations={"main_kv": cached_locations},
             data_versions={"main_kv": (1, 1)},
             host_versions={"main_kv": (1, 1)},
             request_references={req.rid},

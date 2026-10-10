@@ -35,8 +35,11 @@ def make_cache(allocator):
 
 
 def make_decode_batch(lengths, *, free_pages=0, logical_size=4096, swa_size=4096):
-    coordinator, physical = make_coordinator(free_pages=free_pages)
+    coordinator, physical = make_coordinator(
+        requests=len(lengths), free_pages=free_pages
+    )
     coordinator.page_size = 64
+    coordinator.mem_pool_host.page_size = coordinator.mem_pool_host.slot_page_size = 64
     coordinator.item_size_bytes = 1
     coordinator.is_dsv4_hisparse = True
     coordinator._kvduo_pending_hot_minimum.clear()
@@ -49,7 +52,12 @@ def make_decode_batch(lengths, *, free_pages=0, logical_size=4096, swa_size=4096
         coordinator, dsv4=True, logical_size=logical_size, swa_size=swa_size
     )
     coordinator.token_to_kv_pool_allocator = allocator
-    batch = ScheduleBatch(reqs=[SimpleNamespace(kv_committed_len=n) for n in lengths])
+    batch = ScheduleBatch(
+        reqs=[
+            SimpleNamespace(kv_committed_len=n, req_pool_idx=i)
+            for i, n in enumerate(lengths)
+        ]
+    )
     batch.spec_algorithm = SimpleNamespace(is_none=lambda: True)
     batch.token_to_kv_pool_allocator = allocator
     batch.hisparse_coordinator = coordinator
@@ -213,10 +221,10 @@ def make_full_coordinator(*, pages=8, layers=1, ratio=1, initial_pages=2):
     coordinator.req_to_host_pool_allocated_len = torch.zeros(1, dtype=torch.int64)
     coordinator._skip_first_backup = [False]
     coordinator._lru_init = torch.arange(32, dtype=torch.int16)
-    coordinator.mem_pool_host = SimpleNamespace(
-        allocated_host_indices=lambda *args: torch.empty(0, dtype=torch.int64),
-        free=MagicMock(),
+    coordinator.mem_pool_host.allocated_host_indices = lambda *args: torch.empty(
+        0, dtype=torch.int64
     )
+    coordinator.mem_pool_host.free = MagicMock()
     coordinator.wait_for_pending_backup = MagicMock()
     coordinator._retain_request_host_prefix = MagicMock(return_value=set())
     coordinator._release_host_prefix_refs = MagicMock()

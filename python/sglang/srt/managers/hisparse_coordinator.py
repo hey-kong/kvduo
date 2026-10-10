@@ -979,6 +979,70 @@ class HiSparseCoordinator:
                 torch.tensor(sorted(locations), dtype=torch.int64, device=self.device)
             )
 
+    def _kvduo_host_capacity_ready(self, slots: int, *, prefill_key=None) -> bool:
+        reserved = sum(
+            reservation[1]
+            for key, reservation in self._kvduo_prefill_host_reservations.items()
+            if key != prefill_key
+        )
+        required = slots + reserved
+        self._evict_host_prefix_for_slots(required)
+        return bool(
+            self._kvduo_common_available(
+                int(self.mem_pool_host.available_size() >= required)
+            )
+        )
+
+    def _reserve_kvduo_prefill_host(self, req, key) -> bool:
+        existing = self._kvduo_prefill_host_reservations.get(key)
+        if existing is not None:
+            return existing[0] is req
+        # Reserve the complete prompt even when this execution is only a chunk.
+        # No host backup exists until the final prefill-to-decode transition.
+        fill_ids = req.full_untruncated_fill_ids
+        length = len(fill_ids) // self.compress_ratio
+        capacity = (length + self.page_size - 1) // self.page_size * self.page_size
+        records = []
+        owner = ("kvduo-prefill", key)
+        try:
+            for ordinal in range(length // self.page_size):
+                identities = self._host_prefix_identities(req, ordinal, fill_ids)
+                identity = identities[ordinal]
+                record = self.host_prefix_cache.records.get(identity)
+                if record is None or not record.fully_valid:
+                    break
+                identities[ordinal] = record.identity
+                self.host_prefix_cache.acquire(identity, owner, 0)
+                records.append(identity)
+            slots = capacity - len(records) * self.page_size
+            if not self._kvduo_host_capacity_ready(slots):
+                return False
+            self._kvduo_prefill_host_reservations[key] = (req, slots, tuple(records))
+            return True
+        finally:
+            if key not in self._kvduo_prefill_host_reservations:
+                for identity in records:
+                    self.host_prefix_cache.release(identity, owner)
+
+    def _release_kvduo_prefill_host(self, key) -> None:
+        reservation = self._kvduo_prefill_host_reservations.pop(key, None)
+        if reservation is not None:
+            for identity in reservation[2]:
+                if identity in self.host_prefix_cache.records:
+                    self.host_prefix_cache.release(identity, ("kvduo-prefill", key))
+
+    def _kvduo_decode_host_slots(self, requests) -> int:
+        slots = 0
+        for req in requests:
+            length = self.host_token_len(req.kv_committed_len + 1)
+            if length <= 1 or (length - 1) % self.page_size:
+                continue
+            slots += max(
+                0,
+                length - 1 - int(self.req_to_host_pool_allocated_len[req.req_pool_idx]),
+            )
+        return slots
+
     def _attach_cached_host_prefix(self, req: Req, host_len: int) -> int:
         """Attach the longest contiguous valid host prefix to this request row."""
         if not self.enable_mixed_residency:
@@ -1114,7 +1178,13 @@ class HiSparseCoordinator:
             ((prefill_len + self.page_size - 1) // self.page_size * self.page_size)
             - attached,
         )
-        self._evict_host_prefix_for_slots(new_host_slots)
+        prefill_key = (
+            self._kvduo_prefill_key(req) if self.enable_mixed_residency else None
+        )
+        if self.enable_mixed_residency and not self._kvduo_host_capacity_ready(
+            new_host_slots, prefill_key=prefill_key
+        ):
+            raise RuntimeError("KVDuo prefill lost its reserved Host capacity")
         host_indices = self.mem_pool_host.alloc_paged_token_slots(
             self.req_to_host_pool,
             self.req_to_host_pool_allocated_len,
@@ -1122,6 +1192,8 @@ class HiSparseCoordinator:
             0,
             prefill_len,
         )
+        if self.enable_mixed_residency:
+            self._release_kvduo_prefill_host(prefill_key)
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -1409,6 +1481,14 @@ class HiSparseCoordinator:
         """
         if not self.enable_mixed_residency:
             return self._reclaim_for_physical_allocation(0)
+        if not self._kvduo_host_capacity_ready(self._kvduo_decode_host_slots(requests)):
+            return KVDuoPressureResult(
+                KVDuoPressureStatus.RECLAIM_REQUIRED,
+                0,
+                action=KVDuoPressureAction.ERROR,
+                reason=KVDuoPressureReason.MEMORY_SHORTAGE,
+                detail="KVDuo Host pool cannot cover decode backup and prefill reservations",
+            )
         pages = 0
         if self.is_dsv4_hisparse:
             page = self.page_size
@@ -2395,6 +2475,7 @@ class HiSparseCoordinator:
         self._kvduo_fixed_queue = {}
         self._kvduo_fixed_sequence = 0
         self._kvduo_prefill_lifecycle = {}
+        self._kvduo_prefill_host_reservations = {}
         self._kvduo_prefill_generation = 0
         self._kvduo_full_conversion_pending = {}
         self._kvduo_prefill_hot_commitments = {}
@@ -2662,6 +2743,12 @@ class HiSparseCoordinator:
         for key, (req, _) in list(self._kvduo_prefill_lifecycle.items()):
             if req is not request:
                 continue
+            for token, prefill in list(
+                self._kvduo_prefill_reservation_requests.items()
+            ):
+                if prefill == key:
+                    self.finish_kvduo_prefill_reservation(token, cancelled=True)
+            self._release_kvduo_prefill_host(key)
             self._kvduo_prefill_hot_commitments.pop(key, None)
             self._kvduo_full_conversion_pending.pop(key, None)
             for associations in self._kvduo_prefill_associations.values():
@@ -2669,6 +2756,12 @@ class HiSparseCoordinator:
             del self._kvduo_prefill_lifecycle[key]
         if request is not None and hasattr(request, "kvduo_prefill_generation"):
             del request.kvduo_prefill_generation
+
+    def end_kvduo_prefill(self, req: Req) -> None:
+        if not self.enable_mixed_residency:
+            return
+        self._end_kvduo_prefill_lifecycle(req.req_pool_idx, req)
+        self.release_kvduo_match_refs(req)
 
     def _kvduo_optional_protected_pages(self) -> int:
         return (
@@ -2850,6 +2943,7 @@ class HiSparseCoordinator:
         _, owners = reservation
         prefill_key = self._kvduo_prefill_reservation_requests.pop(token, None)
         if cancelled and prefill_key is not None:
+            self._release_kvduo_prefill_host(prefill_key)
             self._kvduo_prefill_hot_commitments.pop(prefill_key, None)
             request = self._kvduo_prefill_lifecycle[prefill_key][0]
             self._kvduo_prefill_lifecycle[prefill_key][1] = "cancelled"
@@ -2934,8 +3028,44 @@ class HiSparseCoordinator:
         prefix_indices: torch.Tensor | None = None,
         prefill_req=None,
     ) -> int | None:
-        """Check one fixed round's miss budget before any no-copy rollback."""
         self._wait_kvduo_hot_merge_boundary()
+        prefill_key = (
+            self._kvduo_prefill_key(prefill_req) if prefill_req is not None else None
+        )
+        needs_host = prefill_req is not None and hasattr(
+            prefill_req, "full_untruncated_fill_ids"
+        )
+        new_host_reservation = (
+            needs_host and prefill_key not in self._kvduo_prefill_host_reservations
+        )
+        if needs_host and not self._reserve_kvduo_prefill_host(
+            prefill_req, prefill_key
+        ):
+            return None
+        token = None
+        try:
+            token = self._reserve_kvduo_prefill_physical(
+                pages,
+                decode_req_indices,
+                tree_cache=tree_cache,
+                prefix_indices=prefix_indices,
+                prefill_req=prefill_req,
+            )
+            return token
+        finally:
+            if token is None and new_host_reservation:
+                self._release_kvduo_prefill_host(prefill_key)
+
+    def _reserve_kvduo_prefill_physical(
+        self,
+        pages: int,
+        decode_req_indices: Sequence[int],
+        *,
+        tree_cache=None,
+        prefix_indices: torch.Tensor | None = None,
+        prefill_req=None,
+    ) -> int | None:
+        """Check one fixed round's miss budget before any no-copy rollback."""
         self._prune_kvduo_prefill_budget()
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         prefill_key = (
@@ -3326,6 +3456,12 @@ class HiSparseCoordinator:
         if not page_jobs:
             return
         self.wait_for_pending_backup()
+        required_host_slots = sum(
+            max(0, end - int(self.req_to_host_pool_allocated_len[req_idx]))
+            for req_idx, _, end in page_jobs
+        )
+        if not self._kvduo_host_capacity_ready(required_host_slots):
+            raise RuntimeError("KVDuo decode backup exceeds available Host capacity")
         host_locs = []
         logical_locs = []
         for req_idx, start, end in page_jobs:
