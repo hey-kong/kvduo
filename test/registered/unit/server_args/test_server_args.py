@@ -106,6 +106,65 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestKVDuoSessionCompatibility(unittest.TestCase):
+    def test_constructor_rejects_kvduo_with_streaming_session(self):
+        with self.assertRaisesRegex(
+            ValueError, "--enable-kvduo and --enable-streaming-session"
+        ):
+            ServerArgs(
+                model_path="dummy",
+                enable_kvduo=True,
+                enable_streaming_session=True,
+            )
+
+    def test_cli_rejects_both_flag_orders(self):
+        flags = ["--enable-kvduo", "--enable-streaming-session"]
+        for order in (flags, flags[::-1]):
+            with (
+                self.subTest(order=order),
+                self.assertRaisesRegex(
+                    ValueError, "--enable-kvduo and --enable-streaming-session"
+                ),
+            ):
+                prepare_server_args(["--model-path", "dummy", *order])
+
+    def test_config_rejects_kvduo_with_streaming_session(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as config:
+            config.write(
+                "model-path: dummy\n"
+                "enable-kvduo: true\n"
+                "enable-streaming-session: true\n"
+            )
+            config.flush()
+            with self.assertRaisesRegex(
+                ValueError, "--enable-kvduo and --enable-streaming-session"
+            ):
+                prepare_server_args(["--config", config.name])
+
+    def test_cli_accepts_each_flag_separately(self):
+        for flags, kvduo, streaming in (
+            ([], False, False),
+            (["--enable-kvduo"], True, False),
+            (["--enable-streaming-session"], False, True),
+        ):
+            with self.subTest(flags=flags):
+                args = prepare_server_args(["--model-path", "dummy", *flags])
+                self.assertEqual(args.enable_kvduo, kvduo)
+                self.assertEqual(args.enable_streaming_session, streaming)
+
+    def test_cli_accepts_plain_hisparse_with_streaming_session(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--enable-hisparse",
+                "--enable-streaming-session",
+            ]
+        )
+        self.assertTrue(args.enable_hisparse)
+        self.assertTrue(args.enable_streaming_session)
+
+
 class TestMmEncoderDataParallelLogging(CustomTestCase):
     def test_logs_when_encoder_dp_has_no_parallelism(self):
         server_args = ServerArgs(

@@ -3479,6 +3479,7 @@ class ServerArgs:
         self._resolved_overrides = []
 
         self._handle_return_hidden_states_mode()
+        self._handle_session_compatibility()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -7779,6 +7780,12 @@ class ServerArgs:
                 )
             if not supported:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+
+    def _handle_session_compatibility(self):
+        if self.enable_kvduo and self.enable_streaming_session:
+            raise ValueError(
+                "--enable-kvduo and --enable-streaming-session are mutually exclusive"
+            )
 
     def _handle_cache_compatibility(self):
         if self.kvduo_config is not None and not self.enable_kvduo:
