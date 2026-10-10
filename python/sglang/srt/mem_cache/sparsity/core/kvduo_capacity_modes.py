@@ -1,27 +1,26 @@
-"""Request-atomic elasticity recovery with a protected prefill space plan."""
+"""Object-level elasticity recovery with a protected prefill space plan."""
 
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class KVDuoRecoveryRequest:
-    key: tuple[int, int]
+class KVDuoRecoveryObject:
+    key: tuple[int, int, int]
     order: int
-    quantum: int
     ready: bool
 
 
-def plan_kvduo_recovery(requests, available_pages, prefill_pages):
-    """FIFO recovery; skip protected requests, stop at a safe request that cannot fit."""
+def plan_kvduo_recovery(objects, available_pages, prefill_pages):
+    """FIFO recovery of ready objects, reserving one page for each."""
     remaining = available_pages - prefill_pages
     if remaining < 0:
         return ()
     selected = []
-    for request in sorted(requests, key=lambda r: (r.order, r.key)):
-        if not request.ready:
+    for obj in sorted(objects, key=lambda o: (o.order, o.key[1], o.key[0], o.key[2])):
+        if not obj.ready:
             continue
-        if request.quantum > remaining:
+        if remaining < 1:
             break
-        selected.append(request.key)
-        remaining -= request.quantum
+        selected.append(obj.key)
+        remaining -= 1
     return tuple(selected)
