@@ -2,6 +2,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
+
 #include <type_traits>
 #ifdef USE_ROCM
 #include <hipcub/hipcub.hpp>
@@ -16,6 +17,14 @@ namespace {
 struct KVDuoRollbackStrides {
   int64_t layer;
   int64_t request;
+};
+
+struct KVDuoRollbackStats {
+  float* capacity_ema = nullptr;
+  int64_t* capacity_steps = nullptr;
+  int32_t* growth_events = nullptr;
+  float* prefill_ema = nullptr;
+  int64_t* prefill_steps = nullptr;
 };
 
 template <int CAPACITY>
@@ -33,7 +42,8 @@ __global__ void kvduo_prefill_rollback_kernel(
     int64_t padded_capacity,
     KVDuoRollbackStrides token_strides,
     KVDuoRollbackStrides location_strides,
-    KVDuoRollbackStrides lru_strides) {
+    KVDuoRollbackStrides lru_strides,
+    KVDuoRollbackStats stats) {
   constexpr int ITEMS = (CAPACITY + BLOCK_SIZE - 1) / BLOCK_SIZE;
   using SlotT = KVDuoRollbackSlot<CAPACITY>;
   using Scan = rollback_cub::BlockScan<int, BLOCK_SIZE>;
@@ -72,6 +82,15 @@ __global__ void kvduo_prefill_rollback_kernel(
     tokens[slot] = -1;
     locations[slot] = -1;
   }
+  if (stats.capacity_ema != nullptr) {
+    if (tid < 9) stats.capacity_ema[owner * 9 + tid] = 0;
+    if (tid < 2) stats.prefill_ema[owner * 2 + tid] = 0;
+    if (tid == 0) {
+      stats.capacity_steps[owner] = 0;
+      stats.growth_events[owner] = 0;
+      stats.prefill_steps[owner] = 0;
+    }
+  }
   __syncthreads();
   if (tid == 0) capacities[owner] = target;
 }
@@ -83,7 +102,12 @@ void kvduo_prefill_rollback(
     tvm::ffi::TensorView tokens,
     tvm::ffi::TensorView locations,
     tvm::ffi::TensorView lru,
-    tvm::ffi::TensorView capacities) {
+    tvm::ffi::TensorView capacities,
+    tvm::ffi::Optional<tvm::ffi::TensorView> capacity_ema,
+    tvm::ffi::Optional<tvm::ffi::TensorView> capacity_steps,
+    tvm::ffi::Optional<tvm::ffi::TensorView> growth_events,
+    tvm::ffi::Optional<tvm::ffi::TensorView> prefill_ema,
+    tvm::ffi::Optional<tvm::ffi::TensorView> prefill_steps) {
   using namespace host;
   using SlotT = KVDuoRollbackSlot<CAPACITY>;
   auto n = SymbolicSize{"objects"};
@@ -102,6 +126,28 @@ void kvduo_prefill_rollback(
   TensorMatcher({layers, requests, CAPACITY}).with_dtype<SlotT>().with_device(device).verify(lru);
   TensorMatcher({layers, requests}).with_dtype<int32_t>().with_device(device).verify(capacities);
   RuntimeCheck(padded_capacity.unwrap() >= CAPACITY, "Padded metadata cannot be smaller than LRU capacity");
+  const bool reset = capacity_ema.has_value();
+  RuntimeCheck(
+      reset == capacity_steps.has_value() && reset == growth_events.has_value() && reset == prefill_ema.has_value() &&
+          reset == prefill_steps.has_value(),
+      "Rollback statistics must be supplied together");
+  KVDuoRollbackStats stats;
+  if (reset) {
+    TensorMatcher({layers, requests, 9}).with_dtype<float>().with_device(device).verify(capacity_ema.value());
+    TensorMatcher({layers, requests})
+        .with_dtype<int64_t>()
+        .with_device(device)
+        .verify(capacity_steps.value())
+        .verify(prefill_steps.value());
+    TensorMatcher({layers, requests}).with_dtype<int32_t>().with_device(device).verify(growth_events.value());
+    TensorMatcher({layers, requests, 2}).with_dtype<float>().with_device(device).verify(prefill_ema.value());
+    stats = KVDuoRollbackStats{
+        static_cast<float*>(capacity_ema.value().data_ptr()),
+        static_cast<int64_t*>(capacity_steps.value().data_ptr()),
+        static_cast<int32_t*>(growth_events.value().data_ptr()),
+        static_cast<float*>(prefill_ema.value().data_ptr()),
+        static_cast<int64_t*>(prefill_steps.value().data_ptr())};
+  }
   LaunchKernel(n.unwrap(), BLOCK_SIZE, device.unwrap())(
       kvduo_prefill_rollback_kernel<CAPACITY, BLOCK_SIZE>,
       static_cast<const int64_t*>(owners.data_ptr()),
@@ -114,7 +160,8 @@ void kvduo_prefill_rollback(
       padded_capacity.unwrap(),
       KVDuoRollbackStrides{tokens.stride(0), tokens.stride(1)},
       KVDuoRollbackStrides{locations.stride(0), locations.stride(1)},
-      KVDuoRollbackStrides{lru.stride(0), lru.stride(1)});
+      KVDuoRollbackStrides{lru.stride(0), lru.stride(1)},
+      stats);
 }
 
 }  // namespace

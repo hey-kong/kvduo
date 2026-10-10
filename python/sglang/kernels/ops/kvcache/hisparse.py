@@ -558,10 +558,50 @@ def rollback_kvduo_hot_metadata(
     locations: torch.Tensor,
     lru: torch.Tensor,
     capacities: torch.Tensor,
+    capacity_ema: torch.Tensor | None = None,
+    capacity_steps: torch.Tensor | None = None,
+    growth_events: torch.Tensor | None = None,
+    prefill_ema: torch.Tensor | None = None,
+    prefill_steps: torch.Tensor | None = None,
 ) -> None:
-    """One batched metadata launch; no KV payload is read or moved."""
+    """Batch metadata compaction and optional statistics reset without moving KV."""
     if owners.numel() == 0:
         return
+    statistics = (
+        capacity_ema,
+        capacity_steps,
+        growth_events,
+        prefill_ema,
+        prefill_steps,
+    )
+    reset_stats = any(bank is not None for bank in statistics)
+    if reset_stats:
+        shapes = (
+            (*capacities.shape, 9),
+            capacities.shape,
+            capacities.shape,
+            (*capacities.shape, 2),
+            capacities.shape,
+        )
+        dtypes = (
+            torch.float32,
+            torch.int64,
+            torch.int32,
+            torch.float32,
+            torch.int64,
+        )
+        for bank, shape, dtype in zip(statistics, shapes, dtypes):
+            if (
+                bank is None
+                or bank.shape != shape
+                or bank.dtype != dtype
+                or bank.device != capacities.device
+                or not bank.is_contiguous()
+            ):
+                raise ValueError(
+                    "Rollback statistics must be supplied together with matching "
+                    "shapes, dtypes, devices and contiguous layout"
+                )
     if not tokens.is_cuda:
         # CPU reference also exercises publication/free ordering in unit tests.
         for (layer, req), target in zip(owners.tolist(), targets.tolist()):
@@ -572,6 +612,9 @@ def rollback_kvduo_hot_metadata(
             lru[layer, req, target:] = -1
             tokens[layer, req, target:] = -1
             locations[layer, req, target:] = -1
+            if reset_stats:
+                for bank in statistics:
+                    bank[layer, req] = 0
             capacities[layer, req] = target
         return
     assert owners.dtype == torch.int64 and owners.is_contiguous()
@@ -593,4 +636,5 @@ def rollback_kvduo_hot_metadata(
         locations,
         lru,
         capacities,
+        *statistics,
     )
