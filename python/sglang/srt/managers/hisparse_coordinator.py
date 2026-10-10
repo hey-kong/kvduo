@@ -1397,6 +1397,10 @@ class HiSparseCoordinator:
         """
         if not self.enable_mixed_residency:
             return self._reclaim_for_physical_allocation(0)
+        self.wait_for_pending_backup()
+        self._backup_kvduo_decode_full_pages(requests)
+        self.wait_for_pending_backup()
+        self._evict_kvduo_decode_full_pages()
         pages = 0
         if self.is_dsv4_hisparse:
             page = self.page_size
@@ -1474,11 +1478,12 @@ class HiSparseCoordinator:
             # Staging materializes the complete prefill range. Appending to an
             # incomplete final page will lower this boundary to its page start.
             self._kvduo_host_valid_len[req.req_pool_idx] = compressed_len
-            # Until the first demotion, decode can extend the complete prefix.
-            # An initial prefill-length cap would discard those complete pages
-            # at finish. Clear a previous incarnation's first-hole marker.
-            if hasattr(req, "kvduo_radix_insert_len"):
-                del req.kvduo_radix_insert_len
+            req.kvduo_decode_full_start = (
+                (compressed_len + self.page_size - 1) // self.page_size * self.page_size
+            )
+            req.kvduo_radix_insert_len = (
+                compressed_len // self.page_size * self.page_size * self.compress_ratio
+            )
 
             # A fully-resident KVDuo request does not own a speculative hot
             # buffer. The first FULL demotion schedules the whole-page minimum
@@ -2000,6 +2005,8 @@ class HiSparseCoordinator:
             device_module.current_stream(self.device).wait_stream(
                 self.decode_producer_stream
             )
+        self.wait_for_pending_backup()
+        self._evict_kvduo_decode_full_pages()
         self.kvduo_observe.fill_(1)
         tracked_pending_minimum = getattr(self, "_kvduo_pending_hot_minimum", None)
         pending_minimum = tracked_pending_minimum
@@ -2450,6 +2457,7 @@ class HiSparseCoordinator:
         self._kvduo_prefill_lifecycle = {}
         self._kvduo_prefill_generation = 0
         self._kvduo_full_conversion_pending = {}
+        self._kvduo_decode_full_pending = {}
         self._kvduo_prefill_hot_commitments = {}
         self._kvduo_prefill_reservation_requests = {}
         self._kvduo_prefill_associations = {}
@@ -2504,6 +2512,9 @@ class HiSparseCoordinator:
             for owner in list(records):
                 if owner[1] == req_idx:
                     del records[owner]
+        for key in list(self._kvduo_decode_full_pending):
+            if key[0][0] == req_idx:
+                del self._kvduo_decode_full_pending[key]
         for key in list(self._kvduo_prefill_budget_reference):
             if key[1] == req_idx:
                 del self._kvduo_prefill_budget_reference[key]
@@ -3354,6 +3365,27 @@ class HiSparseCoordinator:
             reserved_buffer_loc
         )
 
+    def _backup_kvduo_decode_full_pages(self, requests) -> None:
+        page_jobs = []
+        for req in requests:
+            req_idx = getattr(req, "req_pool_idx", None)
+            if self._active_kvduo_reqs.get(req_idx) is not req:
+                continue
+            if getattr(req, "hisparse_staging", False):
+                continue
+            next_len = req.kv_committed_len + 1
+            if self.is_dsv4_hisparse and next_len % self.compress_ratio != 0:
+                continue
+            end = self.host_token_len(req.kv_committed_len)
+            start = end - self.page_size
+            if (
+                end % self.page_size == 0
+                and start >= req.kvduo_decode_full_start
+                and self._kvduo_host_valid_len[req_idx] < end
+            ):
+                page_jobs.append((req_idx, start, end))
+        self._backup_kvduo_page_jobs(page_jobs)
+
     def _backup_kvduo_sealed_pages(
         self,
         seq_lens: torch.Tensor,
@@ -3388,6 +3420,9 @@ class HiSparseCoordinator:
                 continue
             page_jobs.append((req_idx, sealed_start, sealed_end))
 
+        self._backup_kvduo_page_jobs(page_jobs)
+
+    def _backup_kvduo_page_jobs(self, page_jobs) -> None:
         if not page_jobs:
             return
         self.wait_for_pending_backup()
@@ -3433,7 +3468,7 @@ class HiSparseCoordinator:
             if device_locs.is_cuda:
                 device_locs.record_stream(self.decode_backup_stream)
         self._pending_kvduo_host_valid.extend(
-            (req_idx, end, logical, versions)
+            (req_idx, end, logical, versions, self._kvduo_request_key(req_idx))
             for (req_idx, _, end), logical, versions in zip(
                 page_jobs,
                 logical_locs.split(self.page_size),
@@ -3541,14 +3576,101 @@ class HiSparseCoordinator:
                 valid_len,
                 logical,
                 copied_versions,
+                generation,
             ) in self._pending_kvduo_host_valid:
+                if generation != self._kvduo_request_key(req_idx):
+                    continue
                 # Publish the captured version, not whatever version is current
                 # when the asynchronous transfer completes.
                 self.full_host_version[logical] = copied_versions
                 self._kvduo_host_valid_len[req_idx] = max(
                     self._kvduo_host_valid_len[req_idx], valid_len
                 )
+                req = self._active_kvduo_reqs.get(req_idx)
+                start = valid_len - logical.numel()
+                if req is not None and start >= req.kvduo_decode_full_start:
+                    self._kvduo_decode_full_pending[generation, start] = logical
             self._pending_kvduo_host_valid.clear()
+
+    def _evict_kvduo_decode_full_pages(self) -> int:
+        if not self.enable_mixed_residency or not self._kvduo_decode_full_pending:
+            return 0
+        if self.decode_producer_stream is not None:
+            device_module.current_stream(self.device).wait_stream(
+                self.decode_producer_stream
+            )
+        candidates = []
+        for key, logical in tuple(self._kvduo_decode_full_pending.items()):
+            generation, start = key
+            req_idx = generation[0]
+            req = self._active_kvduo_reqs.get(req_idx)
+            if req is None or generation != self._kvduo_request_key(req_idx):
+                del self._kvduo_decode_full_pending[key]
+                continue
+            if getattr(req, "hisparse_staging", False) or (
+                callable(getattr(req, "finished", None)) and req.finished()
+            ):
+                continue
+            if start < req.kvduo_decode_full_start:
+                del self._kvduo_decode_full_pending[key]
+                continue
+            candidates.append((key, logical))
+        if not candidates:
+            return 0
+        logical_pages = torch.stack([logical for _, logical in candidates])
+        mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
+        physical_pages = mapping[logical_pages]
+        resident = torch.all(physical_pages > 0, dim=1)
+        valid = resident & torch.all(
+            self.full_host_version[logical_pages]
+            == self.full_data_version[logical_pages],
+            dim=1,
+        )
+        protected = self._kvduo_pressure_protected
+        if protected is not None:
+            valid &= ~torch.any(torch.isin(logical_pages, protected), dim=1)
+        summaries = torch.stack(
+            [torch.all(physical_pages == 0, dim=1), valid], dim=1
+        ).cpu()
+        selected = []
+        cleared = []
+        for i, (key, _) in enumerate(candidates):
+            if summaries[i, 0]:
+                cleared.append(i)
+            elif summaries[i, 1]:
+                selected.append(i)
+        if not self._kvduo_consensus(
+            (
+                tuple(candidates[i][0] for i in cleared),
+                tuple(candidates[i][0] for i in selected),
+            )
+        ):
+            return 0
+        for i in cleared:
+            self._kvduo_decode_full_pending.pop(candidates[i][0], None)
+        if not selected:
+            return 0
+        indices = torch.tensor(selected, dtype=torch.int64, device=self.device)
+        released = physical_pages[indices].flatten()
+        mapping[logical_pages[indices].flatten()] = 0
+        for i in selected:
+            generation, start = candidates[i][0]
+            req_idx = generation[0]
+            req = self._active_kvduo_reqs[req_idx]
+            req.kvduo_mixed_residency = True
+            req.kvduo_radix_insert_len = min(
+                req.kvduo_radix_insert_len, start * self.compress_ratio
+            )
+            self._mixed_slots[req_idx] = True
+            self._kvduo_pending_hot_minimum.add(req_idx)
+        if released.is_cuda:
+            published = device_module.Event()
+            published.record(device_module.current_stream(self.device))
+            published.synchronize()
+        self.token_to_kv_pool_allocator.free_hisparse_indices(released)
+        for i in selected:
+            self._kvduo_decode_full_pending.pop(candidates[i][0], None)
+        return released.numel()
 
     def _publish_kvduo_model_write(self, logical_locs: torch.Tensor) -> None:
         """Publish a newly generated KV identity in the unified address space."""
@@ -3757,8 +3879,8 @@ class HiSparseCoordinator:
             allocated_locs
         )
         is_mixed = self.enable_mixed_residency and self._mixed_slots[req.req_pool_idx]
-        if is_mixed:
-            req.kvduo_mixed_residency = True
+        if self.enable_mixed_residency:
+            req.kvduo_mixed_residency = is_mixed
             # RadixCache cannot represent host-only holes. Free every surviving
             # request-owned fragment beyond kvduo_radix_insert_len; the cache
             # implementations retain only the already-contiguous full prefix.
@@ -3787,14 +3909,6 @@ class HiSparseCoordinator:
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 compressed_locs
             ] = 0
-        elif self.req_reserved_logical[req.req_pool_idx] >= 0:
-            # A decode append slot is transient, not a sealed full page. Keep
-            # the prefill full mappings for Radix insertion, but invalidate the
-            # final append owner before its private buffer is returned.
-            self.mem_pool_device.full_to_hisparse_device_index_mapping[
-                self.req_reserved_logical[req.req_pool_idx]
-            ] = 0
-
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
             req.req_pool_idx,
