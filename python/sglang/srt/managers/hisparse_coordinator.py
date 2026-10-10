@@ -15,6 +15,10 @@ from sglang.kernels.ops.kvcache.hisparse import (
     rollback_kvduo_hot_metadata,
     transfer_cache_dsv4_mla,
 )
+from sglang.kernels.ops.kvcache.kvduo_full_reclaim import (
+    select_kvduo_full_pages,
+    summarize_kvduo_full_pages,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -980,7 +984,8 @@ class HiSparseCoordinator:
         if not self.enable_mixed_residency:
             return 0
         owner = (req.rid, req.req_pool_idx)
-        attached = 0
+        records = []
+        locations = []
         fill_ids = req.get_fill_ids()
         for ordinal in range(host_len // self.page_size):
             identities = self._host_prefix_identities(req, ordinal, fill_ids)
@@ -989,16 +994,17 @@ class HiSparseCoordinator:
             if record is None or not record.fully_valid:
                 break
             identities[ordinal] = record.identity
-            locations = record.host_locations["main_kv"]
-            start = ordinal * self.page_size
-            self.req_to_host_pool[req.req_pool_idx, start : start + self.page_size] = (
-                torch.tensor(locations, dtype=torch.int64, device=self.device)
+            locations.extend(record.host_locations["main_kv"])
+            records.append(identity)
+        attached = len(locations)
+        if attached:
+            self.req_to_host_pool[req.req_pool_idx, :attached] = torch.tensor(
+                locations, dtype=torch.int64, device=self.device
             )
-            self.host_prefix_cache.acquire(
-                identity, owner, int(self.full_touch_clock[0])
-            )
-            self._req_host_prefix_records[req.req_pool_idx].add(identity)
-            attached += self.page_size
+            clock = int(self.full_touch_clock[0])
+            for identity in records:
+                self.host_prefix_cache.acquire(identity, owner, clock)
+                self._req_host_prefix_records[req.req_pool_idx].add(identity)
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = attached
         return attached
 
@@ -1048,9 +1054,15 @@ class HiSparseCoordinator:
             self.req_to_full_lookup[req.req_pool_idx, :valid_len]
         ]
         # One compact transfer, not one synchronization per page.
-        host_locs_cpu = host_locs.cpu().tolist()
-        versions_cpu = versions.cpu().tolist()
-        touches_cpu = touches.cpu().tolist()
+        summary = (
+            torch.cat((host_locs, versions, touches, self.full_touch_clock[:1]))
+            .cpu()
+            .tolist()
+        )
+        host_locs_cpu = summary[:valid_len]
+        versions_cpu = summary[valid_len : 2 * valid_len]
+        touches_cpu = summary[2 * valid_len : 3 * valid_len]
+        clock = summary[-1]
         retained = set()
         fill_ids = req.get_fill_ids()
         for ordinal, start in enumerate(range(0, valid_len, self.page_size)):
@@ -1069,7 +1081,7 @@ class HiSparseCoordinator:
                     host_versions={"main_kv": version},
                     model_touches={"main_kv": touch},
                     cache_reference=True,
-                    last_access=int(self.full_touch_clock[0]),
+                    last_access=clock,
                     tie_break_key=(ordinal, identity.stable_sort_digest),
                 )
                 self.host_prefix_cache.insert(record)
@@ -3772,7 +3784,7 @@ class HiSparseCoordinator:
         self.wait_for_pending_backup()
         candidate_pages = []
         candidate_meta = []
-        for req_idx, req in tuple(self._active_kvduo_reqs.items()):
+        for req_idx, req in sorted(self._active_kvduo_reqs.items()):
             if request_indices is not None and req_idx not in request_indices:
                 continue
             if getattr(req, "hisparse_staging", False) or (
@@ -3810,42 +3822,22 @@ class HiSparseCoordinator:
             self._kvduo_consensus(())
             return 0
         logical_pages = torch.cat(candidate_pages, dim=0)
-        physical_pages = self.mem_pool_device.full_to_hisparse_device_index_mapping[
-            logical_pages
-        ]
-        valid = torch.all(physical_pages > 0, dim=1)
-        pressure_protected = getattr(self, "_kvduo_pressure_protected", None)
-        if pressure_protected is not None:
-            valid &= ~torch.any(torch.isin(logical_pages, pressure_protected), dim=1)
-        host_current = torch.all(
-            self.full_host_version[logical_pages]
-            == self.full_data_version[logical_pages],
-            dim=1,
-        )
-        valid &= host_current
-        page_touch = torch.max(self.full_last_touch[logical_pages], dim=1).values
-        # Pressure handling is a control-plane barrier. Transfer the compact
-        # page summaries once, never one synchronization per candidate page.
-        summaries = torch.stack([page_touch, valid.to(torch.int64)], dim=1).cpu()
-        order = sorted(
-            (i for i in range(len(candidate_meta)) if summaries[i, 1]),
-            key=lambda i: (
-                int(summaries[i, 0]),
-                candidate_meta[i][0],
-                candidate_meta[i][1],
-            ),
+        physical_pages, page_touch, valid = summarize_kvduo_full_pages(
+            logical_pages,
+            self.mem_pool_device.full_to_hisparse_device_index_mapping,
+            self.full_data_version,
+            self.full_host_version,
+            self.full_last_touch,
+            getattr(self, "_kvduo_pressure_protected", None),
         )
 
         minimum_costs = {}
+        owners = sorted({req_idx for req_idx, _ in candidate_meta})
         if reserve_hot_minimum:
             # The first FULL demotion needs minimum HOT capacity in EVERY
             # logical layer. An allocation cannot count these as free space,
             # or make a fully resident request mixed without room to execute.
-            counts = {}
-            for i in order:
-                req_idx = candidate_meta[i][0]
-                counts[req_idx] = counts.get(req_idx, 0) + 1
-            for req_idx in counts:
+            for req_idx in owners:
                 minimum_costs[req_idx] = (
                     0
                     if req_idx in self._kvduo_pending_hot_minimum
@@ -3859,26 +3851,15 @@ class HiSparseCoordinator:
                         for layer in range(self.mem_pool_device.layer_num)
                     )
                 )
-            # Reclaiming these owners cannot produce net usable capacity.
-            order = [
-                i
-                for i in order
-                if counts[candidate_meta[i][0]] > minimum_costs[candidate_meta[i][0]]
-            ]
-
-        reclaimed = 0
-        charged = set()
-        minimum_slots = 0
-        selected = []
-        for i in order:
-            if not release_all and reclaimed - minimum_slots >= num_tokens:
-                break
-            selected.append(i)
-            reclaimed += self.page_size
-            req_idx = candidate_meta[i][0]
-            if req_idx not in charged:
-                minimum_slots += minimum_costs.get(req_idx, 0) * self.page_size
-                charged.add(req_idx)
+        owner_indices = {req_idx: i for i, req_idx in enumerate(owners)}
+        selected = select_kvduo_full_pages(
+            page_touch,
+            valid,
+            [owner_indices[req_idx] for req_idx, _ in candidate_meta],
+            [minimum_costs.get(req_idx, 0) for req_idx in owners],
+            (num_tokens + self.page_size - 1) // self.page_size,
+            release_all=release_all,
+        )
 
         if (
             not self._kvduo_consensus(tuple(candidate_meta[i] for i in selected))
@@ -3908,7 +3889,7 @@ class HiSparseCoordinator:
         self.token_to_kv_pool_allocator.free_hisparse_indices(
             selected_physical.flatten()
         )
-        return reclaimed
+        return len(selected) * self.page_size
 
     def swap_in_selected_pages(
         self,

@@ -1349,6 +1349,183 @@ def test_kvduo_ema_decays_on_valid_zero_counts_and_marks_reuse_after_h2d():
     assert kwargs["prefill_steps"].item() == 2
 
 
+@pytest.mark.parametrize("kind", ["valid", "invalid", "failed", "padding", "capture"])
+def test_mixed_full_only_resolver_keeps_hot_metadata_and_observation_rules(kind):
+    kwargs = _kvduo_observation_case(selected=(1, 2))
+    kwargs["full_to_device_loc"][[1, 2]] = torch.tensor([12, 13], device=DEVICE)
+    kwargs["capacity_ema"].fill_(64)
+    kwargs["capacity_steps"].fill_(65)
+    kwargs["prefill_ema"][0] = torch.tensor([8, 16], device=DEVICE)
+    kwargs["prefill_steps"].fill_(67)
+    kwargs["hot_growth_events"].fill_(1)
+    kwargs["touch_clock"].fill_(7)
+    expected_accesses = 2
+    if kind == "invalid":
+        kwargs["top_k_tokens"].fill_(-1)
+        expected_accesses = 0
+    elif kind == "failed":
+        kwargs["req_to_logical_token"][0, 2] = -1
+        expected_accesses = 1
+    elif kind == "padding":
+        kwargs["num_real_reqs"].zero_()
+        expected_accesses = 0
+    elif kind == "capture":
+        kwargs["observe_cache"].zero_()
+    hot_banks = [
+        kwargs[key]
+        for key in ("device_buffer_tokens", "device_buffer_locs", "lru_slots")
+    ]
+    originals = [bank.clone() for bank in hot_banks]
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+    assert all(torch.equal(bank, saved) for bank, saved in zip(hot_banks, originals))
+    assert kwargs["resolver_stats"].tolist() == [[0, expected_accesses]]
+    observed = kind == "valid"
+    assert kwargs["capacity_steps"].item() == 65 + observed
+    assert kwargs["prefill_steps"].item() == 67 + observed
+    expected_capacity = [63] * 9 if observed else [64] * 9
+    assert kwargs["capacity_ema"].tolist() == [expected_capacity]
+    assert kwargs["prefill_ema"].tolist() == [
+        [8 * (63 / 64 if observed else 1), 16 * (63 / 64 if observed else 1)]
+    ]
+    assert kwargs["hot_growth_events"].item() == int(kind in {"padding", "capture"})
+    if kind in {"valid", "capture"}:
+        assert kwargs["top_k_device_locs"].tolist() == [[12, 13]]
+        assert kwargs["full_last_touch"][[1, 2]].tolist() == [7, 7]
+    elif kind == "failed":
+        assert kwargs["top_k_device_locs"].tolist() == [[12, -1]]
+        assert kwargs["swap_status"].item() == 1
+    else:
+        assert kwargs["top_k_device_locs"].tolist() == [[-1, -1]]
+
+
+def test_mixed_full_fast_path_graph_switches_to_hot_and_h2d_without_recapture():
+    kwargs = _kvduo_observation_case(selected=(1, 2))
+    kwargs["full_to_device_loc"][[1, 2]] = torch.tensor([12, 13], device=DEVICE)
+    full_payload = kwargs["device_buffer"][12].clone()
+    banks = [value for value in kwargs.values() if isinstance(value, torch.Tensor)]
+    addresses = [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+    kwargs["observe_cache"].zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        load_cache_to_device_buffer_mla(**kwargs)
+    kwargs["observe_cache"].fill_(1)
+    kwargs["capacity_ema"].zero_()
+    kwargs["capacity_steps"].zero_()
+    kwargs["prefill_ema"].zero_()
+    kwargs["prefill_steps"].zero_()
+    kwargs["full_to_device_loc"][2] = 0
+    graph.replay()
+    torch.cuda.synchronize()
+    assert kwargs["top_k_device_locs"].tolist() == [[12, 1]]
+    assert kwargs["prefill_ema"].tolist() == [[1, 0]]
+    kwargs["top_k_tokens"][0, 1] = 6
+    graph.replay()
+    torch.cuda.synchronize()
+    h2d_location = kwargs["top_k_device_locs"][0, 1].item()
+    assert torch.equal(
+        kwargs["device_buffer"][h2d_location].cpu(), kwargs["host_cache"][6]
+    )
+    assert kwargs["hot_growth_events"].item() == 0  # Already at maximum capacity.
+    old_lru = kwargs["lru_slots"].clone()
+    old_capacity_ema = kwargs["capacity_ema"].clone()
+    old_prefill_ema = kwargs["prefill_ema"].clone()
+    kwargs["full_to_device_loc"][6] = 14
+    graph.replay()
+    torch.cuda.synchronize()
+    assert kwargs["top_k_device_locs"].tolist() == [[12, 14]]
+    assert torch.equal(kwargs["lru_slots"], old_lru)
+    assert torch.equal(kwargs["capacity_ema"], old_capacity_ema * (63 / 64))
+    assert torch.equal(kwargs["prefill_ema"], old_prefill_ema * (63 / 64))
+    assert kwargs["capacity_steps"].item() == kwargs["prefill_steps"].item() == 3
+    assert torch.equal(kwargs["device_buffer"][12], full_payload)
+    assert addresses == [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
+
+
+@pytest.mark.parametrize("needed", [1, 129, 521])
+@pytest.mark.parametrize("costs", [[0, 0, 0, 0], [4, 7, 2, 9]])
+@pytest.mark.parametrize("release_all", [False, True])
+def test_full_reclaim_gpu_selection_scans_multiple_tiles_and_charges_interleaved_owners(
+    needed, costs, release_all
+):
+    from sglang.kernels.ops.kvcache.kvduo_full_reclaim import select_kvduo_full_pages
+
+    generator = torch.Generator().manual_seed(782)
+    owners = [0] * 130 + [1] * 131 + [2] * 128 + [3] * 132
+    scores = torch.randint(0, 20, (len(owners),), generator=generator)
+    valid = (torch.rand(len(owners), generator=generator) > 0.2).int()
+    scores[-2:] = torch.iinfo(torch.int64).max
+    valid[-2:] = torch.tensor([0, 1])
+    expected = select_kvduo_full_pages(
+        scores, valid, owners, costs, needed, release_all=release_all
+    )
+    assert (
+        select_kvduo_full_pages(
+            scores.to(DEVICE),
+            valid.to(DEVICE),
+            owners,
+            costs,
+            needed,
+            release_all=release_all,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("page_size", [1, 64, 129])
+@pytest.mark.parametrize("release_all", [False, True])
+def test_full_reclaim_gpu_summary_and_selection_match_cpu_with_multiple_requests(
+    page_size, release_all
+):
+    from sglang.kernels.ops.kvcache.kvduo_full_reclaim import (
+        select_kvduo_full_pages,
+        summarize_kvduo_full_pages,
+    )
+
+    pages = torch.arange(12 * page_size).view(12, page_size)
+    mapping = pages.flatten().clone() + 10
+    versions = torch.ones_like(mapping)
+    host_versions = versions.clone()
+    mapping[page_size] = 0
+    host_versions[3 * page_size] = 0
+    touches = torch.arange(page_size).repeat(12)
+    touches[5 * page_size : 6 * page_size] = torch.iinfo(torch.int64).max
+    protected = torch.tensor([9 * page_size])
+    cpu = summarize_kvduo_full_pages(
+        pages, mapping, versions, host_versions, touches, protected
+    )
+    gpu = summarize_kvduo_full_pages(
+        *(
+            bank.to(DEVICE)
+            for bank in (pages, mapping, versions, host_versions, touches, protected)
+        )
+    )
+    assert all(
+        torch.equal(actual.cpu(), expected) for actual, expected in zip(gpu, cpu)
+    )
+    owners, costs = [0] * 4 + [1] * 4 + [2] * 4, [1, 2, 1]
+    expected = select_kvduo_full_pages(
+        cpu[1], cpu[2], owners, costs, 2, release_all=release_all
+    )
+    assert (
+        select_kvduo_full_pages(
+            gpu[1], gpu[2], owners, costs, 2, release_all=release_all
+        )
+        == expected
+    )
+    pages[0, 0] = -1
+    pages[-1, -1] = mapping.numel()
+    _, _, valid = summarize_kvduo_full_pages(
+        *(
+            bank.to(DEVICE)
+            for bank in (pages, mapping, versions, host_versions, touches)
+        )
+    )
+    assert valid[[0, -1]].tolist() == [0, 0]
+
+
 def _generic_kvduo_stack(monkeypatch):
     if is_hip():
         pytest.skip("Actual DSA pool fixture uses CUDA's 64-token page layout")
@@ -1593,8 +1770,9 @@ def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru
 
 @pytest.mark.parametrize("active_capacity", [0, 78 * 64, 8 * 78 * 64])
 @pytest.mark.parametrize("global_scratch", [True, False])
+@pytest.mark.parametrize("full_only", [True, False])
 def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_scratch(
-    active_capacity, global_scratch
+    active_capacity, global_scratch, full_only
 ):
     # Exact configuration from the resource regression: 210712 bytes at
     # compile-time max capacity, even when only one HOT page is currently live.
@@ -1627,7 +1805,7 @@ def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_sc
     )
     full_mapping = torch.zeros(requests * topk + 1, dtype=torch.int64, device=DEVICE)
     expected = host[:, 0, 0].reshape(requests, topk).to(DEVICE)
-    if active_capacity == 0:
+    if active_capacity == 0 or full_only:
         full_mapping[1:] = full_offset + logical.flatten()
         device[full_mapping[1:]] = host.to(DEVICE)
     else:
@@ -1691,8 +1869,8 @@ def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_sc
     output = kwargs["top_k_device_locs"]
     assert torch.equal(device[output[:2].long(), 0, 0], expected.flip(0))
     assert torch.all(output[2] == -1)
-    extra_hits = int(active_capacity > base)
-    misses = topk - 2 if active_capacity else 0
+    extra_hits = int(active_capacity > base and not full_only)
+    misses = topk - 2 if active_capacity and not full_only else 0
     assert kwargs["prefill_ema"].tolist() == [[extra_hits, misses]] * requests
     if scratch is not None:
         assert torch.all(scratch[:, words:] == 7)
