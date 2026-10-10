@@ -13,8 +13,6 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
     coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
     coordinator.enable_mixed_residency = True
     coordinator.decode_producer_stream = None
-    coordinator._has_pending_backup = False
-    coordinator._pending_kvduo_host_valid = []
     coordinator.device = "cpu"
     coordinator.page_size = 2
     coordinator.hot_storage_layers = 2

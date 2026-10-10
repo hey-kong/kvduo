@@ -30,6 +30,8 @@ def make_decode_coordinator(monkeypatch, *, ratio=1, mixed=False, prefill=4):
     physical.free_pages = 64
     physical.next_page = count + c.page_size
     c.reclaim_kvduo_full_pages = MagicMock(wraps=c.reclaim_kvduo_full_pages)
+    c._has_pending_backup = False
+    c._pending_kvduo_host_valid = []
     c.decode_producer_stream = MagicMock()
     c.decode_backup_stream = MagicMock()
     c._backup_done_event = MagicMock()
@@ -79,7 +81,7 @@ def append(c, req, compressed_len):
 
 @pytest.mark.parametrize("ratio", [1, 4])
 @pytest.mark.parametrize("mixed", [False, True])
-def test_sealed_decode_full_pages_are_backed_up_and_evicted_without_pressure(
+def test_decode_full_pages_remain_resident_until_request_finish(
     monkeypatch, ratio, mixed
 ):
     c, physical, req, payload, host_payload, current = make_decode_coordinator(
@@ -87,185 +89,58 @@ def test_sealed_decode_full_pages_are_backed_up_and_evicted_without_pressure(
     )
     mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
     original = mapping.clone()
-    host_indices = c.req_to_host_pool.clone()
     free_before = physical.free_pages
-    for length in (5, 6, 7):
+    for length in range(5, 10):
         append(c, req, length)
-    assert c._has_pending_backup
+        c.ensure_kvduo_decode_capacity([req])
+        c.prepare_kvduo_graph_replay(torch.tensor([0]))
+    c.wait_for_pending_backup()
     assert torch.equal(mapping, original)
-    c.prepare_kvduo_graph_replay(torch.tensor([0]))
-    assert mapping[:4].tolist() == original[:4].tolist()
-    assert mapping[4:6].tolist() == [0, 0]
-    assert mapping[6:].tolist() == original[6:].tolist()
-    assert torch.equal(host_payload[:, 4:6], payload[:, original[4:6]])
-    assert c.req_to_host_pool[0, :4].tolist() == host_indices[0, :4].tolist()
-    assert c.req_to_host_pool[0, 4:6].tolist() == [4, 5]
-    assert c.req_to_full_lookup[0, :7].tolist() == list(range(7))
-    assert c.full_host_version[4:6].tolist() == c.full_data_version[4:6].tolist()
-    assert req.kvduo_mixed_residency
-    assert c.kvduo_req_hot_capacity[:, 0].tolist() == [4, 4, 4]
-    assert physical.free_pages == free_before + 1 - (0 if mixed else 3)
-    c.token_to_kv_pool_allocator.free_hisparse_indices.assert_called_once()
-    assert (
-        c.token_to_kv_pool_allocator.free_hisparse_indices.call_args.args[0].tolist()
-        == original[4:6].tolist()
-    )
-    c._backup_done_event.wait.assert_called_once_with(current)
-    current.wait_stream.assert_called_with(c.decode_producer_stream)
+    assert torch.equal(host_payload[:, 4:8], payload[:, original[4:8]])
+    assert physical.free_pages == free_before
+    assert c._mixed_slots[0] is mixed
+    expected = [4, 4, 4] if mixed else [0, 0, 0]
+    assert c.kvduo_req_hot_capacity[:, 0].tolist() == expected
+    c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
     c.reclaim_kvduo_full_pages.assert_not_called()
-    assert not c._kvduo_decode_full_pending
-    lru = c.lru_slots.clone()
-    for length in (8, 9):
-        append(c, req, length)
-    c.prepare_kvduo_graph_replay(torch.tensor([0]))
-    assert mapping[6:8].tolist() == [0, 0]
-    assert mapping[8].item() == original[8].item()
-    assert torch.equal(c.lru_slots, lru)
-    assert c.token_to_kv_pool_allocator.free_hisparse_indices.call_count == 2
+    c.request_finished(req)
+    assert mapping[:4].tolist() == original[:4].tolist()
+    assert torch.all(mapping[4:] == 0)
+    released = torch.cat(
+        [
+            call.args[0]
+            for call in c.token_to_kv_pool_allocator.free_hisparse_indices.call_args_list
+        ]
+    )
+    assert set(original[4:].tolist()).issubset(set(released.tolist()))
+    assert released.unique().numel() == released.numel()
+    assert physical.free_pages == free_before + 4 + (3 if mixed else 0)
+    current.wait_stream.assert_called_with(c.decode_producer_stream)
+    assert c.kvduo_req_hot_capacity[:, 0].tolist() == [0, 0, 0]
+    assert req.kvduo_radix_insert_len == 4 * ratio
+    assert not c._active_kvduo_reqs
 
 
 @pytest.mark.parametrize("ratio", [1, 4])
-def test_prefill_partial_page_keeps_its_identity_when_decode_seals_it(
-    monkeypatch, ratio
-):
+def test_decode_can_fill_prefill_partial_page_before_finish(monkeypatch, ratio):
     c, _, req, _, host_payload, _ = make_decode_coordinator(
         monkeypatch, ratio=ratio, prefill=3
     )
     mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
     original = mapping.clone()
-    assert req.kvduo_decode_full_start == 4
-    for length in (4, 5):
+    for length in range(4, 8):
         append(c, req, length)
-    c.prepare_kvduo_graph_replay(torch.tensor([0]))
+        c.prepare_kvduo_graph_replay(torch.tensor([0]))
+    c.wait_for_pending_backup()
     assert torch.equal(mapping, original)
-    assert torch.all(host_payload[:, 2:4] >= 0)
+    assert torch.all(host_payload[:, 2:6] >= 0)
     assert not c._mixed_slots[0]
     assert not torch.any(c.kvduo_req_hot_capacity)
-    for length in (6, 7):
-        append(c, req, length)
-    c.prepare_kvduo_graph_replay(torch.tensor([0]))
-    assert mapping[:4].tolist() == original[:4].tolist()
-    assert mapping[4:6].tolist() == [0, 0]
-
-
-def ready_page(monkeypatch):
-    c, physical, req, _, _, _ = make_decode_coordinator(monkeypatch)
-    for length in (5, 6, 7):
-        append(c, req, length)
-    c.wait_for_pending_backup()
-    return c, physical, req
-
-
-@pytest.mark.parametrize("blocked", ["version", "protected", "staging", "consensus"])
-def test_unsafe_decode_page_is_retained_and_retried(monkeypatch, blocked):
-    c, physical, req = ready_page(monkeypatch)
-    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
-    original = mapping.clone()
-    if blocked == "version":
-        c.full_data_version[4] += 1
-    elif blocked == "protected":
-        c._kvduo_pressure_protected = torch.tensor([5])
-    elif blocked == "staging":
-        req.hisparse_staging = True
-    else:
-        c._kvduo_consensus = MagicMock(return_value=False)
-    free_before = physical.free_pages
-    assert c._evict_kvduo_decode_full_pages() == 0
-    assert torch.equal(mapping, original)
-    assert physical.free_pages == free_before
-    assert len(c._kvduo_decode_full_pending) == 1
-    c.full_host_version.copy_(c.full_data_version)
-    c._kvduo_pressure_protected = None
-    req.hisparse_staging = False
-    c._kvduo_consensus = MagicMock(return_value=True)
-    assert c._evict_kvduo_decode_full_pages() == 2
-    assert mapping[4:6].tolist() == [0, 0]
-    assert physical.free_pages == free_before + 1
-    assert not c._kvduo_decode_full_pending
-
-
-def test_backup_completion_does_not_publish_for_reused_request_slot(monkeypatch):
-    c, _, req, _, _, _ = make_decode_coordinator(monkeypatch)
-    for length in (5, 6, 7):
-        append(c, req, length)
-    c._reset_kvduo_prefill_request(0)
-    c.full_host_version[4:6] = 99
-    c._kvduo_host_valid_len[0] = 0
-    c.wait_for_pending_backup()
-    assert c.full_host_version[4:6].tolist() == [99, 99]
-    assert c._kvduo_host_valid_len[0] == 0
-    assert not c._kvduo_decode_full_pending
     c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
-
-
-def test_pending_eviction_does_not_free_pages_reassigned_to_another_generation(
-    monkeypatch,
-):
-    c, _, _ = ready_page(monkeypatch)
-    c._kvduo_request_generation[0] += 1
-    assert c._evict_kvduo_decode_full_pages() == 0
-    assert not c._kvduo_decode_full_pending
-    c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
-
-
-def test_page_already_demoted_by_pressure_is_not_freed_twice(monkeypatch):
-    c, _, _ = ready_page(monkeypatch)
-    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
-    mapping[4:6] = 0
-    c._kvduo_consensus = MagicMock(return_value=False)
-    assert c._evict_kvduo_decode_full_pages() == 0
-    assert len(c._kvduo_decode_full_pending) == 1
-    c._kvduo_consensus.return_value = True
-    assert c._evict_kvduo_decode_full_pages() == 0
-    assert not c._kvduo_decode_full_pending
-    c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
-
-
-@pytest.mark.parametrize("ratio", [1, 4])
-def test_decode_admission_backs_up_sealed_page_before_allocating_the_next_tail(
-    monkeypatch, ratio
-):
-    c, physical, req, _, _, _ = make_decode_coordinator(monkeypatch, ratio=ratio)
-    for length in (5, 6):
-        append(c, req, length)
-    req.kv_committed_len = 7 * ratio - 1
-    physical.free_pages = 0
-    c.ensure_kvduo_decode_capacity([req])
-    assert physical.free_pages == 1
-    assert c._kvduo_mandatory_hot_pages() == 3
-    c._reclaim_for_physical_allocation.assert_called_once_with(
-        2, reserve_hot_minimum=True
-    )
-    assert c._kvduo_pending_hot_minimum == {0}
-    append(c, req, 7)
-    c.mem_pool_host.backup_from_device_all_layer.assert_called_once()
-
-
-def test_c4_tail_stays_resident_until_next_compressed_write(monkeypatch):
-    c, _, req, _, _, _ = make_decode_coordinator(monkeypatch, ratio=4)
-    for length in (5, 6):
-        append(c, req, length)
-    for length in (24, 25, 26):
-        req.kv_committed_len = length
-        c.ensure_kvduo_decode_capacity([req])
-    c.mem_pool_host.backup_from_device_all_layer.assert_not_called()
-    assert torch.all(c.mem_pool_device.full_to_hisparse_device_index_mapping[4:6] > 0)
-    req.kv_committed_len = 27
-    c.ensure_kvduo_decode_capacity([req])
-    c.mem_pool_host.backup_from_device_all_layer.assert_called_once()
-    assert c.mem_pool_device.full_to_hisparse_device_index_mapping[4:6].tolist() == [
-        0,
-        0,
-    ]
-
-
-def test_hisparse_without_kvduo_does_not_evict_decode_full_pages(monkeypatch):
-    c, _, _ = ready_page(monkeypatch)
-    c.enable_mixed_residency = False
-    assert c._evict_kvduo_decode_full_pages() == 0
-    c.prepare_kvduo_graph_replay(torch.tensor([0]))
-    c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
-    assert len(c._kvduo_decode_full_pending) == 1
+    c.request_finished(req)
+    assert mapping[:2].tolist() == original[:2].tolist()
+    assert torch.all(mapping[2:] == 0)
+    assert req.kvduo_radix_insert_len == 2 * ratio
 
 
 @pytest.mark.parametrize("prefill", [1, 63, 64, 65, 128])

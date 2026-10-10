@@ -613,8 +613,6 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.enable_mixed_residency = True
         coordinator.kvduo_observe = torch.ones(1, dtype=torch.int32)
         coordinator.decode_producer_stream = None
-        coordinator._has_pending_backup = False
-        coordinator._kvduo_decode_full_pending = {}
         coordinator.device = "cpu"
         coordinator.page_size = 4
         coordinator.hot_page_size = 4
@@ -740,7 +738,6 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.enable_mixed_residency = True
         coordinator.kvduo_observe = torch.ones(1, dtype=torch.int32)
         coordinator.decode_producer_stream = None
-        coordinator._has_pending_backup = False
         coordinator.device = "cpu"
         coordinator.page_size = 1
         coordinator.top_k = 1
