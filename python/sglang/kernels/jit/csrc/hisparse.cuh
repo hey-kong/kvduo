@@ -35,6 +35,20 @@ __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
   return ((uint32_t)key * 2654435761u) % (uint32_t)hash_size;
 }
 
+template <typename SlotT>
+__device__ __forceinline__ void
+insert_top_k_token(int32_t token, int index, int32_t* keys, SlotT* values, int hash_size) {
+  int slot = hash_slot(token, hash_size);
+  while (true) {
+    const int32_t old = atomicCAS(keys + slot, HASH_EMPTY, token);
+    if (old == HASH_EMPTY || old == token) {
+      values[slot] = static_cast<SlotT>(index);
+      return;
+    }
+    slot = (slot + 1) % hash_size;
+  }
+}
+
 #ifdef USE_ROCM
 __device__ __forceinline__ void transfer_item_warp(
     int32_t lane_id, const void* __restrict__ src_addr, void* __restrict__ dst_addr, int64_t item_size_bytes) {
@@ -276,16 +290,6 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  // KVDuo deliberately keeps complete pages resident until memory pressure
-  // requires demotion.  In that common state every selected row already has a
-  // canonical device address, so do not initialize or scan the (up to 16K)
-  // hot-buffer workspace.  The old path paid O(HOT_BUFFER_SIZE) LRU work even
-  // when the request had hot capacity zero and all top-k rows were full hits.
-  //
-  // A block-wide flag makes the fast path graph-safe: if any valid selection
-  // needs the hot/newest path, all threads fall through to the existing
-  // resolver.  Writes performed here are harmless because that resolver
-  // overwrites the corresponding output entries.
   __shared__ int needs_hot_resolver;
   __shared__ int full_resident_accesses;
   __shared__ int needs_hot_growth;
@@ -299,45 +303,6 @@ __global__ void load_cache_to_device_buffer_kernel(
     base_hot_hits = 0;
   }
   __syncthreads();
-  // A non-zero dynamic hot view identifies a mixed request.  Do not pre-probe
-  // those requests: the general resolver already performs the same full-table
-  // lookup, so probing them here would double top-k reads and touch atomics.
-  if (enable_full_lookup && hot_buffer_size == 0) {
-    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
-      const int32_t token_idx = req_top_k_tokens[i];
-      if (token_idx < 0 || token_idx >= seq_len) {
-        req_top_k_device_locs[i] = -1;
-        continue;
-      }
-
-      const int64_t logical_loc = req_to_logical_token[rid * req_to_logical_stride + token_idx];
-      const int64_t full_loc = logical_loc >= 0 ? full_to_device_loc[logical_loc] : 0;
-      if (logical_loc < 0 || (full_loc <= 0 && (req_host_cache_locs[token_idx] < 0 ||
-                                                full_host_version[logical_loc] != full_data_version[logical_loc]))) {
-        req_top_k_device_locs[i] = -1;
-        atomicMax(&swap_status[rid], 1);
-      } else if (full_loc > 0) {
-        req_top_k_device_locs[i] = static_cast<int32_t>(full_loc + full_location_base);
-        atomicAdd(&full_resident_accesses, 1);
-        atomicMax(
-            reinterpret_cast<unsigned long long*>(&full_last_touch[logical_loc]),
-            static_cast<unsigned long long>(touch_clock[0]));
-      } else {
-        atomicExch(&needs_hot_resolver, 1);
-      }
-    }
-    __syncthreads();
-    if (needs_hot_resolver == 0) {
-      if (tid == 0) {
-        atomicAdd(&resolver_stats[rid * resolver_stats_stride + 1], full_resident_accesses);
-        if (observe_prefill && swap_status[rid] == 0) {
-          sglang::kvduo_update_prefill_ema(0, 0, full_resident_accesses, prefill_ema + rid * 2, prefill_steps[rid]);
-        }
-      }
-      return;
-    }
-  }
-
   // Fast path: short sequences have all tokens in the device buffer in order.
   if (!enable_full_lookup && seq_len <= HOT_BUFFER_SIZE) {
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
@@ -387,26 +352,27 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Open-addressing hash table: top-k token_id -> top-k index (values)
   SlotT* s_hash_vals = s_lru_slots_out + HOT_BUFFER_SIZE;
 
-  // Initialize shared memory: counters, hash table, prefix-sum offsets.
+  // Classify FULL hits once, before initializing any HOT hash/LRU workspace.
   if (tid == 0) {
     s_total_hits = 0;
     s_newest_hit = 0;
     s_full_hits = 0;
     s_total_misses = 0;
   }
-  for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
-    s_hash_keys[i] = HASH_EMPTY;
-  }
-  for (int i = tid; i < num_buffer_chunks + 1; i += BLOCK_SIZE) {
-    s_chunk_offset[i] = 0;
-    s_evict_chunk_offset[i] = 0;
+  // Standalone HiSparse retains its original single-pass hash insertion.
+  if (!enable_full_lookup) {
+    for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE)
+      s_hash_keys[i] = HASH_EMPTY;
+    for (int i = tid; i < num_buffer_chunks + 1; i += BLOCK_SIZE) {
+      s_chunk_offset[i] = 0;
+      s_evict_chunk_offset[i] = 0;
+    }
   }
   __syncthreads();
 
   const int newest_slot = HOT_BUFFER_SIZE;
   const int32_t newest_token = seq_len - 1;
 
-  // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
     int64_t full_loc = 0;
@@ -438,7 +404,7 @@ __global__ void load_cache_to_device_buffer_kernel(
           static_cast<unsigned long long>(touch_clock[0]));
       s_top_k_tokens[i] = TOKEN_HIT;
       req_top_k_device_locs[i] = static_cast<int32_t>(full_loc + full_location_base);
-      atomicAdd(&s_full_hits, 1);
+      atomicAdd(&full_resident_accesses, 1);
     } else if (!enable_full_lookup && token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
@@ -446,19 +412,55 @@ __global__ void load_cache_to_device_buffer_kernel(
       req_top_k_device_locs[i] = req_device_buffer_locs[newest_slot];
       s_newest_hit = 1;
     } else {
-      int slot = hash_slot(token_idx, HASH_SIZE);
-      while (true) {
-        int32_t old = atomicCAS(&s_hash_keys[slot], HASH_EMPTY, token_idx);
-        if (old == HASH_EMPTY || old == token_idx) {
-          s_hash_vals[slot] = static_cast<SlotT>(i);
-          break;
-        }
-        slot = (slot + 1) % HASH_SIZE;
-      }
       s_top_k_tokens[i] = token_idx;
+      if (enable_full_lookup) {
+        atomicExch(&needs_hot_resolver, 1);
+      } else {
+        insert_top_k_token(token_idx, i, s_hash_keys, s_hash_vals, HASH_SIZE);
+      }
     }
   }
   __syncthreads();
+
+  // Mixed objects can also skip the entire HOT scan and LRU writeback when
+  // this selection is fully resident. Valid zero HOT counts still update EMA.
+  if (enable_full_lookup && needs_hot_resolver == 0) {
+    if (tid == 0) {
+      atomicAdd(&resolver_stats[rid * resolver_stats_stride + 1], full_resident_accesses);
+      if (observe && swap_status[rid] == 0) {
+        if (capacity_ema != nullptr) {
+          sglang::kvduo_update_capacity_ema(
+              segment_hot_hits,
+              0,
+              full_resident_accesses,
+              hot_buffer_size / page_size,
+              capacity_ema + rid * 9,
+              capacity_steps[rid]);
+        }
+        if (observe_prefill) {
+          sglang::kvduo_update_prefill_ema(0, 0, full_resident_accesses, prefill_ema + rid * 2, prefill_steps[rid]);
+        }
+      }
+    }
+    return;
+  }
+
+  if (enable_full_lookup) {
+    if (tid == 0) s_full_hits = full_resident_accesses;
+    for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE)
+      s_hash_keys[i] = HASH_EMPTY;
+    for (int i = tid; i < num_buffer_chunks + 1; i += BLOCK_SIZE) {
+      s_chunk_offset[i] = 0;
+      s_evict_chunk_offset[i] = 0;
+    }
+    __syncthreads();
+    // Reuse the classification; no second FULL lookup or touch update.
+    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+      const int32_t token_idx = s_top_k_tokens[i];
+      if (token_idx >= 0) insert_top_k_token(token_idx, i, s_hash_keys, s_hash_vals, HASH_SIZE);
+    }
+    __syncthreads();
+  }
 
   const int iterations_per_warp_buffer = (num_buffer_chunks + NUM_WARPS - 1) / NUM_WARPS;
   int total_hit_count = 0;
@@ -639,8 +641,12 @@ __global__ void load_cache_to_device_buffer_kernel(
       const int accesses = total_misses + s_total_hits + s_full_hits + s_newest_hit;
       if (capacity_ema != nullptr && observe && swap_status[rid] == 0) {
         sglang::kvduo_update_capacity_ema(
-            segment_hot_hits, total_misses, accesses, hot_buffer_size / page_size,
-            capacity_ema + rid * 9, capacity_steps[rid]);
+            segment_hot_hits,
+            total_misses,
+            accesses,
+            hot_buffer_size / page_size,
+            capacity_ema + rid * 9,
+            capacity_steps[rid]);
       }
       if (observe_prefill && swap_status[rid] == 0) {
         sglang::kvduo_update_prefill_ema(
