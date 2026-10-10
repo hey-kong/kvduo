@@ -24,7 +24,6 @@ from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
 from test_kvduo_hot_merge import make_merge_coordinator
 
-
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
@@ -565,8 +564,9 @@ def merged_and_expanded(page_counts, expanded, *, layers=1):
     return c, physical
 
 
+@pytest.mark.parametrize("reset_stats", [False, True])
 def test_rollback_cuda_entry_uses_unpadded_lru_capacity_and_passes_full_banks(
-    monkeypatch,
+    monkeypatch, reset_stats
 ):
     import sglang.kernels.ops.kvcache.hisparse as ops
 
@@ -590,15 +590,65 @@ def test_rollback_cuda_entry_uses_unpadded_lru_capacity_and_passes_full_banks(
         c.lru_slots,
         c.kvduo_req_hot_capacity_gpu,
     )
-    ops.rollback_kvduo_hot_metadata(owners, targets, *banks)
+    statistics = (
+        (
+            c.kvduo_capacity_ema,
+            c.kvduo_capacity_steps,
+            c.kvduo_hot_growth_events,
+            c.kvduo_prefill_ema,
+            c.kvduo_prefill_steps,
+        )
+        if reset_stats
+        else (None,) * 5
+    )
+    ops.rollback_kvduo_hot_metadata(owners, targets, *banks, *statistics)
     load_module.assert_called_once_with(32, 256)
     module.rollback.assert_called_once()
+    assert len(module.rollback.call_args.args) == 11
     assert all(
         actual is expected
         for actual, expected in zip(
-            module.rollback.call_args.args, (owners, targets, *banks)
+            module.rollback.call_args.args, (owners, targets, *banks, *statistics)
         )
     )
+
+
+def test_rollback_rejects_invalid_statistics_before_metadata_mutation():
+    from sglang.kernels.ops.kvcache.hisparse import rollback_kvduo_hot_metadata
+
+    tokens = torch.arange(60, dtype=torch.int32).view(2, 3, 10)
+    locations = tokens + 100
+    lru = torch.arange(8, dtype=torch.int16).repeat(2, 3, 1)
+    capacities = torch.full((2, 3), 8, dtype=torch.int32)
+    statistics = [
+        torch.ones((2, 3, 9)),
+        torch.ones((2, 3), dtype=torch.int64),
+        torch.ones((2, 3), dtype=torch.int32),
+        torch.ones((2, 3, 2)),
+        torch.ones((2, 3), dtype=torch.int64),
+    ]
+    invalid = (
+        None,
+        torch.ones((2, 3, 8)),
+        torch.ones((2, 3, 9), dtype=torch.int32),
+        torch.ones((2, 3, 10))[:, :, :9],
+        torch.ones((2, 3, 9), device="meta"),
+    )
+    banks = (tokens, locations, lru, capacities, *statistics)
+    before = [bank.clone() for bank in banks]
+    for bank in invalid:
+        args = [bank, *statistics[1:]]
+        with pytest.raises(ValueError, match="Rollback statistics"):
+            rollback_kvduo_hot_metadata(
+                torch.tensor([[1, 2]]),
+                torch.tensor([4], dtype=torch.int32),
+                tokens,
+                locations,
+                lru,
+                capacities,
+                *args,
+            )
+        assert all(torch.equal(a, b) for a, b in zip(banks, before))
 
 
 def test_multi_request_layer_rollback_with_coordinator_padding_publishes_before_free():
@@ -611,7 +661,13 @@ def test_multi_request_layer_rollback_with_coordinator_padding_publishes_before_
         c.req_device_buffer_token_locs,
         c.lru_slots,
         c.kvduo_req_hot_capacity_gpu,
+        c.kvduo_capacity_ema,
+        c.kvduo_capacity_steps,
+        c.kvduo_hot_growth_events,
+        c.kvduo_prefill_ema,
+        c.kvduo_prefill_steps,
     )
+    c.kvduo_hot_growth_events.fill_(3)
     assert banks[0].size(2) == c.device_buffer_size + c.page_size
     assert banks[2].size(2) == c.device_buffer_size
     c.req_device_buffer_tokens[:, :, 32:] = 999
@@ -634,6 +690,7 @@ def test_multi_request_layer_rollback_with_coordinator_padding_publishes_before_
             owner = (layer, req)
             assert c.kvduo_req_hot_capacity[owner].item() == 8
             assert c.kvduo_req_hot_capacity_gpu[owner].item() == 8
+            assert all(torch.all(bank[owner] == 0) for bank in banks[4:])
             assert c.lru_slots[owner][:8].tolist() == [3, 7, 0, 6, 2, 1, 5, 4]
             assert torch.all(c.lru_slots[owner][8:] == -1)
             for bank, original in zip((banks[0], banks[1]), (before[0], before[1])):

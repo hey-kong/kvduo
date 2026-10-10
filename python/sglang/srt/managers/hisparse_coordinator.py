@@ -3120,12 +3120,13 @@ class HiSparseCoordinator:
             self.req_device_buffer_token_locs,
             self.lru_slots,
             self.kvduo_req_hot_capacity_gpu,
+            self.kvduo_capacity_ema,
+            self.kvduo_capacity_steps,
+            self.kvduo_hot_growth_events,
+            self.kvduo_prefill_ema,
+            self.kvduo_prefill_steps,
         )
         for owner in owners:
-            self._reset_kvduo_capacity_stats(owner)
-            self.kvduo_hot_growth_events[owner].zero_()
-            self.kvduo_prefill_steps[owner].zero_()
-            self.kvduo_prefill_ema[owner].zero_()
             # Resetting the evaluation stage invalidates its frozen reference;
             # the object's admitted cost remains reserved until recovery/end.
             self._kvduo_prefill_budget_reference.pop(self._kvduo_owner_key(owner), None)

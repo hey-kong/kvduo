@@ -1529,8 +1529,9 @@ def test_generic_resolver_preserves_lru_slots_above_int16_range():
 
 @pytest.mark.parametrize("capacity", [8, 512, 39936])
 @pytest.mark.parametrize("page_size", [2, 64])
+@pytest.mark.parametrize("reset_stats", [False, True])
 def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru(
-    capacity, page_size
+    capacity, page_size, reset_stats
 ):
     from sglang.kernels.ops.kvcache.hisparse import rollback_kvduo_hot_metadata
 
@@ -1545,7 +1546,18 @@ def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru
     order = torch.arange(capacity, dtype=slot_dtype, device=DEVICE).flip(0)
     lru = torch.stack([order.roll(i) for i in range(6)]).view(2, 3, capacity)
     capacities = torch.full((2, 3), capacity, dtype=torch.int32, device=DEVICE)
-    banks = (tokens, locations, lru, capacities)
+    statistics = (
+        (
+            torch.arange(1, 55, dtype=torch.float32, device=DEVICE).view(2, 3, 9),
+            torch.full((2, 3), 73, dtype=torch.int64, device=DEVICE),
+            torch.full((2, 3), 2, dtype=torch.int32, device=DEVICE),
+            torch.arange(1, 13, dtype=torch.float32, device=DEVICE).view(2, 3, 2),
+            torch.full((2, 3), 65, dtype=torch.int64, device=DEVICE),
+        )
+        if reset_stats
+        else ()
+    )
+    banks = (tokens, locations, lru, capacities, *statistics)
     before = [bank.clone() for bank in banks]
     addresses = [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
     selected = {(0, 1): capacity // 2, (1, 0): capacity // 4, (1, 2): capacity * 3 // 4}
@@ -1556,6 +1568,7 @@ def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru
         locations,
         lru,
         capacities,
+        *statistics,
     )
     torch.cuda.synchronize()
     for layer in range(2):
@@ -1574,6 +1587,7 @@ def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru
             assert torch.all(tokens[owner][target:] == -1)
             assert torch.all(locations[owner][target:] == -1)
             assert capacities[owner].item() == target
+            assert all(torch.all(bank[owner] == 0) for bank in statistics)
     assert addresses == [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
 
 
@@ -1748,6 +1762,7 @@ def test_kvduo_resolver_graph_replays_after_no_copy_rollback_without_recapture()
         "prefill_steps",
         "capacity_ema",
         "capacity_steps",
+        "hot_growth_events",
     )
     addresses = [
         (kwargs[key].data_ptr(), kwargs[key].shape, kwargs[key].stride())
@@ -1760,11 +1775,24 @@ def test_kvduo_resolver_graph_replays_after_no_copy_rollback_without_recapture()
         kwargs["device_buffer_locs"].unsqueeze(0),
         kwargs["lru_slots"].unsqueeze(0),
         kwargs["req_hot_buffer_sizes"].unsqueeze(0),
+        kwargs["capacity_ema"].unsqueeze(0),
+        kwargs["capacity_steps"].unsqueeze(0),
+        kwargs["hot_growth_events"].unsqueeze(0),
+        kwargs["prefill_ema"].unsqueeze(0),
+        kwargs["prefill_steps"].unsqueeze(0),
     )
     assert torch.all(kwargs["device_buffer_tokens"][:, 2:] == -1)
     assert torch.all(kwargs["device_buffer_locs"][:, 2:] == -1)
-    kwargs["prefill_ema"].zero_()
-    kwargs["prefill_steps"].zero_()
+    assert all(
+        torch.all(kwargs[key] == 0)
+        for key in (
+            "capacity_ema",
+            "capacity_steps",
+            "hot_growth_events",
+            "prefill_ema",
+            "prefill_steps",
+        )
+    )
     kwargs["observe_cache"].fill_(1)
     kwargs["top_k_tokens"].copy_(
         torch.tensor([[1, 6]], dtype=torch.int32, device=DEVICE)
