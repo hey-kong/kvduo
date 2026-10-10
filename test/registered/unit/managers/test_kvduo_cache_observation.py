@@ -148,7 +148,7 @@ def test_replay_reenables_observation_and_growth_keeps_capacity_history():
     pointer = c.kvduo_capacity_ema.data_ptr()
     c.kvduo_hot_growth_events[0, 0] = 1
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
-    assert c.kvduo_capacity_ema[0, 0].tolist() == [3, 0, 3, 3, 3, 3, 3, 3, 3]
+    assert c.kvduo_capacity_ema[0, 0].tolist() == [3] * 9
     assert c.kvduo_capacity_steps.item() == 65
     assert c.kvduo_prefill_steps.item() == 66 and c.kvduo_prefill_ema[
         0, 0
@@ -176,7 +176,7 @@ def test_growth_preserves_mru_segments_and_continues_production_ema(
 
     assert c.lru_slots[owner][:16].tolist() == list(range(8, 16)) + old_lru
     assert old_segments == [native_observation.segment(16, i + 8, 4) for i in range(8)]
-    assert c.kvduo_capacity_ema[owner].tolist() == [8, 4, 0, 0, 0, 0, 0, 0, 2]
+    assert c.kvduo_capacity_ema[owner].tolist() == [8, 4, 4, 4, 0, 0, 0, 0, 2]
     assert c.kvduo_capacity_steps[owner] == 100
     assert torch.equal(c.kvduo_capacity_ema[:, 0], other_counts)
     assert shapes_and_pointers == [
@@ -193,8 +193,31 @@ def test_growth_preserves_mru_segments_and_continues_production_ema(
         counts,
         ctypes.byref(steps),
     )
-    assert list(counts) == [8 - 4 / 64, 4 * 63 / 64, 2 / 64, 0, 0, 0, 0, 0, 2 * 63 / 64]
+    assert list(counts) == [
+        8 - 4 / 64,
+        4 * 63 / 64,
+        4 - 2 / 64,
+        4 * 63 / 64,
+        0,
+        0,
+        0,
+        0,
+        2 * 63 / 64,
+    ]
     assert steps.value == 101
+    # A later expansion must use the latest last segment, including its EMA
+    # updates, rather than the original seed or another more-recent segment.
+    c.kvduo_capacity_ema[owner] = torch.tensor(list(counts))
+    c.kvduo_capacity_steps[owner] = steps.value
+    c._ensure_kvduo_hot_capacity_targets_batch({owner: 20})
+    assert c.kvduo_capacity_ema[owner].tolist() == list(counts)[:4] + [
+        counts[3],
+        0,
+        0,
+        0,
+        counts[8],
+    ]
+    assert c.kvduo_capacity_steps[owner] == 101
 
 
 def test_first_hot_allocation_starts_fresh_observation():
@@ -214,6 +237,7 @@ def test_failed_growth_restores_capacity_and_prefill_histories():
         c._establish_kvduo_hot_base(owner, c._kvduo_req_layer_pages[owner])
         c._kvduo_prefill_budget_reference[c._kvduo_owner_key(owner)] = 2.0
     c.kvduo_capacity_ema.fill_(3)
+    c.kvduo_capacity_ema[:, :, 1] = 9
     c.kvduo_capacity_steps.fill_(65)
     c.kvduo_prefill_ema.fill_(7)
     c.kvduo_prefill_steps.fill_(66)

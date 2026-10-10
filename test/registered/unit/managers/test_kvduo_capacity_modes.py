@@ -73,7 +73,12 @@ def test_recovery_needs_all_established_layers_and_uses_only_latest_events():
     assert p.free_pages == 8 and c._kvduo_recovery_credits == 0
     assert not c._kvduo_prefill_budget_cost
     assert c.kvduo_capacity_steps[:, 0].tolist() == [100] * 4
-    assert c.kvduo_capacity_ema[:, 0, :3].tolist() == [[8, 4, 0]] * 4
+    assert c.kvduo_capacity_ema[:, 0, :3].tolist() == [
+        [8, 4, 4],
+        [8, 4, 0],
+        [8, 4, 4],
+        [8, 4, 0],
+    ]
     assert c.kvduo_capacity_ema[:, 0, 8].tolist() == [2] * 4
     # Design 3 still starts a new phase only on first growth from the base.
     assert c.kvduo_prefill_steps[:, 0].tolist() == [0, 66, 0, 66]

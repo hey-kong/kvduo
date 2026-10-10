@@ -294,7 +294,7 @@ def test_only_shrunk_applicants_lose_their_events():
     assert p.free_pages == 4
     p.alloc.assert_called_once_with(2)
     assert c.kvduo_capacity_steps[0].tolist() == [0, 65]
-    assert c.kvduo_capacity_ema[0, 1].tolist() == [100, 100, 0, 0, 0, 0, 0, 0, 0]
+    assert c.kvduo_capacity_ema[0, 1].tolist() == [100, 100, 100, 0, 0, 0, 0, 0, 0]
 
 
 @pytest.mark.parametrize("consume_before_merge", [False, True])
@@ -322,7 +322,7 @@ def test_mandatory_merge_consumes_event_before_or_after_replay_reads_it(
     assert not c.kvduo_hot_growth_events.any()
 
 
-def test_mature_grown_object_can_immediately_reclaim_its_new_tail():
+def test_grown_tail_inherits_hit_prior_instead_of_appearing_free_to_shrink():
     c, p = make_merge_coordinator({(0, 0): 2})
     p.free_pages = 1
     old_lru = live_lru(c, 0, 0)
@@ -330,10 +330,31 @@ def test_mature_grown_object_can_immediately_reclaim_its_new_tail():
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
     assert c.kvduo_req_hot_capacity.item() == 12
     assert c.kvduo_capacity_steps.item() == 65
+    assert c.kvduo_capacity_ema[0, 0, :3].tolist() == [100] * 3
+    assert c.reclaim_kvduo_hot_pages(2) == 0
+    assert c.kvduo_req_hot_capacity.item() == 12
+    assert c.kvduo_capacity_steps.item() == 65
+    assert live_lru(c, 0, 0) == old_lru
+    assert_payloads_match_tokens(c, 0, 0)
+    # Later zero contribution permits reclamation without a new maturity phase.
+    c.kvduo_capacity_ema[0, 0, 2] = 0
     assert c.reclaim_kvduo_hot_pages(2) == 2
     assert c.kvduo_req_hot_capacity.item() == 8
     assert live_lru(c, 0, 0) == old_lru
     assert not c.kvduo_capacity_ema.any() and not c.kvduo_capacity_steps.any()
+    assert_payloads_match_tokens(c, 0, 0)
+
+
+def test_zero_old_tail_keeps_zero_prior_and_can_still_shrink():
+    c, p = make_merge_coordinator({(0, 0): 2}, top_k=5)
+    c.kvduo_capacity_ema[0, 0, 1] = 0
+    p.free_pages = 1
+    c.kvduo_hot_growth_events[0, 0] = 1
+    c.prepare_kvduo_graph_replay(torch.tensor([0]))
+    assert c.kvduo_capacity_ema[0, 0, :3].tolist() == [100, 0, 0]
+    assert c.kvduo_capacity_steps.item() == 65
+    assert c.reclaim_kvduo_hot_pages(2) == 2
+    assert c.kvduo_req_hot_capacity.item() == 8
     assert_payloads_match_tokens(c, 0, 0)
 
 

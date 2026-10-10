@@ -2533,7 +2533,10 @@ class HiSparseCoordinator:
             # segments stay unchanged; miss EMA and maturity remain a prior.
             first_new_segment = old_capacity // self.hot_page_size
             end_segment = new_capacity // self.hot_page_size
-            self.kvduo_capacity_ema[owner][first_new_segment:end_segment] = 0
+            # Seed new tails with the previous LRU-most segment's hit EMA.
+            # This is a prior, not an observed hit in the newly allocated slots.
+            counts = self.kvduo_capacity_ema[owner]
+            counts[first_new_segment:end_segment] = counts[first_new_segment - 1]
         base = self._kvduo_hot_base_pages.get(owner)
         if (
             base
