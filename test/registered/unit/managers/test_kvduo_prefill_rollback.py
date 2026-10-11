@@ -367,6 +367,30 @@ def test_dsv4_full_physical_pool_reaches_rollback_with_real_allocator_budgets(pa
     assert adder.rem_swa_token_offset > 0
 
 
+@pytest.mark.parametrize("pool", ["logical", "swa"])
+def test_waiting_existing_chunk_protects_its_resource_limited_execution(pool):
+    coordinator, physical = ready_coordinator()
+    adder, req = adder_and_req(
+        coordinator,
+        dsv4=True,
+        chunk=16,
+        logical_size=8 if pool == "logical" else 1024,
+        swa_size=16 if pool == "swa" else 1024,
+    )
+    req.prefix_indices = torch.arange(8, dtype=torch.int64)
+    req.full_untruncated_fill_ids = list(range(40))
+    coordinator.kvduo_prefill_steps.zero_()
+    reserve = MagicMock(wraps=coordinator.reserve_kvduo_prefill)
+    coordinator.reserve_kvduo_prefill = reserve
+
+    assert adder.add_chunked_req(req) is req
+
+    assert reserve.call_args.args[0] == 1
+    assert coordinator._kvduo_prefill_plan_uncovered_pages() == 1
+    assert physical.free_pages == 0 and not adder.can_run_list
+    assert not coordinator._kvduo_prefill_limited_objects
+
+
 @pytest.mark.parametrize("path", ["new", "chunk"])
 @pytest.mark.parametrize("pool", ["logical", "swa"])
 def test_rollback_admission_preserves_logical_and_swa_budget_rejections(path, pool):
