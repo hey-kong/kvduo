@@ -132,6 +132,72 @@ def test_real_prefill_reservation_funds_restore_and_keeps_fresh_tail_quota(
 
 
 @pytest.mark.parametrize("dsv4", [False, True])
+@pytest.mark.parametrize("blocked_by", ["host", "logical", "physical"])
+def test_waiting_chunk_protects_host_restore_and_fresh_tail(dsv4, blocked_by):
+    c, physical, adder, req = restore_setup(dsv4=dsv4)
+    reserve = MagicMock(wraps=c.reserve_kvduo_prefill)
+    c.reserve_kvduo_prefill = reserve
+    if blocked_by == "host":
+        assert c.mem_pool_host.alloc(c.mem_pool_host.available_size()) is not None
+    elif blocked_by == "logical":
+        logical = adder.token_to_kv_pool_allocator.logical_attn_allocator
+        logical = logical.full_attn_allocator if dsv4 else logical
+        assert logical.alloc(logical.available_size()) is not None
+    else:
+        c.kvduo_prefill_steps.zero_()
+
+    result = adder.add_one_req(req, False, None)
+
+    assert result is (
+        AddReqResult.NO_TOKEN if blocked_by == "logical" else AddReqResult.OTHER
+    )
+    assert c._kvduo_prefill_plan_uncovered_pages() == 2
+    if blocked_by == "logical":
+        reserve.assert_not_called()
+    else:
+        assert reserve.call_args.args[0] == 2
+    assert physical.free_pages == 0
+    assert not adder.can_run_list and not c._kvduo_prefill_limited_objects
+    c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_not_called()
+
+
+@pytest.mark.parametrize("dsv4", [False, True])
+def test_waiting_plan_uses_the_aligned_chunk_end(dsv4):
+    c, physical, adder, req = restore_setup(dsv4=dsv4)
+    page = adder.page_size
+    req.full_untruncated_fill_ids = list(range(6 * page))
+    adder.rem_chunk_tokens = 3 * page + 1
+    reserve = MagicMock(wraps=c.reserve_kvduo_prefill)
+    c.reserve_kvduo_prefill = reserve
+
+    assert adder.add_one_req(req, False, 2 * page) is AddReqResult.OTHER
+
+    # One restored page and two freshly computed pages fit this execution.
+    assert reserve.call_args.args[0] == 3
+    assert c._kvduo_prefill_plan_uncovered_pages() == 3
+    assert physical.free_pages == 0 and not adder.can_run_list
+    c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_not_called()
+
+
+def test_swa_limited_plan_updates_protection_before_host_admission():
+    c, physical, adder, req = restore_setup(dsv4=True)
+    page = adder.page_size
+    req.full_untruncated_fill_ids = list(range(6 * page))
+    adder.rem_chunk_tokens = 3 * page
+    # Leave SWA room for one compute page plus the allocator's page slack.
+    swa = adder.token_to_kv_pool_allocator.logical_attn_allocator.swa_attn_allocator
+    assert swa.alloc(swa.available_size() - 2 * page) is not None
+    reserve = MagicMock(wraps=c.reserve_kvduo_prefill)
+    c.reserve_kvduo_prefill = reserve
+
+    assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
+
+    assert reserve.call_args.args[0] == 2
+    assert c._kvduo_prefill_plan_uncovered_pages() == 2
+    assert physical.free_pages == 0 and not adder.can_run_list
+
+
+@pytest.mark.parametrize("dsv4", [False, True])
 @pytest.mark.parametrize("protected", ["fresh_tail", "other_prefill", "hot_minimum"])
 def test_restore_cannot_spend_other_pending_allocations(dsv4, protected):
     c, physical, adder, req = restore_setup(dsv4=dsv4, requests=2)

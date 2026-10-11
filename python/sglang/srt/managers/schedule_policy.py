@@ -563,6 +563,7 @@ class PrefillAdder:
         coordinator = getattr(self, "kvduo_coordinator", None)
         if not self._kvduo_prefill_enabled():
             return True, None
+        coordinator.protect_kvduo_prefill_plan(req, end)
         pages = coordinator.kvduo_prefill_pages(len(req.prefix_indices), end)
         indices = (
             [
@@ -587,6 +588,50 @@ class PrefillAdder:
             return False, None
         self.kvduo_prefill_reservations.append(token)
         return True, token
+
+    def _plan_prefill_after_prefix(
+        self,
+        req: Req,
+        prefix_length: int,
+        chunk_tokens_limit: Optional[int],
+        truncation_align_size: Optional[int],
+    ):
+        planned_input_tokens = self.ceil_paged_tokens(
+            len(req.full_untruncated_fill_ids) - prefix_length
+        )
+        if (
+            self.rem_chunk_tokens is None
+            and len(self.can_run_list) != 0
+            and planned_input_tokens >= self.rem_input_tokens
+        ):
+            return None
+
+        planned_trunc_len = None
+        if (
+            self.dllm_config is None
+            and chunk_tokens_limit is not None
+            and planned_input_tokens > chunk_tokens_limit
+        ):
+            planned_trunc_len = chunk_tokens_limit // self.page_size * self.page_size
+            if planned_trunc_len <= 0:
+                return None
+            if truncation_align_size is not None:
+                if planned_trunc_len < truncation_align_size:
+                    return None
+                planned_trunc_len = truncation_align_size * (
+                    planned_trunc_len // truncation_align_size
+                )
+            now_input_len = planned_trunc_len + prefix_length
+            now_input_len = now_input_len // self.page_size * self.page_size
+            planned_trunc_len = now_input_len - prefix_length
+            if planned_trunc_len <= 0:
+                return None
+        planned_end = (
+            prefix_length + planned_trunc_len
+            if planned_trunc_len is not None
+            else len(req.full_untruncated_fill_ids)
+        )
+        return planned_input_tokens, planned_trunc_len, planned_end
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -1112,11 +1157,14 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        prospective_prefix_len = len(req.prefix_indices) + req.host_hit_length
+        chunk_tokens_limit = self.rem_chunk_tokens
         if self._kvduo_prefill_enabled():
-            end = len(req.full_untruncated_fill_ids)
-            if self.rem_chunk_tokens is not None:
-                end = min(end, len(req.prefix_indices) + max(0, self.rem_chunk_tokens))
-            self.kvduo_coordinator.protect_kvduo_prefill_plan(req, end)
+            prefill_plan = self._plan_prefill_after_prefix(
+                req, prospective_prefix_len, chunk_tokens_limit, truncation_align_size
+            )
+            if prefill_plan is not None:
+                self.kvduo_coordinator.protect_kvduo_prefill_plan(req, prefill_plan[2])
 
         total_tokens = cand_extend_input_len + max_new + self.page_size
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
@@ -1131,7 +1179,6 @@ class PrefillAdder:
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
-        chunk_tokens_limit = self.rem_chunk_tokens
         if self.is_hybrid_swa:
             # host-hit prefix is loaded back, not re-prefilled, so the SWA peak is
             # driven only by the freshly-prefilled tail (the loaded window is
@@ -1183,46 +1230,14 @@ class PrefillAdder:
             # particular, a KVDuo host restore allocates Full/C4 pages that are
             # not yet request-owned; returning OTHER afterward would leak them
             # when the next scheduling pass overwrites the prefix match.
-            def plan_prefill_after_prefix(prefix_length: int):
-                planned_input_tokens = self.ceil_paged_tokens(
-                    len(req.full_untruncated_fill_ids) - prefix_length
-                )
-                if (
-                    self.rem_chunk_tokens is None
-                    and len(self.can_run_list) != 0
-                    and planned_input_tokens >= self.rem_input_tokens
-                ):
-                    return None
-
-                planned_trunc_len = None
-                if (
-                    self.dllm_config is None
-                    and chunk_tokens_limit is not None
-                    and planned_input_tokens > chunk_tokens_limit
-                ):
-                    planned_trunc_len = (
-                        chunk_tokens_limit // self.page_size * self.page_size
-                    )
-                    if planned_trunc_len <= 0:
-                        return None
-                    if truncation_align_size is not None:
-                        if planned_trunc_len < truncation_align_size:
-                            return None
-                        planned_trunc_len = truncation_align_size * (
-                            planned_trunc_len // truncation_align_size
-                        )
-                    now_input_len = planned_trunc_len + prefix_length
-                    now_input_len = now_input_len // self.page_size * self.page_size
-                    planned_trunc_len = now_input_len - prefix_length
-                    if planned_trunc_len <= 0:
-                        return None
-                return planned_input_tokens, planned_trunc_len
-
-            prospective_prefix_len = len(req.prefix_indices) + req.host_hit_length
-            prefill_plan = plan_prefill_after_prefix(prospective_prefix_len)
+            prefill_plan = self._plan_prefill_after_prefix(
+                req, prospective_prefix_len, chunk_tokens_limit, truncation_align_size
+            )
             if prefill_plan is None:
                 return AddReqResult.OTHER
-            input_tokens, trunc_len = prefill_plan
+            input_tokens, trunc_len, planned_end = prefill_plan
+            if self._kvduo_prefill_enabled():
+                self.kvduo_coordinator.protect_kvduo_prefill_plan(req, planned_end)
 
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
@@ -1243,11 +1258,6 @@ class PrefillAdder:
             ):
                 return AddReqResult.OTHER
 
-            planned_end = (
-                prospective_prefix_len + trunc_len
-                if trunc_len is not None
-                else len(req.full_untruncated_fill_ids)
-            )
             admitted, reservation = self._reserve_kvduo_prefill(req, planned_end)
             if not admitted:
                 # This is a transient physical-page deficit. Keep trying on
@@ -1295,10 +1305,12 @@ class PrefillAdder:
                         raise RuntimeError(
                             "KVDuo host-prefix restore returned an unexpected length"
                         )
-                    prefill_plan = plan_prefill_after_prefix(prefix_len)
+                    prefill_plan = self._plan_prefill_after_prefix(
+                        req, prefix_len, chunk_tokens_limit, truncation_align_size
+                    )
                     if prefill_plan is None:
                         return AddReqResult.OTHER
-                    input_tokens, trunc_len = prefill_plan
+                    input_tokens, trunc_len, _ = prefill_plan
 
             if self.dllm_config is not None:
                 self._add_dllm_req(req, prefix_len)

@@ -6,11 +6,17 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.mem_cache.sparsity.core.kvduo_capacity_modes import (
     KVDuoRecoveryObject,
     plan_kvduo_recovery,
 )
-from test_kvduo_prefill_rollback import merged_and_expanded, ready_coordinator
+from test_kvduo_hot_growth import make_host_pool
+from test_kvduo_prefill_rollback import (
+    adder_and_req,
+    merged_and_expanded,
+    ready_coordinator,
+)
 from test_kvduo_pressure_admission import make_full_coordinator
 
 
@@ -41,6 +47,69 @@ def fixed_stack(layers=4):
     c.finish_kvduo_prefill_reservation(token, cancelled=False)
     p.free_pages = 0
     return c, p
+
+
+@pytest.mark.parametrize("dsv4", [False, True])
+def test_host_prefix_chunk_wait_keeps_recovery_credit_out_of_prefill_space(dsv4):
+    c, p = fixed_stack(layers=1)
+    adder, req = adder_and_req(c, dsv4=dsv4)
+    page = adder.page_size
+    adder.rem_chunk_tokens = page
+    req.rid = "waiting-prefill"
+    req.extra_key = None
+    req.prefix_indices = torch.arange(page, dtype=torch.int64)
+    req.host_hit_length = page
+    req.full_untruncated_fill_ids = list(range(4 * page))
+    c.mem_pool_host = make_host_pool(0, c.page_size)
+    p.free_pages = 3
+    before = c.kvduo_req_hot_capacity.clone()
+    costs = dict(c._kvduo_prefill_budget_cost)
+
+    assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
+    assert c._kvduo_optional_protected_pages() == 3  # Restore, chunk, HOT minimum.
+
+    c.kvduo_hot_growth_events[0, 0] = 1
+    c.prepare_kvduo_graph_replay(torch.tensor([0]))
+
+    assert c._kvduo_object_limited((0, 0))
+    assert torch.equal(c.kvduo_req_hot_capacity, before)
+    assert c._kvduo_prefill_budget_cost == costs
+    assert p.free_pages == 3 and c._kvduo_recovery_credits == 0
+
+    # Recovery gets one page only after the complete prefill demand is covered.
+    p.free_pages = 4
+    c.kvduo_hot_growth_events[0, 0] = 1
+    c.prepare_kvduo_graph_replay(torch.tensor([0]))
+    assert not c._kvduo_object_limited((0, 0))
+    assert int(c.kvduo_req_hot_capacity[0, 0]) == int(before[0, 0]) + c.hot_page_size
+    assert p.free_pages == 3 and not c._kvduo_prefill_budget_cost
+
+
+@pytest.mark.parametrize("dsv4", [False, True])
+def test_waiting_host_prefix_chunk_defers_optional_growth_without_merge(dsv4):
+    c, p = ready_coordinator(extra=3)
+    adder, req = adder_and_req(c, dsv4=dsv4)
+    page = adder.page_size
+    adder.rem_chunk_tokens = page
+    req.rid = "waiting-prefill"
+    req.extra_key = None
+    req.prefix_indices = torch.arange(page, dtype=torch.int64)
+    req.host_hit_length = page
+    req.full_untruncated_fill_ids = list(range(4 * page))
+    c.mem_pool_host = make_host_pool(0, c.page_size)
+    p.free_pages = 1
+    before = c.kvduo_req_hot_capacity.clone()
+    c.reclaim_kvduo_hot_pages = MagicMock(wraps=c.reclaim_kvduo_hot_pages)
+
+    assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
+    assert c._kvduo_optional_protected_pages() == 2
+    c.kvduo_hot_growth_events[0, 0] = 1
+    c.prepare_kvduo_graph_replay(torch.tensor([0]))
+
+    assert torch.equal(c.kvduo_req_hot_capacity, before)
+    assert p.free_pages == 1
+    assert not c._kvduo_prefill_limited_objects
+    c.reclaim_kvduo_hot_pages.assert_not_called()
 
 
 def test_one_page_headroom_recovers_only_one_layer_without_replaying_old_events():
