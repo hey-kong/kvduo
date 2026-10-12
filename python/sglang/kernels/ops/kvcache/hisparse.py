@@ -12,16 +12,21 @@ if TYPE_CHECKING:
 
 
 def hisparse_resolver_scratch_words(
-    num_top_k: int, hot_buffer_size: int, *, warp_size: int | None = None
+    num_top_k: int,
+    hot_buffer_size: int,
+    *,
+    warp_size: int | None = None,
+    use_lru_scratch: bool = False,
 ) -> int:
-    """Size of SmemLayout in int32 words, for a persistent global fallback."""
+    """Size of the full or compact resolver workspace in int32 words."""
     if warp_size is None:
         warp_size = 64 if torch.version.hip else 32
     chunks = (hot_buffer_size + warp_size - 1) // warp_size
     hash_size = 2 * num_top_k
     int32_count = num_top_k + 2 * (chunks + 1) + hash_size + 4
     slot_bytes = 4 if hot_buffer_size > torch.iinfo(torch.int16).max else 2
-    required_bytes = 4 * int32_count + slot_bytes * (hot_buffer_size + hash_size)
+    slots = hash_size + (0 if use_lru_scratch else hot_buffer_size)
+    required_bytes = 4 * int32_count + slot_bytes * slots
     return (required_bytes + 3) // 4
 
 
@@ -31,6 +36,8 @@ def allocate_hisparse_resolver_scratch(
     hot_buffer_size: int,
     block_size: int,
     device: torch.device,
+    *,
+    use_lru_scratch: bool = False,
 ) -> torch.Tensor | None:
     """Check launch resources and allocate before capture when shared memory is too small.
 
@@ -54,12 +61,18 @@ def allocate_hisparse_resolver_scratch(
         getattr(properties, "shared_memory_per_block_optin", 0),
     )
     words = hisparse_resolver_scratch_words(
-        num_top_k, hot_buffer_size, warp_size=warp_size
+        num_top_k,
+        hot_buffer_size,
+        warp_size=warp_size,
+        use_lru_scratch=use_lru_scratch,
     )
     # Four small shared counters remain even on the global path. Reserve
     # compiler alignment headroom; the CUDA wrapper checks actual static usage.
     if words * 4 + 256 <= shared_limit:
         return None
+    words = hisparse_resolver_scratch_words(
+        num_top_k, hot_buffer_size, warp_size=warp_size
+    )
     return torch.empty((requests, words), dtype=torch.int32, device=device)
 
 
@@ -72,6 +85,7 @@ def _jit_sparse_module(
     is_mla: bool = False,
     is_dsv4_layout: bool = False,
     use_global_scratch: bool = False,
+    use_lru_scratch: bool = False,
 ) -> Module:
     template_args = make_cpp_args(
         block_size,
@@ -80,6 +94,7 @@ def _jit_sparse_module(
         is_mla,
         is_dsv4_layout,
         use_global_scratch,
+        use_lru_scratch,
     )
     cache_args = make_cpp_args(
         item_size_bytes,
@@ -89,6 +104,7 @@ def _jit_sparse_module(
         is_mla,
         is_dsv4_layout,
         use_global_scratch,
+        use_lru_scratch,
     )
     return load_jit(
         "sparse_cache",
@@ -173,6 +189,7 @@ def _load_cache_to_device_buffer_mla(
     prefill_ema: torch.Tensor | None = None,
     prefill_steps: torch.Tensor | None = None,
     resolver_scratch: torch.Tensor | None = None,
+    lru_scratch: torch.Tensor | None = None,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
@@ -188,6 +205,12 @@ def _load_cache_to_device_buffer_mla(
         assert resolver_scratch.size(1) >= hisparse_resolver_scratch_words(
             num_top_k, hot_buffer_size
         )
+    if lru_scratch is not None:
+        assert resolver_scratch is None
+        assert lru_scratch.dtype == lru_slots.dtype
+        assert lru_scratch.shape == (device_buffer_tokens.size(0), hot_buffer_size)
+        assert lru_scratch.is_contiguous() and lru_scratch.device == top_k_tokens.device
+        assert lru_scratch.data_ptr() != lru_slots.data_ptr()
 
     module = _jit_sparse_module(
         item_size_bytes,
@@ -197,6 +220,7 @@ def _load_cache_to_device_buffer_mla(
         is_mla=True,
         is_dsv4_layout=is_dsv4_layout,
         use_global_scratch=resolver_scratch is not None,
+        use_lru_scratch=lru_scratch is not None,
     )
 
     # Pass only scalars through TVM FFI.  Its PyTorch fallback can reject tensor
@@ -241,6 +265,8 @@ def _load_cache_to_device_buffer_mla(
             [top_k_tokens.size(0)], dtype=torch.int32, device=top_k_tokens.device
         )
     enable_dynamic_hot_view = enable_full_lookup and req_hot_buffer_sizes is not None
+    if lru_scratch is not None:
+        assert enable_dynamic_hot_view
     if enable_dynamic_hot_view:
         assert req_hot_buffer_sizes.dtype == torch.int32
         assert req_hot_buffer_sizes.device == top_k_tokens.device
@@ -326,6 +352,8 @@ def _load_cache_to_device_buffer_mla(
         prefill_steps.data_ptr() if prefill_steps is not None else 0,
         resolver_scratch.data_ptr() if resolver_scratch is not None else 0,
         resolver_scratch.stride(0) if resolver_scratch is not None else 0,
+        lru_scratch.data_ptr() if lru_scratch is not None else 0,
+        lru_scratch.stride(0) if lru_scratch is not None else 0,
     )
 
 
@@ -364,6 +392,7 @@ def load_cache_to_device_buffer_mla(
     prefill_ema: torch.Tensor | None = None,
     prefill_steps: torch.Tensor | None = None,
     resolver_scratch: torch.Tensor | None = None,
+    lru_scratch: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
     _load_cache_to_device_buffer_mla(
@@ -402,6 +431,7 @@ def load_cache_to_device_buffer_mla(
         prefill_ema=prefill_ema,
         prefill_steps=prefill_steps,
         resolver_scratch=resolver_scratch,
+        lru_scratch=lru_scratch,
     )
 
 
@@ -440,6 +470,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     prefill_ema: torch.Tensor | None = None,
     prefill_steps: torch.Tensor | None = None,
     resolver_scratch: torch.Tensor | None = None,
+    lru_scratch: torch.Tensor | None = None,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -478,6 +509,7 @@ def load_cache_to_device_buffer_dsv4_mla(
         prefill_ema=prefill_ema,
         prefill_steps=prefill_steps,
         resolver_scratch=resolver_scratch,
+        lru_scratch=lru_scratch,
     )
 
 

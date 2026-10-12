@@ -196,6 +196,7 @@ template <
     bool IsMLA,
     bool IsDsv4Layout,
     bool UseGlobalScratch,
+    bool UseLruScratch,
     typename SeqLensT,
     typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_kernel(
@@ -241,7 +242,9 @@ __global__ void load_cache_to_device_buffer_kernel(
     float* __restrict__ prefill_ema,
     int64_t* __restrict__ prefill_steps,
     int32_t* __restrict__ resolver_scratch,
-    int64_t resolver_scratch_stride) {
+    int64_t resolver_scratch_stride,
+    typename SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::SlotT* __restrict__ lru_scratch,
+    int64_t lru_scratch_stride) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
@@ -348,9 +351,9 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   SlotT* smem_slots = reinterpret_cast<SlotT*>(smem_i32 + Layout::TOTAL_INT32);
   // Compacted slot ordering: [hits fwd->  ...  <-evictables bwd]
-  SlotT* s_lru_slots_out = smem_slots;
+  SlotT* s_lru_slots_out = UseLruScratch ? lru_scratch + rid * lru_scratch_stride : smem_slots;
   // Open-addressing hash table: top-k token_id -> top-k index (values)
-  SlotT* s_hash_vals = s_lru_slots_out + HOT_BUFFER_SIZE;
+  SlotT* s_hash_vals = smem_slots + (UseLruScratch ? 0 : HOT_BUFFER_SIZE);
 
   // Classify FULL hits once, before initializing any HOT hash/LRU workspace.
   if (tid == 0) {
@@ -373,6 +376,8 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int newest_slot = HOT_BUFFER_SIZE;
   const int32_t newest_token = seq_len - 1;
 
+  int local_full_hits = 0;
+  bool local_needs_hot = false;
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
     int64_t full_loc = 0;
@@ -404,7 +409,7 @@ __global__ void load_cache_to_device_buffer_kernel(
           static_cast<unsigned long long>(touch_clock[0]));
       s_top_k_tokens[i] = TOKEN_HIT;
       req_top_k_device_locs[i] = static_cast<int32_t>(full_loc + full_location_base);
-      atomicAdd(&full_resident_accesses, 1);
+      ++local_full_hits;
     } else if (!enable_full_lookup && token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
@@ -414,10 +419,22 @@ __global__ void load_cache_to_device_buffer_kernel(
     } else {
       s_top_k_tokens[i] = token_idx;
       if (enable_full_lookup) {
-        atomicExch(&needs_hot_resolver, 1);
+        local_needs_hot = true;
       } else {
         insert_top_k_token(token_idx, i, s_hash_keys, s_hash_vals, HASH_SIZE);
       }
+    }
+  }
+  if (enable_full_lookup) {
+    // FULL classification aggregates within each warp instead of serializing
+    // every selected entry through the same two shared counters.
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+      local_full_hits += __shfl_down_sync(FULL_WARP_MASK, local_full_hits, offset, WARP_SIZE);
+    }
+    const BallotMask hot_mask = __ballot_sync(FULL_WARP_MASK, local_needs_hot);
+    if (lane_id == 0) {
+      if (local_full_hits) atomicAdd(&full_resident_accesses, local_full_hits);
+      if (hot_mask) atomicExch(&needs_hot_resolver, 1);
     }
   }
   __syncthreads();
@@ -742,7 +759,14 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsDsv4Layout, bool UseGlobalScratch>
+template <
+    int BLOCK_SIZE,
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    bool IsMLA,
+    bool IsDsv4Layout,
+    bool UseGlobalScratch,
+    bool UseLruScratch = false>
 void load_cache_to_device_buffer(
     uint64_t top_k_tokens_ptr,
     uint64_t device_buffer_tokens_ptr,
@@ -788,11 +812,19 @@ void load_cache_to_device_buffer(
     uint64_t prefill_ema_ptr,
     uint64_t prefill_steps_ptr,
     uint64_t resolver_scratch_ptr,
-    int64_t resolver_scratch_stride) {
+    int64_t resolver_scratch_stride,
+    uint64_t lru_scratch_ptr = 0,
+    int64_t lru_scratch_stride = 0) {
   using namespace host;
 
   using SlotT = typename SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::SlotT;
   RuntimeCheck((resolver_scratch_ptr != 0) == UseGlobalScratch, "HiSparse scratch does not match the compiled path");
+  RuntimeCheck((lru_scratch_ptr != 0) == UseLruScratch, "HiSparse LRU scratch does not match the compiled path");
+  RuntimeCheck(!UseGlobalScratch || !UseLruScratch, "HiSparse scratch paths are mutually exclusive");
+  RuntimeCheck(
+      !UseLruScratch || (enable_full_lookup && enable_dynamic_hot_view && lru_scratch_stride >= HOT_BUFFER_SIZE &&
+                         lru_scratch_ptr != lru_slots_ptr),
+      "Compact scratch requires KVDuo with a separate full-capacity LRU workspace");
 
   const auto stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(stream_ptr));
 
@@ -800,7 +832,8 @@ void load_cache_to_device_buffer(
   // seq_lens and req_pool_indices; the correct combo is selected at runtime.
   auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr, const auto* req_pool_indices_ptr) {
     constexpr size_t required_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
-    constexpr size_t smem_bytes = UseGlobalScratch ? 0 : required_bytes;
+    constexpr size_t smem_bytes =
+        UseGlobalScratch ? 0 : (UseLruScratch ? SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::COMPACT_BYTES : required_bytes);
     RuntimeCheck(
         resolver_scratch_ptr == 0 || resolver_scratch_stride * sizeof(int32_t) >= required_bytes,
         "HiSparse global resolver scratch row is too small");
@@ -867,7 +900,9 @@ void load_cache_to_device_buffer(
         reinterpret_cast<float*>(static_cast<uintptr_t>(prefill_ema_ptr)),
         reinterpret_cast<int64_t*>(static_cast<uintptr_t>(prefill_steps_ptr)),
         reinterpret_cast<int32_t*>(static_cast<uintptr_t>(resolver_scratch_ptr)),
-        resolver_scratch_stride);
+        resolver_scratch_stride,
+        reinterpret_cast<SlotT*>(static_cast<uintptr_t>(lru_scratch_ptr)),
+        lru_scratch_stride);
   };
 
   if (seq_is_i64 && rpi_is_i64) {
@@ -879,6 +914,7 @@ void load_cache_to_device_buffer(
             IsMLA,
             IsDsv4Layout,
             UseGlobalScratch,
+            UseLruScratch,
             int64_t,
             int64_t>,
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
@@ -892,6 +928,7 @@ void load_cache_to_device_buffer(
             IsMLA,
             IsDsv4Layout,
             UseGlobalScratch,
+            UseLruScratch,
             int64_t,
             int32_t>,
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
@@ -905,6 +942,7 @@ void load_cache_to_device_buffer(
             IsMLA,
             IsDsv4Layout,
             UseGlobalScratch,
+            UseLruScratch,
             int32_t,
             int64_t>,
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
@@ -918,6 +956,7 @@ void load_cache_to_device_buffer(
             IsMLA,
             IsDsv4Layout,
             UseGlobalScratch,
+            UseLruScratch,
             int32_t,
             int32_t>,
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(seq_lens_ptr)),

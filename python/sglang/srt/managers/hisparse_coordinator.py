@@ -19,6 +19,7 @@ from sglang.kernels.ops.kvcache.kvduo_full_reclaim import (
     select_kvduo_full_pages,
     summarize_kvduo_full_pages,
 )
+from sglang.kernels.ops.kvcache.kvduo_full_write import publish_kvduo_full_write
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -250,6 +251,20 @@ class HiSparseCoordinator:
             self.device_buffer_size,
             self.swap_in_block_size,
             device,
+            use_lru_scratch=self.enable_mixed_residency,
+        )
+        self.resolver_lru_scratch = (
+            torch.empty(
+                (max_num_req_slots, self.device_buffer_size),
+                dtype=(
+                    torch.int32
+                    if self.device_buffer_size > torch.iinfo(torch.int16).max
+                    else torch.int16
+                ),
+                device=device,
+            )
+            if self.enable_mixed_residency and self.resolver_scratch is None
+            else None
         )
         max_context_len = req_to_token_pool.max_context_len
         max_compressed_context_len = (
@@ -3362,8 +3377,9 @@ class HiSparseCoordinator:
                     )
                 )
                 positions = seq_lens - 1
-                self.req_to_full_lookup[req_pool_indices, positions] = compressed_locs
-                self._publish_kvduo_model_write(compressed_locs)
+                self._publish_kvduo_model_write(
+                    compressed_locs, req_pool_indices, positions
+                )
                 return
             # Grow device buffers if needed and resolve the latest-token slot.
             reserved_buffer_loc = self._grow_device_buffers(
@@ -3411,10 +3427,9 @@ class HiSparseCoordinator:
                 active_out_cache_loc
             )
             positions = compressed_seq_lens - 1
-            self.req_to_full_lookup[active_req_pool_indices, positions] = (
-                compressed_locs
+            self._publish_kvduo_model_write(
+                compressed_locs, active_req_pool_indices, positions
             )
-            self._publish_kvduo_model_write(compressed_locs)
             return
 
         reserved_positions = (compressed_seq_lens - 1).clamp(
@@ -3637,13 +3652,24 @@ class HiSparseCoordinator:
                 )
             self._pending_kvduo_host_valid.clear()
 
-    def _publish_kvduo_model_write(self, logical_locs: torch.Tensor) -> None:
+    def _publish_kvduo_model_write(
+        self,
+        logical_locs: torch.Tensor,
+        req_indices: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+    ) -> None:
         """Publish a newly generated KV identity in the unified address space."""
-        self.full_touch_clock.add_(1)
-        self.full_generation[logical_locs] += 1
-        self.full_data_version[logical_locs] = 1
-        self.full_host_version[logical_locs] = -1
-        self.full_last_touch[logical_locs] = self.full_touch_clock[0]
+        publish_kvduo_full_write(
+            logical_locs,
+            self.full_generation,
+            self.full_data_version,
+            self.full_host_version,
+            self.full_last_touch,
+            self.full_touch_clock,
+            lookup=self.req_to_full_lookup if req_indices is not None else None,
+            req_indices=req_indices,
+            positions=positions,
+        )
 
     def record_kvduo_model_update(self, logical_locs: torch.Tensor) -> None:
         """Record an in-place model KV update without changing its generation."""
@@ -4157,6 +4183,7 @@ class HiSparseCoordinator:
                 else 0
             ),
             resolver_scratch=getattr(self, "resolver_scratch", None),
+            lru_scratch=getattr(self, "resolver_lru_scratch", None),
         )
         if self.enable_mixed_residency:
             # Capturable execution boundary: an invalid/mismatched host source

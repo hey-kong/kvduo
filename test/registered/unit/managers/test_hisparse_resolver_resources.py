@@ -38,6 +38,11 @@ def native_layouts(tmp_path_factory):
             f"sglang::HisparseResolverLayout<{topk},{capacity},{warp}>::BYTES; }}"
             for i, (topk, capacity, warp) in enumerate(LAYOUTS)
         )
+        + "\n".join(
+            f'extern "C" size_t compact_{i}() {{ return '
+            f"sglang::HisparseResolverLayout<{topk},{capacity},{warp}>::COMPACT_BYTES; }}"
+            for i, (topk, capacity, warp) in enumerate(LAYOUTS)
+        )
     )
     library = directory / "layouts.so"
     subprocess.run(
@@ -61,16 +66,36 @@ def native_layouts(tmp_path_factory):
         function = getattr(native, f"layout_{i}")
         function.restype = ctypes.c_size_t
         sizes.append(function())
-    return sizes
+    compact_sizes = []
+    for i in range(len(LAYOUTS)):
+        function = getattr(native, f"compact_{i}")
+        function.restype = ctypes.c_size_t
+        compact_sizes.append(function())
+    return sizes, compact_sizes
 
 
 @pytest.mark.parametrize("case", range(len(LAYOUTS)))
 def test_python_workspace_covers_actual_compiled_layout(native_layouts, case):
     topk, capacity, warp = LAYOUTS[case]
-    size = native_layouts[case]
+    size = native_layouts[0][case]
     words = ops.hisparse_resolver_scratch_words(topk, capacity, warp_size=warp)
     assert size <= words * 4 < size + 4
-    assert native_layouts[0] == 210712
+    assert native_layouts[0][0] == 210712
+
+
+@pytest.mark.parametrize("case", range(len(LAYOUTS)))
+def test_compact_workspace_matches_cpp_and_excludes_capacity_sized_lru(
+    native_layouts, case
+):
+    topk, capacity, warp = LAYOUTS[case]
+    size = native_layouts[1][case]
+    words = ops.hisparse_resolver_scratch_words(
+        topk, capacity, warp_size=warp, use_lru_scratch=True
+    )
+    assert size <= words * 4 < size + 4
+    slot_bytes = 4 if capacity > 32767 else 2
+    assert size == native_layouts[0][case] - capacity * slot_bytes
+    assert native_layouts[1][0] == 50968
 
 
 @pytest.mark.parametrize(
@@ -179,8 +204,93 @@ def test_wrapper_passes_persistent_workspace_address_and_stride_without_tensor_f
         resolver_scratch=workspace,
     )
     arguments = module.load_cache_to_device_buffer.call_args.args
-    assert arguments[-2:] == (
+    assert arguments[-4:-2] == (
         (workspace.data_ptr(), workspace.stride(0)) if global_scratch else (0, 0)
     )
+    assert arguments[-2:] == (0, 0)
     assert compile_module.call_args.kwargs["use_global_scratch"] is global_scratch
+    assert not any(isinstance(arg, torch.Tensor) for arg in arguments)
+
+
+@pytest.mark.parametrize(
+    "shared_limit,global_scratch", [(49152, True), (163840, False), (233472, False)]
+)
+def test_compact_workspace_uses_small_shared_layout_or_the_complete_global_fallback(
+    monkeypatch, shared_limit, global_scratch
+):
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(
+            shared_memory_per_block=49152,
+            shared_memory_per_block_optin=shared_limit,
+            max_threads_per_block=1024,
+        ),
+    )
+    workspace = torch.empty((3, 52678), dtype=torch.int32)
+    allocate = MagicMock(return_value=workspace)
+    monkeypatch.setattr(torch, "empty", allocate)
+    result = ops.allocate_hisparse_resolver_scratch(
+        3,
+        2048,
+        39936,
+        960,
+        torch.device("cuda:2"),
+        use_lru_scratch=True,
+    )
+    if global_scratch:
+        assert result is workspace
+        allocate.assert_called_once_with(
+            (3, 52678), dtype=torch.int32, device=torch.device("cuda:2")
+        )
+    else:
+        assert result is None
+        allocate.assert_not_called()
+
+
+@pytest.mark.parametrize("capacity", [1536, 39936])
+def test_compact_mla_wrapper_passes_separate_lru_storage_without_tensor_ffi(
+    monkeypatch, capacity
+):
+    module = SimpleNamespace(load_cache_to_device_buffer=MagicMock())
+    compile_module = MagicMock(return_value=module)
+    monkeypatch.setattr(ops, "_jit_sparse_module", compile_module)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda _: SimpleNamespace(cuda_stream=123)
+    )
+    slots = torch.empty(
+        (2, capacity), dtype=torch.int16 if capacity < 32768 else torch.int32
+    )
+    scratch = torch.empty_like(slots)
+    full = torch.ones(4, dtype=torch.int64)
+    ops.load_cache_to_device_buffer_mla(
+        top_k_tokens=torch.zeros((1, 1), dtype=torch.int32),
+        device_buffer_tokens=torch.zeros((2, capacity + 64), dtype=torch.int32),
+        host_cache_locs=torch.zeros((2, 4), dtype=torch.int64),
+        device_buffer_locs=torch.zeros((2, capacity + 64), dtype=torch.int32),
+        host_cache=torch.zeros((4, 1, 8)),
+        device_buffer=torch.zeros((4, 1, 8)),
+        top_k_device_locs=torch.zeros((1, 1), dtype=torch.int32),
+        req_pool_indices=torch.ones(1, dtype=torch.int64),
+        seq_lens=torch.ones(1, dtype=torch.int32),
+        lru_slots=slots,
+        item_size_bytes=32,
+        num_top_k=1,
+        hot_buffer_size=capacity,
+        req_hot_buffer_sizes=torch.ones(2, dtype=torch.int32),
+        req_to_logical_token=torch.zeros((2, 4), dtype=torch.int64),
+        full_to_device_loc=full,
+        full_last_touch=full.clone(),
+        full_data_version=full.clone(),
+        full_host_version=full.clone(),
+        swap_status=torch.zeros(2, dtype=torch.int32),
+        resolver_stats=torch.zeros((2, 2), dtype=torch.int32),
+        touch_clock=torch.zeros(1, dtype=torch.int64),
+        lru_scratch=scratch,
+    )
+    arguments = module.load_cache_to_device_buffer.call_args.args
+    assert arguments[-4:] == (0, 0, scratch.data_ptr(), scratch.stride(0))
+    assert compile_module.call_args.kwargs["use_lru_scratch"]
+    assert not compile_module.call_args.kwargs["use_global_scratch"]
     assert not any(isinstance(arg, torch.Tensor) for arg in arguments)
