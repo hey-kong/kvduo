@@ -12,7 +12,6 @@ from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocat
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
-
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
@@ -232,7 +231,7 @@ def test_coordinator_initializes_workspace_once_and_reuses_it_across_requests(
     from sglang.kernels.ops.kvcache.hisparse import hisparse_resolver_scratch_words
 
     allocate = MagicMock(
-        side_effect=lambda requests, topk, capacity, block, device: torch.empty(
+        side_effect=lambda requests, topk, capacity, block, device, **kwargs: torch.empty(
             (requests, hisparse_resolver_scratch_words(topk, capacity)),
             dtype=torch.int32,
             device=device,
@@ -244,6 +243,8 @@ def test_coordinator_initializes_workspace_once_and_reuses_it_across_requests(
     swap = MagicMock()
     monkeypatch.setattr(module, "load_cache_to_device_buffer_mla", swap)
     workspace = c.resolver_scratch
+    assert c.resolver_lru_scratch is None
+    assert allocate.call_args.kwargs["use_lru_scratch"]
     for req in (1, 0):
         c.swap_in_selected_pages(
             torch.tensor([req]),
@@ -252,7 +253,32 @@ def test_coordinator_initializes_workspace_once_and_reuses_it_across_requests(
             77,
         )
         assert swap.call_args.kwargs["resolver_scratch"] is workspace
-    allocate.assert_called_once_with(2, 2048, 39936, 960, torch.device("cpu"))
+    allocate.assert_called_once_with(
+        2, 2048, 39936, 960, torch.device("cpu"), use_lru_scratch=True
+    )
+
+
+def test_coordinator_reuses_compact_lru_workspace_across_requests_and_layers(
+    monkeypatch,
+):
+    import sglang.srt.managers.hisparse_coordinator as module
+
+    c, _, _ = make_stack(monkeypatch, layers=78, top_k=2048)
+    assert c.resolver_scratch is None
+    workspace = c.resolver_lru_scratch
+    assert workspace.shape == (2, 39936) and workspace.dtype == torch.int32
+    c.mem_pool_host.kv_buffer = torch.zeros((78, 1, 1, 16), dtype=torch.bfloat16)
+    swap = MagicMock()
+    monkeypatch.setattr(module, "load_cache_to_device_buffer_mla", swap)
+    for layer, req in ((77, 1), (0, 0)):
+        c.swap_in_selected_pages(
+            torch.tensor([req]),
+            torch.tensor([2048]),
+            torch.zeros((1, 2048), dtype=torch.int32),
+            layer,
+        )
+        assert swap.call_args.kwargs["lru_scratch"] is workspace
+        assert swap.call_args.kwargs["resolver_scratch"] is None
 
 
 def test_kvduo_bf16_flashmla_kv_rejected_during_actual_backend_initialization(

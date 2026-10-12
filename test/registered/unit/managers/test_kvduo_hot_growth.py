@@ -404,11 +404,11 @@ def test_resolver_ffi_receives_the_stable_growth_event_pointer(monkeypatch, dsv4
     assert args[20] == coordinator.kvduo_hot_growth_events[0].data_ptr()
     assert args[12] == coordinator.kvduo_capacity_ema[0].data_ptr()
     assert args[27] == coordinator.kvduo_capacity_steps[0].data_ptr()
-    assert args[-6:-2] == (
+    assert args[-8:-4] == (
         coordinator.kvduo_observe.data_ptr(),
         coordinator.kvduo_hot_base_capacity[0].data_ptr(),
         coordinator.kvduo_prefill_ema[0].data_ptr(),
         coordinator.kvduo_prefill_steps[0].data_ptr(),
     )
-    assert args[-2:] == (0, 0)  # Small capacities keep the shared-memory path.
+    assert args[-4:] == (0, 0, 0, 0)  # This fixture keeps the original shared path.
     assert all(isinstance(arg, (int, bool, float)) for arg in args)

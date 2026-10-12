@@ -924,7 +924,8 @@ def test_load_cache_to_device_buffer_dsv4_mla_miss_copy_layout() -> None:
     or torch.cuda.get_device_capability()[0] not in (9, 10),
     reason="TopK V2 requires a supported CUDA SM90/SM100 GPU.",
 )
-def test_kvduo_dsv4_topk_v2_raw_resolver_graph_with_full_hot_host_and_padding():
+@pytest.mark.parametrize("compact", [False, True])
+def test_kvduo_dsv4_topk_v2_raw_resolver_graph_with_full_hot_host_and_padding(compact):
     from sglang.kernels.ops.attention.dsv4.topk import (
         plan_topk_v2,
         topk_transform_512_v2,
@@ -969,6 +970,7 @@ def test_kvduo_dsv4_topk_v2_raw_resolver_graph_with_full_hot_host_and_padding():
     locations = torch.full_like(tokens, -1)
     locations[1, :k] = torch.arange(hot_start, hot_start + k, device=DEVICE)
     lru = torch.arange(k, dtype=torch.int16, device=DEVICE).repeat(2, 1)
+    lru_scratch = torch.full_like(lru, -123) if compact else None
     lru[1] = torch.cat([lru[1, 64:], lru[1, :64]])
     initial_tokens = tokens[1].clone()
     initial_lru = lru[1].clone()
@@ -1003,6 +1005,7 @@ def test_kvduo_dsv4_topk_v2_raw_resolver_graph_with_full_hot_host_and_padding():
         swap_status=status,
         resolver_stats=stats,
         touch_clock=torch.tensor([7], dtype=torch.int64, device=DEVICE),
+        lru_scratch=lru_scratch,
     )
 
     def run():
@@ -1017,6 +1020,8 @@ def test_kvduo_dsv4_topk_v2_raw_resolver_graph_with_full_hot_host_and_padding():
         assert torch.equal(output[0].long(), mapping[logical[0, raw[0].long()]])
         assert torch.equal(selected[0].long(), logical[0, raw[0].long()])
         assert torch.equal(raw[1, :256], torch.arange(256, device=DEVICE))
+        if compact:
+            assert torch.all(lru_scratch[0] == -123)
         for position, byte in [(0, 0x11), (128, 0x22), (192, 0x33), (255, 0x33)]:
             value = _read_dsv4_token(device, int(output[1, position]))
             assert torch.all(value == byte)
@@ -1916,16 +1921,18 @@ def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru
 
 
 @pytest.mark.parametrize("active_capacity", [0, 78 * 64, 8 * 78 * 64])
-@pytest.mark.parametrize("global_scratch", [True, False])
+@pytest.mark.parametrize("workspace_mode", ["global", "shared", "compact"])
 @pytest.mark.parametrize("full_only", [True, False])
 def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_scratch(
-    active_capacity, global_scratch, full_only
+    active_capacity, workspace_mode, full_only
 ):
     # Exact configuration from the resource regression: 210712 bytes at
     # compile-time max capacity, even when only one HOT page is currently live.
     topk, capacity, base, requests = 2048, 39936, 4992, 2
+    global_scratch = workspace_mode == "global"
+    compact = workspace_mode == "compact"
     scratch = allocate_hisparse_resolver_scratch(
-        requests, topk, capacity, 960, torch.device(DEVICE)
+        requests, topk, capacity, 960, torch.device(DEVICE), use_lru_scratch=compact
     )
     if not global_scratch and scratch is not None:
         pytest.skip("Device cannot run this fixture's shared-memory variant")
@@ -1935,6 +1942,11 @@ def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_sc
         scratch = torch.full((requests, words + 4), 7, dtype=torch.int32, device=DEVICE)
     else:
         scratch = None
+    lru_scratch = (
+        torch.full((requests, capacity), -123, dtype=torch.int32, device=DEVICE)
+        if compact
+        else None
+    )
     host = torch.empty((requests * topk, 1, KV_DIM), dtype=DTYPE, pin_memory=True)
     host.copy_(torch.arange(requests * topk, dtype=DTYPE).view(-1, 1, 1))
     tokens = torch.full((requests, capacity + 64), -1, dtype=torch.int32, device=DEVICE)
@@ -2008,6 +2020,7 @@ def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_sc
         prefill_ema=torch.zeros((requests, 2), dtype=torch.float32, device=DEVICE),
         prefill_steps=torch.zeros(requests, dtype=torch.int64, device=DEVICE),
         resolver_scratch=scratch,
+        lru_scratch=lru_scratch,
     )
     banks = [value for value in kwargs.values() if isinstance(value, torch.Tensor)]
     addresses = [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
@@ -2019,6 +2032,8 @@ def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_sc
     extra_hits = int(active_capacity > base and not full_only)
     misses = topk - 2 if active_capacity and not full_only else 0
     assert kwargs["prefill_ema"].tolist() == [[extra_hits, misses]] * requests
+    if compact and (full_only or active_capacity == 0):
+        assert torch.all(lru_scratch == -123)
     if scratch is not None:
         assert torch.all(scratch[:, words:] == 7)
     kwargs["observe_cache"].zero_()
@@ -2030,11 +2045,15 @@ def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_sc
     kwargs["prefill_steps"].zero_()
     if scratch is not None:
         scratch.fill_(31)  # Scratch from older objects must never affect replay.
+    if compact:
+        lru_scratch.fill_(-321)
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(device[output[:2].long(), 0, 0], expected.flip(0))
     assert kwargs["prefill_ema"].tolist() == [[extra_hits, 0]] * requests
     assert kwargs["prefill_steps"].tolist() == [1] * requests
+    if compact and (full_only or active_capacity == 0):
+        assert torch.all(lru_scratch == -321)
     assert addresses == [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
     if scratch is not None:
         assert torch.all(scratch[:, words:] == 31)
@@ -2063,10 +2082,13 @@ def test_kvduo_rollback_rejects_incompatible_bank_shapes_before_mutation(bad_ban
     assert all(torch.equal(bank, original) for bank, original in zip(banks, before))
 
 
-def test_kvduo_resolver_graph_replays_after_no_copy_rollback_without_recapture():
+@pytest.mark.parametrize("compact", [False, True])
+def test_kvduo_resolver_graph_replays_after_no_copy_rollback_without_recapture(compact):
     from sglang.kernels.ops.kvcache.hisparse import rollback_kvduo_hot_metadata
 
     kwargs = _kvduo_observation_case()
+    if compact:
+        kwargs["lru_scratch"] = torch.empty_like(kwargs["lru_slots"])
     kwargs.update(
         hot_base_capacities=torch.tensor([2], dtype=torch.int32, device=DEVICE),
         prefill_ema=torch.zeros((1, 2), dtype=torch.float32, device=DEVICE),
@@ -2089,6 +2111,8 @@ def test_kvduo_resolver_graph_replays_after_no_copy_rollback_without_recapture()
         "capacity_steps",
         "hot_growth_events",
     )
+    if compact:
+        keys += ("lru_scratch",)
     addresses = [
         (kwargs[key].data_ptr(), kwargs[key].shape, kwargs[key].stride())
         for key in keys
@@ -2134,8 +2158,13 @@ def test_kvduo_resolver_graph_replays_after_no_copy_rollback_without_recapture()
     assert torch.equal(kwargs["device_buffer"][7].cpu(), kwargs["host_cache"][6])
 
 
-def test_kvduo_graph_observes_new_capacity_without_recapture_or_synthetic_reuse():
+@pytest.mark.parametrize("compact", [False, True])
+def test_kvduo_graph_observes_new_capacity_without_recapture_or_synthetic_reuse(
+    compact,
+):
     kwargs = _kvduo_observation_case(selected=(1, 4), capacity=2, lru=(0, 1, 2, 3))
+    if compact:
+        kwargs["lru_scratch"] = torch.empty_like(kwargs["lru_slots"])
     load_cache_to_device_buffer_mla(**kwargs)
     torch.cuda.synchronize()
     kwargs["observe_cache"].zero_()
@@ -2150,6 +2179,8 @@ def test_kvduo_graph_observes_new_capacity_without_recapture_or_synthetic_reuse(
         "req_hot_buffer_sizes",
         "lru_slots",
     )
+    if compact:
+        keys += ("lru_scratch",)
     addresses = [
         (kwargs[key].data_ptr(), kwargs[key].shape, kwargs[key].stride())
         for key in keys
@@ -2174,3 +2205,108 @@ def test_kvduo_graph_observes_new_capacity_without_recapture_or_synthetic_reuse(
         (kwargs[key].data_ptr(), kwargs[key].shape, kwargs[key].stride())
         for key in keys
     ]
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_kvduo_full_mixed_capacity_transitions_share_one_resolver_graph(
+    compact,
+):
+    requests, topk, capacity, context = 2, 2, 8, 8
+    tokens = torch.full((requests, capacity + 64), -1, dtype=torch.int32, device=DEVICE)
+    locations = torch.full_like(tokens, -1)
+    locations[:, :capacity] = torch.arange(24, 40, device=DEVICE).view(
+        requests, capacity
+    )
+    lru = torch.arange(capacity, dtype=torch.int16, device=DEVICE).repeat(requests, 1)
+    scratch = torch.full_like(lru, -123) if compact else None
+    logical = torch.arange(requests * context, dtype=torch.int64, device=DEVICE).view(
+        requests, context
+    )
+    mapping = torch.arange(8, 24, dtype=torch.int64, device=DEVICE)
+    initial_mapping = mapping.clone()
+    host = torch.empty((requests * context, 1, KV_DIM), dtype=DTYPE, pin_memory=True)
+    host.copy_(torch.arange(host.numel(), dtype=DTYPE).view_as(host))
+    device = torch.full((40, 1, KV_DIM), -222, dtype=DTYPE, device=DEVICE)
+    device[mapping] = host.to(DEVICE)
+    selected = torch.tensor(
+        [[6, 2], [4, 1], [-1, -1]], dtype=torch.int32, device=DEVICE
+    )
+    versions = torch.ones_like(mapping)
+    hot_capacity = torch.zeros(requests, dtype=torch.int32, device=DEVICE)
+    stats = torch.zeros((requests, 2), dtype=torch.int32, device=DEVICE)
+    kwargs = dict(
+        top_k_tokens=selected,
+        device_buffer_tokens=tokens,
+        host_cache_locs=torch.arange(
+            requests * context, dtype=torch.int64, device=DEVICE
+        ).view(requests, context),
+        device_buffer_locs=locations,
+        host_cache=host,
+        device_buffer=device,
+        top_k_device_locs=torch.full_like(selected, -123),
+        req_pool_indices=torch.tensor([1, 0, 9999], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([context, context, 0], dtype=torch.int32, device=DEVICE),
+        lru_slots=lru,
+        item_size_bytes=ITEM_SIZE_BYTES,
+        num_top_k=topk,
+        hot_buffer_size=capacity,
+        page_size=4,
+        block_size=256,
+        num_real_reqs=torch.tensor([requests], dtype=torch.int32, device=DEVICE),
+        req_hot_buffer_sizes=hot_capacity,
+        req_to_logical_token=logical,
+        full_to_device_loc=mapping,
+        full_last_touch=torch.zeros_like(mapping),
+        full_data_version=versions,
+        full_host_version=versions.clone(),
+        swap_status=torch.zeros(requests, dtype=torch.int32, device=DEVICE),
+        resolver_stats=stats,
+        touch_clock=torch.ones(1, dtype=torch.int64, device=DEVICE),
+        lru_scratch=scratch,
+    )
+    banks = [value for value in kwargs.values() if isinstance(value, torch.Tensor)]
+    addresses = [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        load_cache_to_device_buffer_mla(**kwargs)
+    for active_capacity in (0, 4, 8, 4, 0):
+        tokens.fill_(-1)
+        lru.copy_(
+            torch.arange(capacity, dtype=lru.dtype, device=DEVICE).repeat(requests, 1)
+        )
+        hot_capacity.fill_(active_capacity)
+        mapping.copy_(initial_mapping)
+        if active_capacity:
+            mapping[logical[1, 6]] = 0
+            mapping[logical[0, 4]] = 0
+        device[24:].fill_(-222)
+        if compact:
+            scratch.fill_(-321)
+        before = stats.clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        output = kwargs["top_k_device_locs"]
+        assert torch.all(output[2] == -1)
+        assert not kwargs["swap_status"].any().item()
+        assert torch.equal(
+            stats - before,
+            torch.tensor(
+                [[int(active_capacity > 0), 2]] * requests,
+                dtype=stats.dtype,
+                device=DEVICE,
+            ),
+        )
+        expected = host[torch.tensor([[14, 10], [4, 1]])].to(DEVICE)
+        assert torch.equal(device[output[:requests].long()], expected)
+        if active_capacity:
+            assert torch.equal(
+                torch.sort(lru[:, :active_capacity].int()).values,
+                torch.arange(active_capacity, device=DEVICE).repeat(requests, 1),
+            )
+        elif compact:
+            assert torch.all(scratch == -321)
+        assert addresses == [
+            (bank.data_ptr(), bank.shape, bank.stride()) for bank in banks
+        ]
