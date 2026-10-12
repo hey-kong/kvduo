@@ -139,6 +139,7 @@ def test_other_prefills_and_decode_cannot_spend_host_hold_and_cancellation_relea
     assert c._kvduo_host_capacity_ready(2)
     assert not c._kvduo_host_capacity_ready(4)
     decode = SimpleNamespace(req_pool_idx=0, kv_committed_len=4)
+    c.token_to_kv_pool_allocator.page_size = c.page_size
     c._reclaim_kvduo_radix_pages = MagicMock()
     result = c.ensure_kvduo_decode_capacity([decode])
     assert result.action is KVDuoPressureAction.ERROR

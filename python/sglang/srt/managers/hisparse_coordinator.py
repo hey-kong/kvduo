@@ -1481,14 +1481,6 @@ class HiSparseCoordinator:
         """
         if not self.enable_mixed_residency:
             return self._reclaim_for_physical_allocation(0)
-        if not self._kvduo_host_capacity_ready(self._kvduo_decode_host_slots(requests)):
-            return KVDuoPressureResult(
-                KVDuoPressureStatus.RECLAIM_REQUIRED,
-                0,
-                action=KVDuoPressureAction.ERROR,
-                reason=KVDuoPressureReason.MEMORY_SHORTAGE,
-                detail="KVDuo Host pool cannot cover decode backup and prefill reservations",
-            )
         pages = 0
         if self.is_dsv4_hisparse:
             page = self.page_size
@@ -1503,12 +1495,36 @@ class HiSparseCoordinator:
             pages = sum(
                 int(req.kv_committed_len % logical_page == 0) for req in requests
             )
-        self._reclaim_kvduo_radix_pages(
-            pages
-            + self._kvduo_mandatory_hot_pages()
-            + self._kvduo_reserved_prefill_pages(),
-            tree_cache,
+        host_slots = self._kvduo_decode_host_slots(requests)
+        required_host_slots = host_slots + sum(
+            reservation[1]
+            for reservation in self._kvduo_prefill_host_reservations.values()
         )
+        minimum_pages = self._kvduo_mandatory_hot_pages()
+        required_pages = pages + minimum_pages + self._kvduo_reserved_prefill_pages()
+        physical_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        local_ready = (
+            self.mem_pool_host.available_size() >= required_host_slots
+            and physical_allocator.available_size() // self.page_size >= required_pages
+        )
+        # A single collective covers both pools when no reclamation is needed.
+        # All TP ranks must agree before any rank skips the pressure path.
+        if self._kvduo_common_available(int(local_ready)):
+            return KVDuoPressureResult(
+                KVDuoPressureStatus.READY,
+                self._physical_bytes((pages + minimum_pages) * self.page_size),
+                action=KVDuoPressureAction.SUCCESS,
+                reason=KVDuoPressureReason.NONE,
+            )
+        if not self._kvduo_host_capacity_ready(host_slots):
+            return KVDuoPressureResult(
+                KVDuoPressureStatus.RECLAIM_REQUIRED,
+                0,
+                action=KVDuoPressureAction.ERROR,
+                reason=KVDuoPressureReason.MEMORY_SHORTAGE,
+                detail="KVDuo Host pool cannot cover decode backup and prefill reservations",
+            )
+        self._reclaim_kvduo_radix_pages(required_pages, tree_cache)
         return self._reclaim_for_physical_allocation(
             pages * self.page_size, reserve_hot_minimum=True
         )
