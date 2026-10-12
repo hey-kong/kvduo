@@ -3361,26 +3361,14 @@ class HiSparseCoordinator:
             self._backup_kvduo_sealed_pages(
                 seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
             )
+            self._publish_kvduo_decode_write(out_cache_loc, req_pool_indices, seq_lens)
+            return
         else:
             self._eager_backup_previous_token(
                 seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
             )
 
         if not self.is_dsv4_hisparse:
-            if self.enable_mixed_residency:
-                # KVDuo appends into the allocator-provided full tail page.
-                # A temporary hot append slot must not be allocated or exposed
-                # as a durable full mapping.
-                compressed_locs = (
-                    self.token_to_kv_pool_allocator.get_last_loc_compressed(
-                        out_cache_loc
-                    )
-                )
-                positions = seq_lens - 1
-                self._publish_kvduo_model_write(
-                    compressed_locs, req_pool_indices, positions
-                )
-                return
             # Grow device buffers if needed and resolve the latest-token slot.
             reserved_buffer_loc = self._grow_device_buffers(
                 seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
@@ -3422,16 +3410,6 @@ class HiSparseCoordinator:
         active_req_pool_indices = req_pool_indices[active_reqs]
 
         compressed_seq_lens = active_seq_lens // self.compress_ratio
-        if self.enable_mixed_residency:
-            compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
-                active_out_cache_loc
-            )
-            positions = compressed_seq_lens - 1
-            self._publish_kvduo_model_write(
-                compressed_locs, active_req_pool_indices, positions
-            )
-            return
-
         reserved_positions = (compressed_seq_lens - 1).clamp(
             max=self.device_buffer_size
         )
@@ -3652,23 +3630,24 @@ class HiSparseCoordinator:
                 )
             self._pending_kvduo_host_valid.clear()
 
-    def _publish_kvduo_model_write(
+    def _publish_kvduo_decode_write(
         self,
-        logical_locs: torch.Tensor,
-        req_indices: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
+        out_cache_loc: torch.Tensor,
+        req_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
     ) -> None:
         """Publish a newly generated KV identity in the unified address space."""
         publish_kvduo_full_write(
-            logical_locs,
+            out_cache_loc,
             self.full_generation,
             self.full_data_version,
             self.full_host_version,
             self.full_last_touch,
             self.full_touch_clock,
-            lookup=self.req_to_full_lookup if req_indices is not None else None,
+            lookup=self.req_to_full_lookup,
             req_indices=req_indices,
-            positions=positions,
+            positions=seq_lens,
+            decode_compress_ratio=self.compress_ratio,
         )
 
     def record_kvduo_model_update(self, logical_locs: torch.Tensor) -> None:
