@@ -7,7 +7,7 @@
 
 namespace {
 
-template <int BLOCK_SIZE, typename LogicalT, typename RequestT, typename PositionT>
+template <int BLOCK_SIZE, int CompressRatio, typename LogicalT, typename RequestT, typename PositionT>
 __global__ void kvduo_publish_full_write_kernel(
     const LogicalT* logical_locs,
     int64_t* generation,
@@ -26,6 +26,14 @@ __global__ void kvduo_publish_full_write_kernel(
     int64_t context,
     int64_t request_stride,
     int64_t position_stride) {
+  if constexpr (CompressRatio > 0) {
+    bool active = false;
+    for (int64_t i = threadIdx.x; i < items; i += BLOCK_SIZE) {
+      const int64_t length = positions[i * position_stride];
+      active |= length > 0 && length % CompressRatio == 0;
+    }
+    if (!__syncthreads_or(active)) return;
+  }
   __shared__ int64_t stamp;
   if (threadIdx.x == 0) {
     stamp = clock[0] + 1;
@@ -33,7 +41,16 @@ __global__ void kvduo_publish_full_write_kernel(
   }
   __syncthreads();
   for (int64_t i = threadIdx.x; i < items; i += BLOCK_SIZE) {
-    const int64_t logical = logical_locs[i * logical_stride];
+    int64_t position = lookup != nullptr ? positions[i * position_stride] : 0;
+    if constexpr (CompressRatio > 0) {
+      if (position <= 0 || position % CompressRatio != 0) continue;
+      position = position / CompressRatio - 1;
+    }
+    int64_t logical = logical_locs[i * logical_stride];
+    if constexpr (CompressRatio > 0) {
+      assert(logical >= CompressRatio - 1);
+      logical = (logical - (CompressRatio - 1)) / CompressRatio;
+    }
     assert(logical >= 0 && logical < logical_size);
     generation[logical] += 1;
     data_versions[logical] = 1;
@@ -41,14 +58,13 @@ __global__ void kvduo_publish_full_write_kernel(
     touches[logical] = stamp;
     if (lookup != nullptr) {
       const int64_t request = req_indices[i * request_stride];
-      const int64_t position = positions[i * position_stride];
       assert(request >= 0 && request < requests && position >= 0 && position < context);
       lookup[request * lookup_stride + position] = logical;
     }
   }
 }
 
-template <int BLOCK_SIZE>
+template <int BLOCK_SIZE, int CompressRatio = 0>
 void kvduo_publish_full_write(
     uint64_t logical_locs,
     uint64_t generation,
@@ -77,7 +93,7 @@ void kvduo_publish_full_write(
     using RequestT = std::remove_cv_t<std::remove_pointer_t<decltype(request_ptr)>>;
     using PositionT = std::remove_cv_t<std::remove_pointer_t<decltype(position_ptr)>>;
     LaunchKernel(1, BLOCK_SIZE, reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(stream)))(
-        kvduo_publish_full_write_kernel<BLOCK_SIZE, LogicalT, RequestT, PositionT>,
+        kvduo_publish_full_write_kernel<BLOCK_SIZE, CompressRatio, LogicalT, RequestT, PositionT>,
         logical_ptr,
         reinterpret_cast<int64_t*>(generation),
         reinterpret_cast<int64_t*>(data_versions),

@@ -8,11 +8,14 @@ from sglang.kernels.jit.utils import load_jit
 
 
 @functools.cache
-def _jit_full_write_module():
+def _jit_full_write_module(decode_compress_ratio: int = 0):
     return load_jit(
         "kvduo_full_write",
+        f"decode_{decode_compress_ratio}",
         cuda_files=["kvduo_full_write.cuh"],
-        cuda_wrappers=[("publish", "kvduo_publish_full_write<256>")],
+        cuda_wrappers=[
+            ("publish", f"kvduo_publish_full_write<256, {decode_compress_ratio}>")
+        ],
     )
 
 
@@ -27,8 +30,15 @@ def publish_kvduo_full_write(
     lookup: torch.Tensor | None = None,
     req_indices: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
+    decode_compress_ratio: int = 0,
 ) -> None:
-    """Publish distinct newly allocated FULL locations and their request mapping."""
+    """Publish distinct newly allocated FULL locations and their request mapping.
+
+    In decode mode, locations are uncompressed and positions are sequence lengths.
+    Only aligned rows publish a write; conversion and masking stay on the device.
+    """
+    if decode_compress_ratio not in (0, 1, 4):
+        raise ValueError("FULL decode compression must be 1 (DSA) or 4 (DSV4)")
     banks = (generation, data_versions, host_versions, touches)
     if logical_locs.ndim != 1 or logical_locs.dtype not in (torch.int32, torch.int64):
         raise ValueError("FULL locations must be an int32/int64 vector")
@@ -52,6 +62,8 @@ def publish_kvduo_full_write(
         raise ValueError(
             "FULL lookup, request indices and positions are required together"
         )
+    if decode_compress_ratio and not mapped:
+        raise ValueError("FULL decode publication requires request mapping")
     if mapped:
         if (
             lookup.ndim != 2
@@ -70,7 +82,7 @@ def publish_kvduo_full_write(
             )
     if logical_locs.is_cuda:
         # Fixed tensor addresses and scalar FFI arguments are capture safe.
-        _jit_full_write_module().publish(
+        _jit_full_write_module(decode_compress_ratio).publish(
             logical_locs.data_ptr(),
             generation.data_ptr(),
             data_versions.data_ptr(),
@@ -94,6 +106,15 @@ def publish_kvduo_full_write(
             positions.dtype == torch.int64 if mapped else True,
         )
     else:
+        if decode_compress_ratio:
+            active = (positions > 0) & (positions % decode_compress_ratio == 0)
+            if not torch.any(active):
+                return
+            logical_locs = (
+                logical_locs[active] - (decode_compress_ratio - 1)
+            ) // decode_compress_ratio
+            req_indices = req_indices[active]
+            positions = positions[active] // decode_compress_ratio - 1
         clock.add_(1)
         generation[logical_locs] += 1
         data_versions[logical_locs] = 1

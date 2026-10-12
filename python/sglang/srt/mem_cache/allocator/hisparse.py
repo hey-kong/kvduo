@@ -9,7 +9,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     HiSparseC4DevicePool,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
-from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.utils.common import get_num_new_pages, is_pin_memory_available
 
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -624,8 +624,12 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 seq_lens, seq_lens_cpu, last_loc
             )
 
-        generated_cpu = seq_lens_cpu % self.compress_ratio == 0
-        compressed_seq_lens_cpu = seq_lens_cpu[generated_cpu] // self.compress_ratio
+        generated_cpu = torch.nonzero(
+            seq_lens_cpu % self.compress_ratio == 0, as_tuple=True
+        )[0]
+        compressed_seq_lens_cpu = (
+            seq_lens_cpu.index_select(0, generated_cpu) // self.compress_ratio
+        )
         num_new_pages = get_num_new_pages(
             seq_lens=compressed_seq_lens_cpu,
             page_size=self.hisparse_page_size,
@@ -642,19 +646,19 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         logical_indices = self.logical_attn_allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc
         )
-        if logical_indices is None or not torch.any(generated_cpu):
+        if logical_indices is None or generated_cpu.numel() == 0:
             return logical_indices
 
-        generated = generated_cpu.to(device=seq_lens.device)
-        compressed_logical_indices = (
-            self.hisparse_kvcache.translate_loc_from_full_to_compressed(
-                logical_indices[generated]
-            )
+        if is_pin_memory_available(seq_lens.device):
+            generated_cpu = generated_cpu.pin_memory()
+        generated = generated_cpu.to(device=seq_lens.device, non_blocking=True)
+        compressed_logical_indices = self.get_last_loc_compressed(
+            logical_indices.index_select(0, generated)
         )
         hisparse_indices = self.hisparse_attn_allocator.alloc_decode(
-            seq_lens[generated] // self.compress_ratio,
+            seq_lens.index_select(0, generated) // self.compress_ratio,
             compressed_seq_lens_cpu,
-            self.get_last_loc_hisparse_device(last_loc[generated]),
+            self.get_last_loc_hisparse_device(last_loc.index_select(0, generated)),
         )
         if hisparse_indices is None:
             raise RuntimeError(
@@ -717,8 +721,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             num_full_pages
             > self.logical_attn_allocator.full_available_size() // self.page_size
             or num_c4_pages
-            > self.hisparse_attn_allocator.available_size()
-            // self.hisparse_page_size
+            > self.hisparse_attn_allocator.available_size() // self.hisparse_page_size
         ):
             return None
 
