@@ -919,6 +919,127 @@ def test_load_cache_to_device_buffer_dsv4_mla_miss_copy_layout() -> None:
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or is_hip()
+    or torch.cuda.get_device_capability()[0] not in (9, 10),
+    reason="TopK V2 requires a supported CUDA SM90/SM100 GPU.",
+)
+def test_kvduo_dsv4_topk_v2_raw_resolver_graph_with_full_hot_host_and_padding():
+    from sglang.kernels.ops.attention.dsv4.topk import (
+        plan_topk_v2,
+        topk_transform_512_v2,
+    )
+
+    k, length = 512, 10_000  # Register4: a 40k-token prompt in C4 space.
+    pages = (length + DSV4_PAGE_SIZE - 1) // DSV4_PAGE_SIZE
+    width = pages * DSV4_PAGE_SIZE
+    page_table = torch.stack(
+        [
+            torch.arange(pages - 1, -1, -1),
+            torch.arange(pages, 2 * pages),
+            torch.zeros(pages),
+        ]
+    ).to(dtype=torch.int32, device=DEVICE)
+    lengths = torch.tensor([length, 256, 0], dtype=torch.int32, device=DEVICE)
+    scores = torch.arange(width, dtype=torch.float32, device=DEVICE).repeat(3, 1)
+    selected, raw, output = [
+        torch.full((3, k), -123, dtype=torch.int32, device=DEVICE) for _ in range(3)
+    ]
+    plan = plan_topk_v2(lengths)
+    logical = (
+        page_table[:2].repeat_interleave(DSV4_PAGE_SIZE, dim=1).long() * DSV4_PAGE_SIZE
+        + torch.arange(width, device=DEVICE) % DSV4_PAGE_SIZE
+    )
+    mapping = torch.zeros(2 * width, dtype=torch.int64, device=DEVICE)
+    mapping[:width] = torch.arange(64, 64 + width, device=DEVICE)
+    mapping[width : width + 128] = torch.arange(
+        64 + width, 64 + width + 128, device=DEVICE
+    )
+    hot_start = 64 + width + 128
+    device = torch.full(
+        ((hot_start + k) // DSV4_PAGE_SIZE, DSV4_PAGE_BYTES),
+        0x11,
+        dtype=torch.uint8,
+        device=DEVICE,
+    )
+    device[hot_start // DSV4_PAGE_SIZE :].fill_(0x22)
+    host = torch.full((4, DSV4_PAGE_BYTES), 0x33, dtype=torch.uint8, pin_memory=True)
+    tokens = torch.full((2, k + DSV4_PAGE_SIZE), -1, dtype=torch.int32, device=DEVICE)
+    tokens[1, :64] = torch.arange(128, 192, device=DEVICE)
+    locations = torch.full_like(tokens, -1)
+    locations[1, :k] = torch.arange(hot_start, hot_start + k, device=DEVICE)
+    lru = torch.arange(k, dtype=torch.int16, device=DEVICE).repeat(2, 1)
+    lru[1] = torch.cat([lru[1, 64:], lru[1, :64]])
+    host_locs = torch.full((2, width), -1, dtype=torch.int64, device=DEVICE)
+    host_locs[1, :256] = torch.arange(256, device=DEVICE)
+    versions = torch.ones_like(mapping)
+    status = torch.zeros(2, dtype=torch.int32, device=DEVICE)
+    stats = torch.zeros((2, 2), dtype=torch.int32, device=DEVICE)
+    kwargs = dict(
+        top_k_tokens=raw,
+        device_buffer_tokens=tokens,
+        host_cache_locs=host_locs,
+        device_buffer_locs=locations,
+        host_cache=host,
+        device_buffer=device,
+        top_k_device_locs=output,
+        req_pool_indices=torch.tensor([0, 1, 9999], dtype=torch.int64, device=DEVICE),
+        seq_lens=lengths,
+        lru_slots=lru,
+        item_size_bytes=DSV4_ITEM_BYTES,
+        num_top_k=k,
+        hot_buffer_size=k,
+        page_size=DSV4_PAGE_SIZE,
+        block_size=960,
+        num_real_reqs=torch.tensor([2], dtype=torch.int32, device=DEVICE),
+        req_hot_buffer_sizes=torch.tensor([0, k], dtype=torch.int32, device=DEVICE),
+        req_to_logical_token=logical,
+        full_to_device_loc=mapping,
+        full_last_touch=torch.zeros_like(mapping),
+        full_data_version=versions,
+        full_host_version=versions.clone(),
+        swap_status=status,
+        resolver_stats=stats,
+        touch_clock=torch.tensor([7], dtype=torch.int64, device=DEVICE),
+    )
+
+    def run():
+        topk_transform_512_v2(scores, lengths, page_table, selected, 64, plan, raw)
+        load_cache_to_device_buffer_dsv4_mla(**kwargs)
+
+    def check():
+        assert not status.any().item()
+        assert torch.all(output[2] == -1)
+        assert torch.all(raw[2] == -1)
+        assert torch.all(output[1, 256:] == -1)
+        assert torch.equal(output[0].long(), mapping[logical[0, raw[0].long()]])
+        assert torch.equal(selected[0].long(), logical[0, raw[0].long()])
+        assert torch.equal(raw[1, :256], torch.arange(256, device=DEVICE))
+        for position, byte in [(0, 0x11), (128, 0x22), (192, 0x33), (255, 0x33)]:
+            value = _read_dsv4_token(device, int(output[1, position]))
+            assert torch.all(value == byte)
+
+    run()  # Compile and exercise FULL, HOT and real paged H2D copies.
+    torch.cuda.synchronize()
+    check()
+    assert stats.tolist() == [[0, 512], [64, 256]]
+    pointers = [bank.data_ptr() for bank in (raw, selected, output, plan, tokens, lru)]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        scores[0].neg_()
+        raw.fill_(-123)
+        output.fill_(-123)
+        graph.replay()
+        torch.cuda.synchronize()
+        check()
+        assert pointers == [
+            bank.data_ptr() for bank in (raw, selected, output, plan, tokens, lru)
+        ]
+
+
+@pytest.mark.skipif(
     not is_hip(), reason="Covers a ROCm wavefront64 LRU writeback regression."
 )
 def test_load_cache_to_device_buffer_rocm_large_lru_writeback() -> None:

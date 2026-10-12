@@ -825,7 +825,16 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and (
+            raw_indices is None
+            or (
+                hisparse_decode
+                and hisparse_coordinator.enable_mixed_residency
+                # The existing V2 plan belongs to the unreshaped query batch.
+                and indexer_metadata.c4_seq_lens.shape[0] == query_rows
+                and indexer_metadata.topk_metadata.shape[0] == query_rows + 1
+            )
+        ):
             topk_transform_512_v2(
                 logits,
                 c4_seq_lens,
@@ -833,6 +842,7 @@ class C4IndexerBackendMixin:
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
+                raw_indices,
             )
         else:
             topk_transform_512(
