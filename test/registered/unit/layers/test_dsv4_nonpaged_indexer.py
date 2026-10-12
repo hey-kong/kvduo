@@ -71,7 +71,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
 
 class TestDSV4NonPagedIndexer(CustomTestCase):
     def _is_eligible(self, **overrides):
-        backend = SimpleNamespace(hisparse_coordinator=None)
+        backend = SimpleNamespace(hisparse_coordinator=overrides.get("coordinator"))
         c4_indexer = SimpleNamespace(use_fp4_indexer=overrides.get("fp4", False))
         forward_batch = SimpleNamespace(
             forward_mode=overrides.get("mode", ForwardMode.EXTEND),
@@ -86,18 +86,28 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.override(
                 overrides.get("enabled", True)
             ),
-            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
-            patch(f"{_INDEXER}.is_cuda", return_value=True),
-            patch(f"{_INDEXER}.is_hip", return_value=False),
-            get_parallel().override(attn_cp_size=1),
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(
+                overrides.get("tilelang", False)
+            ),
+            envs.SGLANG_OPT_USE_AITER_INDEXER.override(overrides.get("aiter", False)),
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(
+                overrides.get("torch", False)
+            ),
+            patch(f"{_INDEXER}.is_cuda", return_value=overrides.get("cuda", True)),
+            patch(f"{_INDEXER}.is_hip", return_value=overrides.get("hip", False)),
+            get_parallel().override(attn_cp_size=overrides.get("cp", 1)),
             patch(
                 f"{_INDEXER}.is_in_tc_piecewise_cuda_graph",
                 return_value=overrides.get("piecewise_graph", False),
             ),
-            patch(f"{_INDEXER}.is_in_breakable_cuda_graph", return_value=False),
-            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+            patch(
+                f"{_INDEXER}.is_in_breakable_cuda_graph",
+                return_value=overrides.get("breakable_graph", False),
+            ),
+            patch(
+                "torch.cuda.is_current_stream_capturing",
+                return_value=overrides.get("capturing", False),
+            ),
         ):
             return C4IndexerBackendMixin._can_use_nonpaged_indexer(
                 backend,
@@ -125,6 +135,33 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         ):
             with self.subTest(case=case):
                 self.assertFalse(self._is_eligible(**case))
+
+    def test_kvduo_preserves_nonpaged_eligibility_gates(self):
+        coordinator = SimpleNamespace(enable_mixed_residency=True)
+        self.assertTrue(self._is_eligible(coordinator=coordinator))
+        self.assertFalse(
+            self._is_eligible(coordinator=SimpleNamespace(enable_mixed_residency=False))
+        )
+        for case in (
+            {"enabled": False},
+            {"mode": ForwardMode.DECODE},
+            {"original_mode": ForwardMode.DECODE},
+            {"batch_size": 2},
+            {"tbo": (1, 2)},
+            {"prefill_graph": True},
+            {"piecewise_graph": True},
+            {"breakable_graph": True},
+            {"capturing": True},
+            {"fp4": True},
+            {"tilelang": True},
+            {"aiter": True},
+            {"torch": True},
+            {"cp": 2},
+            {"cuda": False},
+            {"hip": True},
+        ):
+            with self.subTest(case=case):
+                self.assertFalse(self._is_eligible(coordinator=coordinator, **case))
 
     def test_single_request_plan_contract(self):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=lambda **_: True)

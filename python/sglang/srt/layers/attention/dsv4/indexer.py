@@ -508,7 +508,10 @@ class C4IndexerBackendMixin:
             return False
         if (
             get_parallel().attn_cp_size != 1
-            or self.hisparse_coordinator is not None
+            or (
+                self.hisparse_coordinator is not None
+                and not self.hisparse_coordinator.enable_mixed_residency
+            )
             or is_in_tc_piecewise_cuda_graph()
             or is_in_breakable_cuda_graph()
         ):
