@@ -970,6 +970,8 @@ def test_kvduo_dsv4_topk_v2_raw_resolver_graph_with_full_hot_host_and_padding():
     locations[1, :k] = torch.arange(hot_start, hot_start + k, device=DEVICE)
     lru = torch.arange(k, dtype=torch.int16, device=DEVICE).repeat(2, 1)
     lru[1] = torch.cat([lru[1, 64:], lru[1, :64]])
+    initial_tokens = tokens[1].clone()
+    initial_lru = lru[1].clone()
     host_locs = torch.full((2, width), -1, dtype=torch.int64, device=DEVICE)
     host_locs[1, :256] = torch.arange(256, device=DEVICE)
     versions = torch.ones_like(mapping)
@@ -1018,6 +1020,21 @@ def test_kvduo_dsv4_topk_v2_raw_resolver_graph_with_full_hot_host_and_padding():
         for position, byte in [(0, 0x11), (128, 0x22), (192, 0x33), (255, 0x33)]:
             value = _read_dsv4_token(device, int(output[1, position]))
             assert torch.all(value == byte)
+        restored = output[1, 192:256].long()
+        restored_pages = restored // DSV4_PAGE_SIZE
+        restored_offsets = restored % DSV4_PAGE_SIZE
+        values = device[
+            restored_pages[:, None],
+            restored_offsets[:, None] * DSV4_VALUE_BYTES
+            + torch.arange(DSV4_VALUE_BYTES, device=DEVICE),
+        ]
+        scales = device[
+            restored_pages[:, None],
+            DSV4_SCALE_OFFSET
+            + restored_offsets[:, None] * DSV4_SCALE_BYTES
+            + torch.arange(DSV4_SCALE_BYTES, device=DEVICE),
+        ]
+        assert torch.all(values == 0x33) and torch.all(scales == 0x33)
 
     run()  # Compile and exercise FULL, HOT and real paged H2D copies.
     torch.cuda.synchronize()
@@ -1027,12 +1044,20 @@ def test_kvduo_dsv4_topk_v2_raw_resolver_graph_with_full_hot_host_and_padding():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
+    expected_delta = torch.tensor(
+        [[0, 512], [64, 256]], dtype=stats.dtype, device=DEVICE
+    )
     for _ in range(2):
+        tokens[1].copy_(initial_tokens)
+        lru[1].copy_(initial_lru)
+        device[hot_start // DSV4_PAGE_SIZE :].fill_(0x22)
+        previous_stats = stats.clone()
         scores[0].neg_()
         raw.fill_(-123)
         output.fill_(-123)
         graph.replay()
         torch.cuda.synchronize()
+        assert torch.equal(stats - previous_stats, expected_delta)
         check()
         assert pointers == [
             bank.data_ptr() for bank in (raw, selected, output, plan, tokens, lru)
