@@ -28,8 +28,9 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize(
     "batch,seq,k", [(4, 4096, 512), (4, 40003, 2048), (31, 70003, 512)]
 )
+@pytest.mark.parametrize("multi_stream", [False, True])
 def test_fused_full_topk_replay_matches_addresses_page_ages_and_observations(
-    batch, seq, k
+    batch, seq, k, multi_stream
 ):
     width = (seq + 63) // 64 * 64
     scores = torch.arange(width, device="cuda", dtype=torch.float32).repeat(batch, 1)
@@ -77,6 +78,17 @@ def test_fused_full_topk_replay_matches_addresses_page_ages_and_observations(
         for layer in range(3)
     ]
     module = _jit_topk_v2_module()
+    indexer_stream = torch.cuda.Stream() if multi_stream else None
+
+    def select():
+        if indexer_stream is None:
+            run()
+        else:
+            stream = torch.cuda.current_stream()
+            indexer_stream.wait_stream(stream)
+            with torch.cuda.stream(indexer_stream):
+                run()
+            stream.wait_stream(indexer_stream)
 
     def run():
         module.topk_plan(lengths, metadata, 0)
@@ -93,12 +105,14 @@ def test_fused_full_topk_replay_matches_addresses_page_ages_and_observations(
                 full_metadata=spec,
             )
 
-    run()  # Dummy capture rows must not read a request or FULL mapping.
+    # Match the model's two FULL-variant warmups, including its auxiliary stream.
+    select()
+    select()
     torch.cuda.synchronize()
     assert not stats.any() and torch.all(outputs == -1)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        run()
+        select()
     banks = (
         scores,
         lengths,

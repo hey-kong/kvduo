@@ -7,57 +7,6 @@ import torch
 
 from sglang.kernels.jit.utils import load_jit
 
-_FULL_SUMMARY_ARGUMENTS = (
-    "logical_pages",
-    "mapping",
-    "data_versions",
-    "host_versions",
-    "touches",
-    "protected_pages",
-    "physical_pages",
-    "scores",
-    "valid_pages",
-)
-
-
-def _call_full_summary(summarize, *arguments):
-    try:
-        summarize(*arguments)
-    except RuntimeError as error:
-        if "tensor does not have a device" not in str(error):
-            raise
-        details = []
-        failed = []
-        for name, tensor in zip(_FULL_SUMMARY_ARGUMENTS, arguments):
-            if tensor is None:
-                details.append(f"{name}: None (optional)")
-                continue
-            kind = f"{type(tensor).__module__}.{type(tensor).__qualname__}"
-            metadata = []
-            for field in ("shape", "dtype", "device", "layout"):
-                try:
-                    value = getattr(tensor, field)
-                    metadata.append(f"{field}={value}")
-                except Exception as metadata_error:
-                    metadata.append(f"{field}=ERROR({metadata_error})")
-            try:
-                capsule = torch.utils.dlpack.to_dlpack(tensor)
-                del capsule
-                outcome = "standalone DLPack export passed"
-            except Exception as export_error:
-                failed.append(name)
-                outcome = f"DLPack export failed: {type(export_error).__name__}: {export_error}"
-            details.append(f"{name}: type={kind}, {', '.join(metadata)}; {outcome}")
-        result = (
-            f"Failing arguments: {', '.join(failed)}."
-            if failed
-            else "All standalone exports passed; the FFI conversion failure was not reproduced per argument."
-        )
-        raise RuntimeError(
-            f"KVDuo FULL summary Tensor conversion failed. {result}\n"
-            + "\n".join(details)
-        ) from error
-
 
 @functools.cache
 def _jit_full_reclaim_module():
@@ -122,17 +71,17 @@ def summarize_kvduo_full_pages(
             if logical_pages.dtype == torch.int32
             else module.summarize_i64
         )
-        _call_full_summary(
-            summarize,
+        summarize(
             logical_pages,
-            mapping,
-            data_versions,
-            host_versions,
-            touches,
-            protected_pages,
-            physical,
-            scores,
-            valid,
+            mapping.data_ptr(),
+            data_versions.data_ptr(),
+            host_versions.data_ptr(),
+            touches.data_ptr(),
+            protected_pages.data_ptr() if protected_pages is not None else 0,
+            physical.data_ptr(),
+            scores.data_ptr(),
+            valid.data_ptr(),
+            mapping.numel(),
         )
     else:
         in_range = (logical_pages >= 0) & (logical_pages < mapping.numel())

@@ -27,6 +27,67 @@ class KVDuoFullTopK:
     layer_stride: int
     page_size: int
 
+    def native_metadata(self, scores, raw_indices):
+        """Validate FULL banks and transport their addresses as FFI scalars."""
+        if self.lookup.ndim != 2 or self.mapping.ndim != 1:
+            raise ValueError("KVDuo FULL lookup/mapping require matrix/vector layouts")
+        requests, context = self.lookup.shape
+        logical = self.mapping.numel()
+        if not requests or not context or not logical:
+            raise ValueError("KVDuo FULL metadata cannot have empty address spaces")
+        if (
+            self.layer < 0
+            or self.layer_stride < 0
+            or self.page_size <= 0
+            or self.page_size & (self.page_size - 1)
+        ):
+            raise ValueError("KVDuo FULL metadata has invalid layer/page geometry")
+        fields = (
+            ("output", torch.int32, raw_indices.shape),
+            ("requests", torch.int64, (scores.shape[0],)),
+            ("lookup", torch.int64, (requests, context)),
+            ("mapping", torch.int64, (logical,)),
+            ("touches", torch.int64, (logical,)),
+            ("status", torch.int32, (requests,)),
+            ("stats", torch.int32, (requests, 2)),
+            ("growth", torch.int32, (requests,)),
+            ("observe", torch.int32, (1,)),
+            ("real_requests", torch.int32, (1,)),
+            ("clock_base", torch.int64, (1,)),
+            ("prefill_ema", torch.float32, (requests, 2)),
+            ("prefill_steps", torch.int64, (requests,)),
+        )
+        pointers = []
+        for name, dtype, shape in fields:
+            tensor = getattr(self, name)
+            try:
+                valid = (
+                    tensor.shape == shape
+                    and tensor.dtype == dtype
+                    and tensor.device == scores.device
+                    and (
+                        tensor.stride(1) == 1 and tensor.stride(0) >= context
+                        if name == "lookup"
+                        else tensor.is_contiguous()
+                    )
+                )
+                pointer = tensor.data_ptr() if valid else 0
+            except RuntimeError as error:
+                raise ValueError(f"KVDuo FULL metadata {name} is invalid") from error
+            if not pointer:
+                raise ValueError(f"KVDuo FULL metadata {name} has incompatible layout")
+            pointers.append(pointer)
+        return (
+            *pointers,
+            requests,
+            context,
+            self.lookup.stride(0),
+            logical,
+            self.layer,
+            self.layer_stride,
+            self.page_size,
+        )
+
 
 @functools.cache
 def _jit_full_decode_module():
