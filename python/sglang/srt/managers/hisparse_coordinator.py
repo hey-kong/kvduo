@@ -4163,12 +4163,6 @@ class HiSparseCoordinator:
             ),
             resolver_scratch=getattr(self, "resolver_scratch", None),
             lru_scratch=getattr(self, "resolver_lru_scratch", None),
+            validate_status=self.enable_mixed_residency,
         )
-        if self.enable_mixed_residency:
-            # Capturable execution boundary: an invalid/mismatched host source
-            # must stop this stream before sparse attention consumes the table.
-            torch._assert_async(
-                torch.all(self.kvduo_swap_status[layer_id, req_pool_indices] == 0),
-                "KVDuo resolver produced an incomplete address table",
-            )
         return top_k_indices

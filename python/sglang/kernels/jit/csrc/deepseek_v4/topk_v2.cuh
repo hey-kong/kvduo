@@ -84,20 +84,22 @@ struct TopKLaunchParams {
   SGL_DEVICE int32_t* get_output_ptr(uint32_t batch_id) const {
     return page_indices + batch_id * static_cast<int64_t>(topk);
   }
+  template <bool RawOnly>
   SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
     const auto k = static_cast<int64_t>(topk);
     return TopKProblem{
         .in = scores + batch_id * score_stride,
         .out = page_indices + batch_id * k,
         .raw_out = raw_indices != nullptr ? raw_indices + batch_id * k : nullptr,
-        .page_table = page_table + batch_id * page_table_stride,
+        .page_table = RawOnly ? nullptr : page_table + batch_id * page_table_stride,
         .topk = topk,
         .seq_len = seq_len,
         .page_bits = page_bits,
     };
   }
+  template <bool RawOnly>
   SGL_DEVICE TopKProblem problem(uint32_t batch_id) const {
-    return this->problem(batch_id, static_cast<uint32_t>(seq_lens[batch_id]));
+    return this->problem<RawOnly>(batch_id, static_cast<uint32_t>(seq_lens[batch_id]));
   }
 };
 
@@ -105,7 +107,7 @@ struct TopKLaunchParams {
  * \brief Persistent cluster kernel for the long items. It will handle long inputs.
  * The short items are handled by the separate topk_kernel.
  */
-template <bool kPDL>
+template <bool kPDL, bool RawOnly>
 CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
   __shared__ impl::MaxSmem<Cluster::Smem> smem;
@@ -115,7 +117,7 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ 
 #pragma unroll 1
   for (uint32_t w = blockIdx.x; w < num_cluster_items; w += kNumPersistentClusters) {
     const auto it = params.item(w);
-    const auto problem = params.problem(it.batch_id, it.seq_len);
+    const auto problem = params.problem<RawOnly>(it.batch_id, it.seq_len);
     Cluster::forward<false>(problem, &smem);
     __syncthreads();
   }
@@ -133,22 +135,38 @@ SGL_DEVICE void for_each_item(uint32_t topk, const F& f) {
   }
 }
 
-template <bool kPDL>
+template <bool kPDL, bool RawOnly>
 SGL_DEVICE void trivial_transform(const TopKProblem& problem) {
   device::PDLWaitPrimary<kPDL>();
   device::PDLTriggerSecondary<kPDL>();
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t) {
-    problem.transform_output(tx, tx < problem.seq_len ? static_cast<int32_t>(tx) : -1);
+    const int32_t raw = tx < problem.seq_len ? static_cast<int32_t>(tx) : -1;
+    if constexpr (RawOnly) {
+      problem.out[tx] = raw;
+    } else {
+      problem.transform_output(tx, raw);
+    }
   });
 }
 
+template <bool RawOnly>
 SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
+  if constexpr (RawOnly) {
+    // Persistent clusters already published their raw selection to this bank.
+    if (problem.out == output_ptr) return;
+  }
   static_assert(kMaxTopK % kBlockSize == 0);
   constexpr uint32_t kNumElems = kMaxTopK / kBlockSize;
   int32_t source_index[kNumElems];
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) { source_index[i] = problem.out[tx]; });
   problem.out = output_ptr;
-  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) { problem.transform_output(tx, source_index[i]); });
+  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) {
+    if constexpr (RawOnly) {
+      problem.out[tx] = source_index[i];
+    } else {
+      problem.transform_output(tx, source_index[i]);
+    }
+  });
 }
 
 /**
@@ -160,13 +178,13 @@ SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
  * - Level 2: max_seq_len <= cluster_floor  -> trivial + register<4> + streaming
  * - Level 3: max_seq_len > cluster_floor   -> + epilogue process of cluster path
  */
-template <bool kPDL, int kLevel>
+template <bool kPDL, int kLevel, bool RawOnly>
 TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
-  auto problem = params.problem(blockIdx.x);
+  auto problem = params.problem<RawOnly>(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
-  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL>(problem);
+  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL, RawOnly>(problem);
   __shared__ int32_t topk_indices[kMaxTopK];
   problem.out = topk_indices;
 
@@ -198,15 +216,15 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   // then trigger the dependent kernel only after the full output is written.
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
-  problem_transform(problem, params.get_output_ptr(blockIdx.x));
+  problem_transform<RawOnly>(problem, params.get_output_ptr(blockIdx.x));
 }
 
-template <bool kPDL>
+template <bool kPDL, bool RawOnly>
 CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
-  auto problem = params.problem(blockIdx.x);
+  auto problem = params.problem<RawOnly>(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
-  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL>(problem);
+  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL, RawOnly>(problem);
   __shared__ int32_t topk_indices[kMaxTopK];
   problem.out = topk_indices;
 
@@ -232,7 +250,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
 
   device::PDLWaitPrimary<kPDL>();
   __syncthreads();
-  if (blockIdx.y == worker_rank) problem_transform(problem, params.get_output_ptr(blockIdx.x));
+  if (blockIdx.y == worker_rank) problem_transform<RawOnly>(problem, params.get_output_ptr(blockIdx.x));
 }
 
 // --- Plan: choose cluster_threshold from the seq_len distribution -----------
@@ -356,7 +374,8 @@ struct TopKKernel {
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
       const tvm::ffi::TensorView metadata,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
+      const bool raw_only) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
@@ -395,6 +414,13 @@ struct TopKKernel {
       TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device_).verify(raw_indices.value());
       raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
     }
+    RuntimeCheck(!raw_only || raw_indices_ptr != nullptr, "TopK raw-only mode requires raw indices");
+    const auto raw_start = reinterpret_cast<uintptr_t>(raw_indices_ptr);
+    const auto mapped_start = reinterpret_cast<uintptr_t>(page_indices.data_ptr());
+    const auto output_bytes = B.unwrap() * K.unwrap() * sizeof(int32_t);
+    RuntimeCheck(
+        !raw_only || raw_start >= mapped_start + output_bytes || mapped_start >= raw_start + output_bytes,
+        "TopK raw-only output must not alias mapped output");
 
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
     RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
@@ -418,8 +444,8 @@ struct TopKKernel {
         .scores = static_cast<const float*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
-        .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
-        .raw_indices = raw_indices_ptr,
+        .page_indices = raw_only ? raw_indices_ptr : static_cast<int32_t*>(page_indices.data_ptr()),
+        .raw_indices = raw_only ? nullptr : raw_indices_ptr,
         .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
         .score_stride = S.unwrap(),
         .page_table_stride = P.unwrap(),
@@ -430,32 +456,39 @@ struct TopKKernel {
 
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
     constexpr bool kUsePDL = true;
-    if (use_cluster) {
-      if (batch_size <= kNumPersistentClusters) {
-        LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
-            .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-            .launch(topk_small_batch_kernel<kUsePDL>, params);
-      } else {
-        const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
-        LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
-            .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-            .launch(topk_persistent_cluster_kernel<kUsePDL>, params);
+    auto launch = [&]<bool RawOnly>() {
+      if (use_cluster) {
+        if (batch_size <= kNumPersistentClusters) {
+          LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
+              .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+              .launch(topk_small_batch_kernel<kUsePDL, RawOnly>, params);
+        } else {
+          const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
+          LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
+              .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+              .launch(topk_persistent_cluster_kernel<kUsePDL, RawOnly>, params);
+          LaunchKernel(batch_size, kBlockSize, device)
+              .config({.use_pdl = kUsePDL})
+              .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3, RawOnly>, params);
+        }
+      } else if (max_seq_len <= kReg2MaxSeqLen) {
         LaunchKernel(batch_size, kBlockSize, device)
             .config({.use_pdl = kUsePDL})
-            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3>, params);
+            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0, RawOnly>, params);
+      } else if (max_seq_len <= kReg4MaxSeqLen) {
+        LaunchKernel(batch_size, kBlockSize, device)
+            .config({.use_pdl = kUsePDL})
+            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/1, RawOnly>, params);
+      } else {
+        LaunchKernel(batch_size, kBlockSize, device)
+            .config({.use_pdl = kUsePDL})
+            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2, RawOnly>, params);
       }
-    } else if (max_seq_len <= kReg2MaxSeqLen) {
-      LaunchKernel(batch_size, kBlockSize, device)
-          .config({.use_pdl = kUsePDL})
-          .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0>, params);
-    } else if (max_seq_len <= kReg4MaxSeqLen) {
-      LaunchKernel(batch_size, kBlockSize, device)
-          .config({.use_pdl = kUsePDL})
-          .launch(topk_main_kernel<kUsePDL, /*kLevel=*/1>, params);
+    };
+    if (raw_only) {
+      launch.template operator()<true>();
     } else {
-      LaunchKernel(batch_size, kBlockSize, device)
-          .config({.use_pdl = kUsePDL})
-          .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2>, params);
+      launch.template operator()<false>();
     }
   }
 };

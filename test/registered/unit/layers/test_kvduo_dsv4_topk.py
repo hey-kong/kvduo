@@ -22,8 +22,9 @@ class Indexer(C4IndexerBackendMixin):
     pass
 
 
-def emit_topk(scores, lengths, pages, output, page_size, raw=None):
-    output.fill_(-1)
+def emit_topk(scores, lengths, pages, output, page_size, raw=None, raw_only=False):
+    if not raw_only:
+        output.fill_(-1)
     if raw is not None:
         raw.fill_(-1)
     k = output.shape[1]
@@ -34,9 +35,10 @@ def emit_topk(scores, lengths, pages, output, page_size, raw=None):
             else torch.arange(length)
         )
         count = positions.numel()
-        output[row, :count] = (
-            pages[row, positions // page_size] * page_size + positions % page_size
-        )
+        if not raw_only:
+            output[row, :count] = (
+                pages[row, positions // page_size] * page_size + positions % page_size
+            )
         if raw is not None:
             raw[row, :count] = positions
 
@@ -109,8 +111,8 @@ def indexer_case(monkeypatch):
         c4_indexer = SimpleNamespace(use_fp4_indexer=False, layer_id=7)
         v1 = MagicMock(side_effect=emit_topk)
         v2 = MagicMock(
-            side_effect=lambda scores, seq, pages, out, page_size, plan, raw: emit_topk(
-                scores, seq, pages, out, page_size, raw
+            side_effect=lambda scores, seq, pages, out, page_size, plan, raw, raw_only=False: emit_topk(
+                scores, seq, pages, out, page_size, raw, raw_only
             )
         )
         monkeypatch.setattr(indexer_module, "topk_transform_512", v1)
@@ -161,6 +163,8 @@ def test_kvduo_decode_v2_passes_raw_positions_to_resolver(
     for _ in range(2):
         case.run()
         args = case.v2.call_args.args
+        assert case.v2.call_args.kwargs == {"raw_only": True}
+        assert torch.all(case.output == -123)
         assert args[1] is case.metadata.c4_seq_lens
         assert args[5] is case.metadata.topk_metadata
         selected = args[6]
@@ -210,6 +214,7 @@ def test_ordinary_decode_keeps_v2_without_raw_output(indexer_case):
     case.v1.assert_not_called()
     case.v2.assert_called_once()
     assert case.v2.call_args.args[6] is None
+    assert case.v2.call_args.kwargs == {"raw_only": False}
     assert case.core.c4_sparse_page_indices is case.output
 
 
@@ -222,3 +227,55 @@ def test_prefill_raw_output_keeps_existing_v1_path(indexer_case, coordinator):
     assert case.v1.call_args.args[5] is case.raw
     if coordinator is not None:
         case.backend.hisparse_coordinator.swap_in_selected_pages.assert_not_called()
+
+
+@pytest.mark.parametrize("raw_only", [False, True])
+def test_topk_v2_wrapper_passes_output_mode_without_device_reads(monkeypatch, raw_only):
+    from sglang.kernels.ops.attention.dsv4 import topk as ops
+
+    args = (
+        torch.zeros((2, 1024)),
+        torch.tensor([1024, 0], dtype=torch.int32),
+        torch.empty((2, 0), dtype=torch.int32),
+        torch.full((2, 512), -99, dtype=torch.int32),
+        64,
+        torch.zeros((3, 2), dtype=torch.int32),
+        torch.empty((2, 512), dtype=torch.int32),
+    )
+    module = SimpleNamespace(topk_transform=MagicMock())
+    monkeypatch.setattr(ops, "_jit_topk_v2_module", lambda: module)
+    for operation in ("item", "cpu", "tolist"):
+        monkeypatch.setattr(
+            torch.Tensor,
+            operation,
+            MagicMock(side_effect=AssertionError("device read")),
+        )
+    ops.topk_transform_512_v2(*args, raw_only=raw_only)
+    module.topk_transform.assert_called_once_with(*args, raw_only)
+
+
+def test_topk_v2_raw_only_rejects_missing_or_aliased_output_before_loading(monkeypatch):
+    from sglang.kernels.ops.attention.dsv4 import topk as ops
+
+    load = MagicMock()
+    monkeypatch.setattr(ops, "_jit_topk_v2_module", load)
+    out = torch.empty((1, 512), dtype=torch.int32)
+    args = (
+        torch.zeros((1, 1024)),
+        torch.tensor([1024]),
+        torch.zeros((1, 16)),
+        out,
+        64,
+        torch.zeros((2, 2)),
+    )
+    with pytest.raises(ValueError, match="requires a raw output"):
+        ops.topk_transform_512_v2(*args, raw_only=True)
+    with pytest.raises(ValueError, match="must not alias"):
+        ops.topk_transform_512_v2(*args, out, raw_only=True)
+    backing = torch.empty(out.numel() + 1, dtype=out.dtype)
+    overlapping_args = (*args[:3], backing[:-1].view_as(out), *args[4:])
+    with pytest.raises(ValueError, match="must not alias"):
+        ops.topk_transform_512_v2(
+            *overlapping_args, backing[1:].view_as(out), raw_only=True
+        )
+    load.assert_not_called()

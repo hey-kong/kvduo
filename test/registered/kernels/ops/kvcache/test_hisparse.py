@@ -1006,10 +1006,13 @@ def test_kvduo_dsv4_topk_v2_raw_resolver_graph_with_full_hot_host_and_padding(co
         resolver_stats=stats,
         touch_clock=torch.tensor([7], dtype=torch.int64, device=DEVICE),
         lru_scratch=lru_scratch,
+        validate_status=True,
     )
 
     def run():
-        topk_transform_512_v2(scores, lengths, page_table, selected, 64, plan, raw)
+        topk_transform_512_v2(
+            scores, lengths, page_table, selected, 64, plan, raw, raw_only=True
+        )
         load_cache_to_device_buffer_dsv4_mla(**kwargs)
 
     def check():
@@ -1018,7 +1021,7 @@ def test_kvduo_dsv4_topk_v2_raw_resolver_graph_with_full_hot_host_and_padding(co
         assert torch.all(raw[2] == -1)
         assert torch.all(output[1, 256:] == -1)
         assert torch.equal(output[0].long(), mapping[logical[0, raw[0].long()]])
-        assert torch.equal(selected[0].long(), logical[0, raw[0].long()])
+        assert torch.all(selected == -123)
         assert torch.equal(raw[1, :256], torch.arange(256, device=DEVICE))
         if compact:
             assert torch.all(lru_scratch[0] == -123)

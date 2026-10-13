@@ -209,6 +209,12 @@ def test_generic_resolver_receives_flat_backing_and_local_full_layer_offset(
 
     c, pool, _ = make_stack(monkeypatch, start_layer=7)
     c.mem_pool_host.kv_buffer = torch.zeros((3, 128, 1, 16), dtype=torch.bfloat16)
+    for operation in ("all", "_assert_async"):
+        monkeypatch.setattr(
+            torch,
+            operation,
+            MagicMock(side_effect=AssertionError("unfused status check")),
+        )
     swap = MagicMock()
     monkeypatch.setattr(module, "load_cache_to_device_buffer_mla", swap)
     c.swap_in_selected_pages(
@@ -221,6 +227,7 @@ def test_generic_resolver_receives_flat_backing_and_local_full_layer_offset(
     assert kwargs["device_buffer"] is pool.get_flat_key_buffer()
     assert kwargs["full_location_base"] == pool.flat_layer_slot_stride
     assert kwargs["page_size"] == 3 * 64
+    assert kwargs["validate_status"] is True
     assert kwargs["host_cache"].data_ptr() == c.mem_pool_host.kv_buffer[1].data_ptr()
 
 
