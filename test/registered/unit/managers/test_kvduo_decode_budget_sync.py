@@ -127,7 +127,7 @@ def test_decode_shortage_uses_pressure_path_and_preserves_budget_rejection(short
     else:
         c._reclaim_kvduo_radix_pages.assert_called_once()
         c._reclaim_for_physical_allocation.assert_called_once_with(
-            64, reserve_hot_minimum=True
+            64, reserve_hot_minimum=True, allow_emergency_hot_reclaim=False
         )
 
 

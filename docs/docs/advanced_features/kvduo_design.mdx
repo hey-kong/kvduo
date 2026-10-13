@@ -43,6 +43,10 @@ FULL 只能在 Host 副本完整、有效且版本同步后回收。候选页排
 
 共享池之外的 logical、SWA、indexer、压缩状态及 Host 预算仍需检查。请求进入混合驻留时，首次需要 HOT 的 decode 前必须补足最低容量。
 
+可选 `decode_emergency_reclaim=true` 仅用于必需 decode：正常 FULL 回收和预算内 HOT merge 后仍缺页时，将可安全处理、未锁定的 HOT 对象缩至最低容量，优先处理可释放页数最多的对象，空间足够即停止。此应急路径不受 EMA 预算及观察门槛限制，可能增加 H2D 换入；最低容量、页保护、TP 一致性和 prefill 预留仍有效。默认关闭，prefill 和可选扩容不使用此路径。
+
+首次 decode 准入失败时，日志记录逻辑／SWA、Host、物理空闲页、HOT 最低额度、prefill 预留及回收结果；整请求回退仍作为兜底。应急 HOT 回收无法解决独立池不足。
+
 回退前检查并预留完整 prompt 所需的 Host 后备。Staging 实际分配后转为真实占用；取消或请求结束时释放预留及其前缀 pin。
 
 ## 设计点 2：按近期收益调整 HOT 容量
@@ -180,7 +184,8 @@ python3 -m sglang.launch_server \
 | `tail_protected_pages` | `2` | 每请求保护的最新 FULL 页数 |
 | `full_reclaim_policy` | `"request"` | `"request"` 按请求批量释放全部合格 FULL 页；`"page"` 按页 LRU 回收 |
 | `max_relative_miss_increase` | `0.10` | 普通缩容、对象回退及累计预算共用的预计 miss 相对增幅容忍比例 |
+| `decode_emergency_reclaim` | `false` | 必需 decode 的普通回收失败后，允许 HOT 应急缩至最低容量，优先避免整请求回退 |
 
-前四项须为正整数，回收策略只接受 `"request"` 或 `"page"`，最后一项须为有限非负数；未知字段报错。`--kvduo-config` 必须配合 `--enable-kvduo`。默认 10% 是实验初值。
+前四项须为正整数，回收策略只接受 `"request"` 或 `"page"`，miss 容忍比例须为有限非负数，应急开关须为布尔值；未知字段报错。`--kvduo-config` 必须配合 `--enable-kvduo`。默认 10% 是实验初值。
 
 KVDuo 要求 RadixTree，不能与 HiSparse、HiCache 或 speculative decoding 同时启用；支持 chunked prefill，不改其分块设置。通用 DSA 和 DeepSeek-V4 均按实际存储层数计算 HOT 页容量；`flashmla_kv` 要求 FP8 KV 存储，BF16 使用受支持的其他稀疏 backend。

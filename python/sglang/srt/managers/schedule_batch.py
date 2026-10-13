@@ -2758,6 +2758,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             logical = self.token_to_kv_pool_allocator.logical_attn_allocator
             evict_from_tree_cache(self.tree_cache, num_tokens, allocator=logical)
             if logical.available_size() < num_tokens:
+                if selected_indices is None:
+                    self.hisparse_coordinator.log_kvduo_decode_pressure(
+                        requests, num_tokens
+                    )
                 return False
             # Logical pages and compressed physical pages turn over on
             # different steps. Never compare their needs through a minimum,
@@ -2765,6 +2769,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             pressure = self.hisparse_coordinator.ensure_kvduo_decode_capacity(
                 requests, tree_cache=self.tree_cache
             )
+            if (
+                pressure.action is not KVDuoPressureAction.SUCCESS
+                and selected_indices is None
+            ):
+                self.hisparse_coordinator.log_kvduo_decode_pressure(
+                    requests, num_tokens, pressure
+                )
             return pressure.action is KVDuoPressureAction.SUCCESS
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens

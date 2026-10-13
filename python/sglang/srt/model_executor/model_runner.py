@@ -821,6 +821,7 @@ class ModelRunner:
         tail_protected_pages = 0
         prefill_policy = None
         full_reclaim_policy = "page"
+        decode_emergency_reclaim = False
         if self.server_args.enable_kvduo:
             from sglang.srt.mem_cache.sparsity import parse_kvduo_config
 
@@ -831,6 +832,7 @@ class ModelRunner:
             kvduo_cfg = parse_kvduo_config(self.server_args)
             tail_protected_pages = kvduo_cfg.tail_protected_pages
             full_reclaim_policy = kvduo_cfg.full_reclaim_policy
+            decode_emergency_reclaim = kvduo_cfg.decode_emergency_reclaim
             prefill_policy = KVDuoPrefillPolicy(
                 kvduo_cfg.max_relative_miss_increase,
             )
@@ -853,6 +855,7 @@ class ModelRunner:
             tail_protected_pages=tail_protected_pages,
             prefill_policy=prefill_policy,
             full_reclaim_policy=full_reclaim_policy,
+            decode_emergency_reclaim=decode_emergency_reclaim,
         )
 
     def post_capture_resize_kv_pool(self):

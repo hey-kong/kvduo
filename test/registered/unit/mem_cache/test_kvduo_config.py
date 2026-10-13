@@ -10,6 +10,23 @@ class TestKVDuoConfig(unittest.TestCase):
         self.assertEqual(config, KVDuoConfig())
         self.assertEqual(config.tail_protected_pages, 2)
         self.assertEqual(config.full_reclaim_policy, "request")
+        self.assertFalse(config.decode_emergency_reclaim)
+
+    def test_decode_emergency_reclaim_requires_boolean(self):
+        for raw, expected in (("true", True), ("false", False)):
+            config = parse_kvduo_config(
+                SimpleNamespace(kvduo_config=f'{{"decode_emergency_reclaim": {raw}}}')
+            )
+            self.assertEqual(config.decode_emergency_reclaim, expected)
+        for raw in ("1", "0", "null", '"true"', "[]"):
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                ValueError, "decode_emergency_reclaim"
+            ):
+                parse_kvduo_config(
+                    SimpleNamespace(
+                        kvduo_config=f'{{"decode_emergency_reclaim": {raw}}}'
+                    )
+                )
 
     def test_full_reclaim_policy_values(self):
         for policy in ("request", "page"):
