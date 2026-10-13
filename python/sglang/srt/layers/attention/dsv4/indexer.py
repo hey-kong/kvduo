@@ -799,6 +799,8 @@ class C4IndexerBackendMixin:
 
         raw_indices = None
         touch_clock_advanced = False
+        full_fused = False
+        full_decode = getattr(forward_batch, "kvduo_full_decode", False)
         if capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
@@ -839,6 +841,16 @@ class C4IndexerBackendMixin:
                 and indexer_metadata.topk_metadata.shape[0] == query_rows + 1
             )
         ):
+            full_spec = None
+            if full_decode:
+                layer = token_to_kv_pool.layer_mapping[
+                    c4_indexer.layer_id
+                ].compress_layer_id
+                full_spec = hisparse_coordinator.kvduo_full_topk_metadata(
+                    layer,
+                    forward_batch.req_pool_indices,
+                    hisparse_coordinator.top_k_device_locs_buffer[:query_rows],
+                )
             topk_transform_512_v2(
                 logits,
                 c4_seq_lens,
@@ -851,14 +863,20 @@ class C4IndexerBackendMixin:
                     hisparse_decode and hisparse_coordinator.enable_mixed_residency
                 ),
                 **(
-                    {"touch_clock": hisparse_coordinator.full_touch_clock}
-                    if hisparse_decode and hisparse_coordinator.enable_mixed_residency
-                    else {}
+                    {"full_metadata": full_spec}
+                    if full_decode
+                    else (
+                        {"touch_clock": hisparse_coordinator.full_touch_clock}
+                        if hisparse_decode
+                        and hisparse_coordinator.enable_mixed_residency
+                        else {}
+                    )
                 ),
             )
             touch_clock_advanced = (
                 hisparse_decode and hisparse_coordinator.enable_mixed_residency
             )
+            full_fused = full_decode
         else:
             topk_transform_512(
                 logits,
@@ -870,11 +888,17 @@ class C4IndexerBackendMixin:
             )
         if hisparse_coordinator is not None:
             if hisparse_decode:
+                if full_decode and not full_fused:
+                    raise RuntimeError(
+                        "KVDuo FULL graph requires the eligible TopK V2 path"
+                    )
                 compress_layer_id = token_to_kv_pool.layer_mapping[
                     c4_indexer.layer_id
                 ].compress_layer_id
                 core_metadata.c4_sparse_page_indices = (
-                    hisparse_coordinator.swap_in_selected_pages(
+                    hisparse_coordinator.top_k_device_locs_buffer[:query_rows]
+                    if full_fused
+                    else hisparse_coordinator.swap_in_selected_pages(
                         req_pool_indices=forward_batch.req_pool_indices,
                         compressed_seq_lens=indexer_metadata.c4_seq_lens,
                         top_k_result=raw_indices,

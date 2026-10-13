@@ -111,11 +111,24 @@ def indexer_case(monkeypatch):
         )
         c4_indexer = SimpleNamespace(use_fp4_indexer=False, layer_id=7)
         v1 = MagicMock(side_effect=emit_topk)
-        v2 = MagicMock(
-            side_effect=lambda scores, seq, pages, out, page_size, plan, raw, raw_only=False, touch_clock=None: emit_topk(
-                scores, seq, pages, out, page_size, raw, raw_only
-            )
-        )
+
+        def emit_v2(
+            scores,
+            seq,
+            pages,
+            out,
+            page_size,
+            plan,
+            raw,
+            raw_only=False,
+            touch_clock=None,
+            full_metadata=None,
+        ):
+            emit_topk(scores, seq, pages, out, page_size, raw, raw_only)
+            if full_metadata is not None:
+                full_metadata.output.copy_(torch.where(raw >= 0, raw + 10_000, -1))
+
+        v2 = MagicMock(side_effect=emit_v2)
         monkeypatch.setattr(indexer_module, "topk_transform_512", v1)
         monkeypatch.setattr(indexer_module, "topk_transform_512_v2", v2)
 
@@ -225,6 +238,31 @@ def test_ordinary_decode_keeps_v2_without_raw_output(indexer_case):
     assert case.v2.call_args.args[6] is None
     assert case.v2.call_args.kwargs == {"raw_only": False}
     assert case.core.c4_sparse_page_indices is case.output
+
+
+def test_full_decode_v2_handoff_skips_resolver(indexer_case):
+    case = indexer_case()
+    case.batch.kvduo_full_decode = True
+    c = case.backend.hisparse_coordinator
+    c.top_k_device_locs_buffer = torch.full_like(case.output, -999)
+    c.kvduo_full_topk_metadata = MagicMock(
+        side_effect=lambda layer, requests, output: SimpleNamespace(output=output)
+    )
+    case.run()
+    c.swap_in_selected_pages.assert_not_called()
+    assert (
+        case.v2.call_args.kwargs["full_metadata"].output.data_ptr()
+        == c.top_k_device_locs_buffer.data_ptr()
+    )
+    assert "touch_clock" not in case.v2.call_args.kwargs
+    assert (
+        case.core.c4_sparse_page_indices.data_ptr()
+        == c.top_k_device_locs_buffer.data_ptr()
+    )
+    assert torch.equal(
+        case.core.c4_sparse_page_indices,
+        torch.where(case.raw >= 0, case.raw + 10_000, -1),
+    )
 
 
 @pytest.mark.parametrize("coordinator", [None, "kvduo"])
