@@ -4,7 +4,15 @@ import logging
 import threading
 import time
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeVar,
+)
 
 import torch
 
@@ -23,6 +31,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -282,6 +291,11 @@ class UnifiedRadixCache(BasePrefixCache):
             self.work_list.append(send_work)
 
     def reset(self) -> None:
+        state_cache = getattr(
+            getattr(self, "kvduo_coordinator", None), "kvduo_prefill_host_cache", None
+        )
+        if state_cache is not None:
+            state_cache.clear()
         self._reset_full()
 
     def _reset_full(self) -> None:
@@ -379,17 +393,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
-    def _kvduo_max_prefix_len(self, key: RadixKey, coordinator) -> int:
-        limit = len(key)
-        if not coordinator.is_dsv4_hisparse:
-            return limit
-        # KVDuo host records contain C4/main KV but no SWA. Always reserve one
-        # SWA window for ordinary prefill, even in cache layouts whose generic
-        # swa_reprefill_tail_tokens() policy returns zero.
-        already_held_back = self.swa_reprefill_tail_tokens()
-        required = self.sliding_window_size or 0
-        return max(0, limit - max(0, required - already_held_back))
-
     def _match_prefix_without_kvduo(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:
@@ -410,12 +413,11 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self._match_prefix_without_kvduo(params)
         coordinator = getattr(self, "kvduo_coordinator", None)
         if coordinator is not None and params.req is not None:
+
             def match_common_gpu_prefix(common_len: int) -> MatchResult:
                 key = params.key
                 raw_limit = common_len + 1 if key.is_bigram else common_len
-                limit = (
-                    raw_limit if key.limit is None else min(key.limit, raw_limit)
-                )
+                limit = raw_limit if key.limit is None else min(key.limit, raw_limit)
                 common_params = MatchPrefixParams(
                     key=RadixKey(
                         token_ids=key.token_ids,
@@ -431,7 +433,7 @@ class UnifiedRadixCache(BasePrefixCache):
             result = coordinator.augment_kvduo_prefix_match(
                 params.req,
                 result,
-                max_prefix_len=self._kvduo_max_prefix_len(params.key, coordinator),
+                max_prefix_len=len(params.key),
                 common_gpu_matcher=match_common_gpu_prefix,
             )
         return result
@@ -585,6 +587,12 @@ class UnifiedRadixCache(BasePrefixCache):
             return result
         if self.disable:
             return IncLockRefResult()
+        if self.kvduo_active_swa and ComponentType.SWA not in skip_lock_components:
+            # A match may end inside a large existing node. Bound the SWA lock
+            # before acquiring it, without changing the FULL prefix length.
+            self.components[ComponentType.SWA]._maybe_split_leaf_for_swa_lock(
+                self.tree_core.node_by_id(node_id)
+            )
         return self.tree_core.inc_lock_ref(node_id, skip_lock_components)
 
     def dec_lock_ref(
@@ -620,10 +628,76 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         if self.disable:
             return
+        if self.kvduo_active_swa:
+            node = self.tree_core.node_by_id(node_id)
+            self.components[ComponentType.SWA].release_component_lock(
+                node,
+                DecLockRefParams(
+                    swa_uuid_for_lock=swa_uuid_for_lock,
+                    skip_lock_node_ids=skip_lock_node_ids or {},
+                ),
+            )
+            self.tree_core._update_evictable_leaf_sets(node)
+            return
         result = self.tree_core.dec_swa_lock_only(
             node_id, swa_uuid_for_lock, skip_lock_node_ids
         )
         self._free_values(result.device_frees, result.host_frees)
+
+    @property
+    def kvduo_active_swa(self) -> bool:
+        coordinator = getattr(self, "kvduo_coordinator", None)
+        return self.is_swa_enabled and (
+            getattr(coordinator, "enable_mixed_residency", False) is True
+        )
+
+    def release_kvduo_cached_swa(self) -> None:
+        """Keep cached SWA only while a computation holds its window lock."""
+        if self.kvduo_active_swa and not self.disable:
+            count = self.swa_evictable_size()
+            if count:
+                self.evict(EvictParams(num_tokens=0, swa_num_tokens=count))
+
+    def maintain_kvduo_swa(self, frontiers: Iterable[tuple[Req, int]]) -> None:
+        """Trim SWA behind completed computation, including request-owned restores."""
+        if not self.kvduo_active_swa:
+            return
+        for req, completed_len in frontiers:
+            if req.kv is None or req.req_pool_idx is None:
+                continue
+            # cache_protected_len may also cover a Host-restored suffix whose
+            # SWA belongs to the request. Only the actual tree span is shared.
+            cached_len = 0
+            node = (
+                self.tree_core.node_by_id(req.last_node)
+                if req.last_node is not None and not self.disable
+                else self.tree_core.root_node
+            )
+            while node is not self.tree_core.root_node:
+                cached_len += len(node.key)
+                node = node.parent
+            free_swa_out_of_window_slots(
+                req,
+                completed_len,
+                sliding_window_size=self.sliding_window_size,
+                page_size=self.page_size,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                cache_protected_len=cached_len,
+            )
+            if (
+                not req.swa_prefix_lock_released
+                and req.swa_uuid_for_lock is not None
+                and completed_len - cached_len >= self.sliding_window_size
+                and not getattr(req, "swa_evict_floor", 0)
+            ):
+                self.dec_swa_lock_only(
+                    req.last_node,
+                    req.swa_uuid_for_lock,
+                    skip_lock_node_ids=req.skip_lock_node_ids,
+                )
+                req.swa_prefix_lock_released = True
+        self.release_kvduo_cached_swa()
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         if self.disable:
@@ -663,10 +737,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
         result = None
         insert_params = None
+        shared_prefix_len = getattr(
+            req, "kvduo_shared_prefix_len", req.cache_protected_len
+        )
 
         if is_insert:
             insert_params = InsertParams(
-                prev_prefix_len=req.cache_protected_len,
+                prev_prefix_len=shared_prefix_len,
                 priority=getattr(req, "priority", 0) or 0,
             )
 
@@ -687,7 +764,7 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_indices_full = kv_indices
             tail_free_start = None
             if effective_cache_len < len(token_ids):
-                tail_free_start = max(effective_cache_len, req.cache_protected_len)
+                tail_free_start = max(effective_cache_len, shared_prefix_len)
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
@@ -708,8 +785,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free_segments(segments)
         else:
             self.token_to_kv_pool_allocator.free_segment(
-                kv_indices[req.cache_protected_len :],
-                start_pos=req.cache_protected_len,
+                kv_indices[shared_prefix_len:],
+                start_pos=shared_prefix_len,
             )
 
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
@@ -731,6 +808,8 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 self.session_refs.register_session_ref(req)
 
+        self.release_kvduo_cached_swa()
+
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
@@ -747,10 +826,13 @@ class UnifiedRadixCache(BasePrefixCache):
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        shared_prefix_len = getattr(
+            req, "kvduo_shared_prefix_len", req.cache_protected_len
+        )
 
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
-            prev_prefix_len=req.cache_protected_len,
+            prev_prefix_len=shared_prefix_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
         )
@@ -805,8 +887,8 @@ class UnifiedRadixCache(BasePrefixCache):
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
+            (req.req_pool_idx, slice(shared_prefix_len, len(new_indices))),
+            new_indices[shared_prefix_len:],
         )
 
         self._dec_req_lock(req)
@@ -833,6 +915,8 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             req.prefix_indices = new_indices
         req.cache_protected_len = len(new_indices)
+        if hasattr(req, "kvduo_shared_prefix_len"):
+            del req.kvduo_shared_prefix_len
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         # carry the skip set so this node's dec releases only what we locked
@@ -1942,11 +2026,10 @@ class UnifiedRadixCache(BasePrefixCache):
         Returns (device_indices, last_node) tuple."""
         coordinator = getattr(self, "kvduo_coordinator", None)
         if coordinator is not None and params.req is not None:
+
             def reclaim_radix(full_tokens: int, swa_tokens: int) -> tuple[int, int]:
                 result = self.evict(
-                    EvictParams(
-                        num_tokens=full_tokens, swa_num_tokens=swa_tokens
-                    )
+                    EvictParams(num_tokens=full_tokens, swa_num_tokens=swa_tokens)
                 )
                 return result.num_tokens_evicted, result.swa_num_tokens_evicted
 

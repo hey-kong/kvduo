@@ -184,7 +184,7 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         "page",
     ):
         raise ValueError("full_reclaim_policy must be 'request' or 'page'")
-    decode_emergency_reclaim = values.get("decode_emergency_reclaim", True)
+    decode_emergency_reclaim = values.get("decode_emergency_reclaim", False)
     if not isinstance(decode_emergency_reclaim, bool):
         raise ValueError("decode_emergency_reclaim must be a boolean")
     return KVDuoConfig(

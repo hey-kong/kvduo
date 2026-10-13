@@ -183,7 +183,7 @@ class HiSparseCoordinator:
         tail_protected_pages: int = 0,
         prefill_policy: KVDuoPrefillPolicy | None = None,
         full_reclaim_policy: str = "request",
-        decode_emergency_reclaim: bool = True,
+        decode_emergency_reclaim: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -498,7 +498,16 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
         self._mixed_slots = [False] * max_num_req_slots
+        self.kvduo_prefill_host_cache = None
         if self.enable_mixed_residency:
+            if self.is_dsv4_hisparse:
+                from sglang.srt.mem_cache.sparsity.core.kvduo_prefill_state import (
+                    KVDuoPrefillHostCache,
+                )
+
+                self.kvduo_prefill_host_cache = KVDuoPrefillHostCache.create(
+                    self, host_to_device_ratio
+                )
             # Decode allocation is owned by the token allocator, but pressure
             # policy belongs here.  The callback runs immediately before a
             # real sparse-KV page allocation and therefore cannot confuse a
@@ -521,6 +530,8 @@ class HiSparseCoordinator:
         # See HostKVCache.destroy for why the explicit unregister matters.
         self.write_staging_stream.synchronize()
         self.decode_backup_stream.synchronize()
+        if self.kvduo_prefill_host_cache is not None:
+            self.kvduo_prefill_host_cache.destroy()
         self.mem_pool_host.destroy()
 
     def get_token_stats(self) -> HiSparseTokenStats:
@@ -580,9 +591,14 @@ class HiSparseCoordinator:
         The Radix node remains the lock anchor for its GPU portion.  Host pages
         use content identities and request references, so they remain pinned
         even before a recyclable request-pool slot is assigned.
+        DeepSeek-V4 also requires a valid SWA window and boundary state.
         """
         if not self.enable_mixed_residency:
             return match_result
+        state_cache = getattr(self, "kvduo_prefill_host_cache", None)
+        if state_cache is not None:
+            state_cache.poll()
+            state_cache.release_match(req)
         for identity in getattr(req, "kvduo_host_prefix_records", ()):
             if identity in self.host_prefix_cache.records:
                 self.host_prefix_cache.release(identity, req.rid)
@@ -592,10 +608,14 @@ class HiSparseCoordinator:
         fill_ids = req.get_fill_ids()
         max_prefix = req._compute_max_prefix_len(len(fill_ids))
         if max_prefix_len is not None:
-            # Preserve the cache's own match cap. In particular, DeepSeek V4's
-            # unified SWA cache holds back a trailing window for re-prefill;
-            # KVDuo must not extend a main/C4-only host hit into that window.
             max_prefix = min(max_prefix, max_prefix_len)
+        if self.is_dsv4_hisparse and state_cache is None:
+            # C4-only Host records cannot restore the preceding SWA window or
+            # the other state required at a new prefill boundary. Recomputing
+            # a window after that boundary does not supply its first query.
+            # Keep the tree-validated GPU hit and its TP convergence below.
+            max_prefix = min(max_prefix, gpu_len)
+            req.kvduo_residency_plan = None
         max_prefix = max_prefix // page_tokens * page_tokens
         host_end = gpu_len // page_tokens * page_tokens
         first_host_page = gpu_len // page_tokens
@@ -630,6 +650,28 @@ class HiSparseCoordinator:
             common_host_end = int(boundaries[0].item())
             min_gpu_len = int(boundaries[1].item())
             max_gpu_len = -int(boundaries[2].item())
+        if state_cache is not None:
+            # Window eviction is not prefix-monotonic. Intersect checkpoint
+            # readiness, rather than taking the minimum of rank-local ends.
+            local_ready = state_cache.ready_boundaries(req, gpu_len, max_prefix)
+            ready = torch.tensor(
+                [
+                    int(valid and end <= host_end and end > max_gpu_len)
+                    for valid, end in zip(
+                        local_ready, range(page_tokens, max_prefix + 1, page_tokens)
+                    )
+                ],
+                dtype=torch.int32,
+                device="cpu",
+            )
+            if self.tp_world_size > 1 and ready.numel():
+                torch.distributed.all_reduce(
+                    ready, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                )
+            candidates = torch.nonzero(ready).flatten()
+            common_host_end = (
+                (int(candidates[-1]) + 1) * page_tokens if candidates.numel() else 0
+            )
         if common_host_end <= max_gpu_len:
             if min_gpu_len != max_gpu_len:
                 if common_gpu_matcher is None:
@@ -640,6 +682,11 @@ class HiSparseCoordinator:
                 return self._converge_common_gpu_match(min_gpu_len, common_gpu_matcher)
             return match_result
         host_end = common_host_end
+        state_plan = (
+            state_cache.plan(req, gpu_len, host_end)
+            if state_cache is not None
+            else None
+        )
         # Identity construction is unnecessary for a pure GPU hit.  Once a
         # host extension is confirmed, reuse the persistent chain already
         # built during probing to classify both GPU and host pages.
@@ -673,6 +720,11 @@ class HiSparseCoordinator:
             last_host_node=match_result.last_device_node,
             best_match_node=match_result.last_device_node,
             host_hit_length=host_end - gpu_len,
+            swa_host_hit_length=(
+                state_plan.swa_tokens
+                if state_plan is not None
+                else match_result.swa_host_hit_length
+            ),
             full_kv_hit_length=host_end,
             cache_protected_len=gpu_len,
             kvduo_residency_plan=plan,
@@ -723,9 +775,25 @@ class HiSparseCoordinator:
         plan = getattr(req, "kvduo_residency_plan", None)
         if plan is None or host_hit_length <= 0:
             return torch.empty(0, dtype=torch.int64, device=self.device)
+        state_cache = getattr(self, "kvduo_prefill_host_cache", None)
+        state_plan = getattr(req, "kvduo_prefill_state_plan", None)
+        if self.is_dsv4_hisparse and (state_cache is None or state_plan is None):
+            raise RuntimeError(
+                "KVDuo cannot restore a DeepSeek-V4 prefill prefix from C4-only "
+                "Host records: required SWA and boundary state are not backed up"
+            )
         commitment = begin_kvduo_prefix_restore(plan, self.host_prefix_cache)
         prefix_len = len(req.prefix_indices)
         target_len = prefix_len + host_hit_length
+        swa_tail_len = state_plan.swa_tokens if state_plan is not None else 0
+        if state_plan is not None and (
+            state_plan.prefix_len != prefix_len
+            or state_plan.target_len != target_len
+            or state_plan.owner != state_cache._owner(req, "match")
+            or not state_cache.ready(req, prefix_len, target_len)
+        ):
+            finish_kvduo_prefix_restore(commitment, self.host_prefix_cache)
+            raise RuntimeError("KVDuo prefill checkpoint changed before restore")
         prefix_cpu = torch.tensor([prefix_len], dtype=torch.int64)
         target_cpu = torch.tensor([target_len], dtype=torch.int64)
         prefix_gpu = prefix_cpu.to(self.device)
@@ -736,10 +804,13 @@ class HiSparseCoordinator:
             else torch.full((1,), -1, dtype=torch.int64, device=self.device)
         )
         restored = None
+        main_dma_pins = []
         try:
             allocator = self.token_to_kv_pool_allocator
             logical_pages, swa_pages, physical_pages = (
-                self._kvduo_restore_page_requirements(prefix_cpu, target_cpu)
+                self._kvduo_restore_page_requirements(
+                    prefix_cpu, target_cpu, swa_tail_len=swa_tail_len
+                )
             )
 
             logical_allocator = allocator.logical_attn_allocator
@@ -885,6 +956,9 @@ class HiSparseCoordinator:
                 )
                 return None
 
+            restore_kwargs = (
+                {"swa_tail_len": swa_tail_len} if self.is_dsv4_hisparse else {}
+            )
             restored = self.token_to_kv_pool_allocator.alloc_kvduo_restore(
                 prefix_gpu,
                 prefix_cpu,
@@ -892,6 +966,7 @@ class HiSparseCoordinator:
                 target_cpu,
                 last_loc,
                 host_hit_length,
+                **restore_kwargs,
             )
             allocation_ready = restored is not None
             if self.tp_world_size > 1:
@@ -906,7 +981,7 @@ class HiSparseCoordinator:
                     # and C4 for DeepSeek V4) rather than using a component-only
                     # free method. The allocator also safely clears any SWA map.
                     self.token_to_kv_pool_allocator.rollback_restore_allocation(
-                        restored
+                        restored, **restore_kwargs
                     )
                     restored = None
                 logger.warning(
@@ -956,6 +1031,8 @@ class HiSparseCoordinator:
                 raise RuntimeError(
                     "KVDuo restore adapter produced mismatched locations"
                 )
+            if state_cache is not None:
+                main_dma_pins = state_cache.pin_main_restore(state_plan)
             for layer_id in range(self.mem_pool_device.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
@@ -974,23 +1051,33 @@ class HiSparseCoordinator:
             self.full_last_touch[compressed] = torch.tensor(
                 touches, dtype=torch.int64, device=self.device
             )
+            if state_cache is not None:
+                state_cache.load(req, restored)
+            req.kvduo_shared_prefix_len = prefix_len
             req.kvduo_restored_prefix_len = target_len
             return restored
         except Exception:
             if restored is not None:
-                self.token_to_kv_pool_allocator.rollback_restore_allocation(restored)
+                self.token_to_kv_pool_allocator.rollback_restore_allocation(
+                    restored,
+                    **({"swa_tail_len": swa_tail_len} if self.is_dsv4_hisparse else {}),
+                )
             raise
         finally:
+            if state_cache is not None:
+                state_cache.defer_unpin(main_dma_pins)
             finish_kvduo_prefix_restore(commitment, self.host_prefix_cache)
 
     def _kvduo_restore_page_requirements(
-        self, prefix_lens_cpu: torch.Tensor, seq_lens_cpu: torch.Tensor
+        self,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        *,
+        swa_tail_len: int = 0,
     ) -> tuple[int, int, int]:
         """Return Full/logical, SWA, and sparse-physical pages for restore.
 
-        Both supported KVDuo restore allocators own no SWA pages: generic
-        HiSparse has no SWA sub-pool, while DeepSeek V4 deliberately leaves its
-        trailing SWA window to normal prefill.
+        DeepSeek-V4 allocates SWA only for the restored checkpoint window.
         """
         allocator = self.token_to_kv_pool_allocator
         logical_pages = get_num_new_pages(
@@ -1006,7 +1093,8 @@ class HiSparseCoordinator:
             )
         else:
             physical_pages = logical_pages
-        return logical_pages, 0, physical_pages
+        swa_pages = (swa_tail_len + allocator.page_size - 1) // allocator.page_size
+        return logical_pages, swa_pages, physical_pages
 
     def _evict_host_prefix_for_slots(self, required_slots: int) -> None:
         if not self.enable_mixed_residency:
@@ -1043,7 +1131,7 @@ class HiSparseCoordinator:
         if existing is not None:
             return existing[0] is req
         # Reserve the complete prompt even when this execution is only a chunk.
-        # No host backup exists until the final prefill-to-decode transition.
+        # Completed chunks consume this reservation as Host copies are created.
         fill_ids = req.full_untruncated_fill_ids
         length = len(fill_ids) // self.compress_ratio
         capacity = (length + self.page_size - 1) // self.page_size * self.page_size
@@ -1100,7 +1188,15 @@ class HiSparseCoordinator:
             identities = self._host_prefix_identities(req, ordinal, fill_ids)
             identity = identities[ordinal]
             record = self.host_prefix_cache.records.get(identity)
-            if record is None or not record.fully_valid:
+            state_cache = getattr(self, "kvduo_prefill_host_cache", None)
+            if record is None or not (
+                record.fully_valid
+                or (
+                    state_cache is not None
+                    and record.dma_pins > 0
+                    and state_cache.owns_pending_main(req, identity)
+                )
+            ):
                 break
             identities[ordinal] = record.identity
             locations.extend(record.host_locations["main_kv"])
@@ -1135,6 +1231,9 @@ class HiSparseCoordinator:
         """Drop host match pins for a request that never reached execution."""
         if not self.enable_mixed_residency:
             return
+        state_cache = getattr(self, "kvduo_prefill_host_cache", None)
+        if state_cache is not None:
+            state_cache.release_match(req)
         for identity in getattr(req, "kvduo_host_prefix_records", ()):
             if identity in self.host_prefix_cache.records:
                 self.host_prefix_cache.release(identity, req.rid)
@@ -1238,6 +1337,11 @@ class HiSparseCoordinator:
             prefill_len,
         )
         if self.enable_mixed_residency:
+            # Canonical prefix pages are immutable and may be shared by an
+            # in-flight restore. Only the newly allocated suffix needs staging.
+            host_indices = host_indices[attached:]
+            device_indices = device_indices[attached:]
+        if self.enable_mixed_residency:
             self._release_kvduo_prefill_host(prefill_key)
 
         start_event = device_module.Event()
@@ -1246,12 +1350,13 @@ class HiSparseCoordinator:
         start_event.record(schedule_stream)
         with device_module.stream(self.write_staging_stream):
             start_event.wait(self.write_staging_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_indices,
-                io_backend="kernel",
-            )
+            if host_indices.numel():
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    host_indices,
+                    device_indices,
+                    io_backend="kernel",
+                )
             finish_event.record(self.write_staging_stream)
             if host_indices.is_cuda:
                 host_indices.record_stream(self.write_staging_stream)
@@ -3090,6 +3195,9 @@ class HiSparseCoordinator:
             )
 
     def begin_kvduo_schedule_boundary(self) -> None:
+        state_cache = getattr(self, "kvduo_prefill_host_cache", None)
+        if state_cache is not None:
+            state_cache.poll()
         self.process_kvduo_full_conversions()
         self._kvduo_next_prefill_pages = 0
         self._kvduo_next_prefill_key = None
@@ -3197,6 +3305,9 @@ class HiSparseCoordinator:
     def _end_kvduo_prefill_lifecycle(self, req_idx, request=None) -> None:
         if request is None:
             request = self._active_kvduo_reqs.get(req_idx)
+        state_cache = getattr(self, "kvduo_prefill_host_cache", None)
+        if state_cache is not None and request is not None:
+            state_cache.end_request(request)
         for key, (req, _) in list(self._kvduo_prefill_lifecycle.items()):
             if req is not request:
                 continue
@@ -4242,14 +4353,18 @@ class HiSparseCoordinator:
             self.request_finished(req)
 
     def request_finished(self, req: Req):
-        if self.enable_mixed_residency:
-            self._end_kvduo_prefill_lifecycle(req.req_pool_idx, req)
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream(self.device).wait_stream(
                 self.decode_producer_stream
             )
         self.wait_for_pending_backup()
+        retained = None
+        if self.enable_mixed_residency:
+            state_cache = getattr(self, "kvduo_prefill_host_cache", None)
+            if state_cache is not None:
+                retained = state_cache.backup_finished(req)
+            self._end_kvduo_prefill_lifecycle(req.req_pool_idx, req)
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
@@ -4313,7 +4428,8 @@ class HiSparseCoordinator:
             self.req_to_host_pool_allocated_len[req.req_pool_idx],
         )
         if self.enable_mixed_residency:
-            retained = self._retain_request_host_prefix(req)
+            if retained is None:
+                retained = self._retain_request_host_prefix(req)
             self._release_host_prefix_refs(req)
             if retained and host_indices.numel() > 0:
                 retained_tensor = torch.tensor(

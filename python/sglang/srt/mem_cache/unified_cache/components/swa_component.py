@@ -546,6 +546,7 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         lru = self.tree_core.lru_lists[ct]
         enabled = self.tree_core.enable_session_radix_cache
+        swa_only = self.cache.kvduo_active_swa
         if self._evict_device_cursor is not None and not lru.in_list(
             self._evict_device_cursor
         ):
@@ -559,8 +560,10 @@ class SWAComponent(TreeComponent):
         ):
             x = self._evict_device_cursor
             assert x.component_data[ct].value is not None
-            if x in self.tree_core.evictable_device_leaves and (
-                not enabled or self._can_evict_leaf_atomically(x)
+            if (
+                not swa_only
+                and x in self.tree_core.evictable_device_leaves
+                and (not enabled or self._can_evict_leaf_atomically(x))
             ):
                 self._evict_device_cursor = (
                     lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
@@ -576,9 +579,10 @@ class SWAComponent(TreeComponent):
                 device_frees=device_frees,
                 host_frees=host_frees,
             )
-            self.tree_core._cascade_evict(
-                x, self, tracker, device_frees=device_frees, host_frees=host_frees
-            )
+            if not swa_only:
+                self.tree_core._cascade_evict(
+                    x, self, tracker, device_frees=device_frees, host_frees=host_frees
+                )
             self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
 

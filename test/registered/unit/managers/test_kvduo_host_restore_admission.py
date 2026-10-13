@@ -105,12 +105,11 @@ def restore_params(req, token):
     )
 
 
-@pytest.mark.parametrize("dsv4", [False, True])
 @pytest.mark.parametrize("cache_type", [BasePrefixCache, RadixCache, UnifiedRadixCache])
-def test_real_prefill_reservation_funds_restore_and_keeps_fresh_tail_quota(
-    dsv4, cache_type
+def test_generic_prefill_reservation_funds_restore_and_keeps_fresh_tail_quota(
+    cache_type,
 ):
-    c, physical, adder, req = restore_setup(dsv4=dsv4, cache_type=cache_type, extra=3)
+    c, physical, adder, req = restore_setup(dsv4=False, cache_type=cache_type, extra=3)
     assert physical.free_pages == 0
     assert adder.token_to_kv_pool_allocator.available_size() == 0
 
@@ -126,6 +125,19 @@ def test_real_prefill_reservation_funds_restore_and_keeps_fresh_tail_quota(
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_called_once()
     c.mem_pool_host.load_to_device_per_layer.assert_called_once()
     c.reclaim_kvduo_full_pages.assert_called_once()  # Initial admission only.
+    assert all(
+        record.restore_pins == 0 for record in c.host_prefix_cache.records.values()
+    )
+
+
+@pytest.mark.parametrize("cache_type", [BasePrefixCache, RadixCache, UnifiedRadixCache])
+def test_dsv4_main_only_restore_is_rejected_at_all_cache_entry_points(cache_type):
+    c, physical, adder, req = restore_setup(dsv4=True, cache_type=cache_type)
+    with pytest.raises(RuntimeError, match="required SWA and boundary state"):
+        adder.tree_cache.init_load_back(restore_params(req, None))
+    assert physical.free_pages == 0
+    c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_not_called()
+    c.mem_pool_host.load_to_device_per_layer.assert_not_called()
     assert all(
         record.restore_pins == 0 for record in c.host_prefix_cache.records.values()
     )
@@ -197,10 +209,9 @@ def test_swa_limited_plan_updates_protection_before_host_admission():
     assert physical.free_pages == 0 and not adder.can_run_list
 
 
-@pytest.mark.parametrize("dsv4", [False, True])
 @pytest.mark.parametrize("protected", ["fresh_tail", "other_prefill", "hot_minimum"])
-def test_restore_cannot_spend_other_pending_allocations(dsv4, protected):
-    c, physical, adder, req = restore_setup(dsv4=dsv4, requests=2)
+def test_restore_cannot_spend_other_pending_allocations(protected):
+    c, physical, adder, req = restore_setup(dsv4=False, requests=2)
     token = c.reserve_kvduo_prefill(2, [0])
     assert token is not None and physical.free_pages == 2
     if protected == "fresh_tail":
@@ -229,10 +240,9 @@ def test_restore_cannot_spend_other_pending_allocations(dsv4, protected):
     )
 
 
-@pytest.mark.parametrize("dsv4", [False, True])
 @pytest.mark.parametrize("pass_reservation", [False, True])
-def test_restore_shortfall_never_uses_unbudgeted_hand_merge(dsv4, pass_reservation):
-    c, physical, adder, req = restore_setup(dsv4=dsv4, requests=2)
+def test_restore_shortfall_never_uses_unbudgeted_hand_merge(pass_reservation):
+    c, physical, adder, req = restore_setup(dsv4=False, requests=2)
     physical.free_pages = 2
     c._ensure_kvduo_hot_capacity_targets_batch({(0, 1): 12})
     assert physical.free_pages == 0
@@ -261,7 +271,7 @@ def test_restore_shortfall_never_uses_unbudgeted_hand_merge(dsv4, pass_reservati
 
 @pytest.mark.parametrize("invalid", ["cancelled", "insufficient"])
 def test_restore_rejects_invalid_reservation_without_reclaim(invalid):
-    c, physical, adder, req = restore_setup(dsv4=True)
+    c, physical, adder, req = restore_setup(dsv4=False)
     token = c.reserve_kvduo_prefill(2, [0])
     assert token is not None
     if invalid == "cancelled":
@@ -278,7 +288,7 @@ def test_restore_rejects_invalid_reservation_without_reclaim(invalid):
 
 
 def test_failed_restore_cancels_prefill_quota_and_limits_without_spending_pages():
-    c, physical, adder, req = restore_setup(dsv4=True, extra=3)
+    c, physical, adder, req = restore_setup(dsv4=False, extra=3)
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.return_value = None
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.side_effect = None
 

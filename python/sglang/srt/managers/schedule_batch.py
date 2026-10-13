@@ -1626,6 +1626,8 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.cache_protected_len = 0
+        if hasattr(self, "kvduo_shared_prefix_len"):
+            del self.kvduo_shared_prefix_len
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
@@ -2755,6 +2757,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if selected_indices is None
                 else [self.reqs[i] for i in selected_indices]
             )
+            if getattr(self.tree_cache, "kvduo_active_swa", False) is True:
+                self.tree_cache.maintain_kvduo_swa(
+                    (req, req.seqlen - 1)
+                    for req in requests
+                    if req.decode_batch_idx >= 1
+                )
             logical = self.token_to_kv_pool_allocator.logical_attn_allocator
             evict_from_tree_cache(self.tree_cache, num_tokens, allocator=logical)
             if logical.available_size() < num_tokens:
@@ -3222,6 +3230,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
+            tree_cache=self.tree_cache,
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
@@ -3253,7 +3262,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_num_tokens=self.extend_num_tokens,
         )
 
+    def release_kvduo_prefill_swa(self):
+        if getattr(self.tree_cache, "kvduo_active_swa", False) is not True:
+            return
+        frontiers = [
+            (req, prefix_len + extend_len)
+            for req, prefix_len, extend_len in zip(
+                self.reqs, self.prefix_lens, self.extend_lens
+            )
+            if not req.finished()
+            and not req.is_retracted
+            and (not self.decoding_reqs or req not in self.decoding_reqs)
+        ]
+        state_cache = getattr(
+            self.tree_cache.kvduo_coordinator, "kvduo_prefill_host_cache", None
+        )
+        if state_cache is not None:
+            for req, completed_len in frontiers:
+                state_cache.backup(req, completed_len)
+        self.tree_cache.maintain_kvduo_swa(frontiers)
+
     def maybe_evict_swa(self):
+        if getattr(self.tree_cache, "kvduo_active_swa", False) is True:
+            # Extend cleanup uses the completed batch's immutable length
+            # snapshots, rather than a future chunk's mutable request state.
+            if self.forward_mode.is_decode():
+                self.tree_cache.maintain_kvduo_swa(
+                    (req, req.seqlen - 1)
+                    for req in self.reqs
+                    if req.decode_batch_idx >= 1
+                )
+            return
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_server_args()
