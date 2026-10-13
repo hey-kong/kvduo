@@ -15,6 +15,7 @@
 #include <sgl_kernel/utils.cuh>
 
 #include <sgl_kernel/deepseek_v4/topk_impl.cuh>
+#include <sgl_kernel/kvduo_cache_observation.h>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -59,6 +60,29 @@ struct alignas(8) PlanItem {
 };
 static_assert(sizeof(GlobalMetadata) == 2 * sizeof(int32_t) && sizeof(PlanItem) == sizeof(GlobalMetadata));
 
+struct KVDuoFullParams {
+  int32_t* output = nullptr;
+  const int64_t* requests = nullptr;
+  const int64_t* lookup = nullptr;
+  const int64_t* mapping = nullptr;
+  int64_t* touches = nullptr;
+  int32_t* status = nullptr;
+  int32_t* stats = nullptr;
+  int32_t* growth = nullptr;
+  const int32_t* observe = nullptr;
+  const int32_t* real_requests = nullptr;
+  const int64_t* clock_base = nullptr;
+  float* prefill_ema = nullptr;
+  int64_t* prefill_steps = nullptr;
+  int64_t lookup_stride = 0;
+  int64_t context = 0;
+  int64_t request_count = 0;
+  int64_t logical_size = 0;
+  int64_t location_base = 0;
+  int64_t layer = 0;
+  int page_bits = 0;
+};
+
 struct TopKLaunchParams {
   const float* __restrict__ scores;
   const int32_t* __restrict__ seq_lens;
@@ -71,6 +95,7 @@ struct TopKLaunchParams {
   int64_t page_table_stride;
   uint32_t topk;
   uint32_t page_bits;
+  KVDuoFullParams full;
   uint32_t cluster_floor;  // seq_len > this routes to the cluster path (batch-aware, host-set)
 
   SGL_DEVICE const GlobalMetadata& global() const {
@@ -103,6 +128,59 @@ struct TopKLaunchParams {
     return this->problem<RawOnly>(batch_id, static_cast<uint32_t>(seq_lens[batch_id]));
   }
 };
+
+SGL_DEVICE void resolve_full(const TopKLaunchParams& params, uint32_t row) {
+  const auto full = params.full;
+  int32_t* output = full.output + row * static_cast<int64_t>(params.topk);
+  if (row >= static_cast<uint32_t>(full.real_requests[0])) {
+    for (uint32_t i = threadIdx.x; i < params.topk; i += kBlockSize) output[i] = -1;
+    return;
+  }
+  const int64_t rid = full.requests[row];
+  if (rid < 0 || rid >= full.request_count) {
+    if (threadIdx.x == 0) __assert_fail("KVDuo FULL TopK invalid request slot", __FILE__, __LINE__, __func__);
+    return;
+  }
+  __shared__ int hits;
+  if (threadIdx.x == 0) {
+    hits = 0;
+    full.status[rid] = 0;
+    if (full.observe[0]) full.growth[rid] = 0;
+  }
+  __syncthreads();
+  const int32_t* raw = params.get_output_ptr(row);
+  const int64_t seq_len = params.seq_lens[row];
+  const auto stamp = static_cast<unsigned long long>(full.clock_base[0] + full.layer + 1);
+  int local_hits = 0;
+  for (uint32_t i = threadIdx.x; i < params.topk; i += kBlockSize) {
+    const int32_t token = raw[i];
+    output[i] = -1;
+    if (token < 0 || token >= seq_len) continue;
+    const int64_t logical = token < full.context ? full.lookup[rid * full.lookup_stride + token] : -1;
+    const int64_t location = logical >= 0 && logical < full.logical_size ? full.mapping[logical] : 0;
+    if (location <= 0) {
+      atomicExch(full.status + rid, 1);
+      continue;
+    }
+    const unsigned peers = __match_any_sync(__activemask(), static_cast<unsigned long long>(location >> full.page_bits));
+    if (threadIdx.x % 32 == __ffs(peers) - 1) {
+      atomicMax(reinterpret_cast<unsigned long long*>(full.touches + logical), stamp);
+    }
+    output[i] = static_cast<int32_t>(location + full.location_base);
+    ++local_hits;
+  }
+  for (int offset = 16; offset > 0; offset /= 2) local_hits += __shfl_down_sync(0xffffffffu, local_hits, offset);
+  if (threadIdx.x % 32 == 0) atomicAdd(&hits, local_hits);
+  __syncthreads();
+  if (full.status[rid] != 0) {
+    if (threadIdx.x == 0) __assert_fail("KVDuo FULL TopK missing resident KV", __FILE__, __LINE__, __func__);
+    return;
+  }
+  if (threadIdx.x == 0) {
+    atomicAdd(full.stats + rid * 2 + 1, hits);
+    if (full.observe[0]) sglang::kvduo_update_prefill_ema(0, 0, hits, full.prefill_ema + rid * 2, full.prefill_steps[rid]);
+  }
+}
 
 /**
  * \brief Persistent cluster kernel for the long items. It will handle long inputs.
@@ -179,10 +257,10 @@ SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
  * - Level 2: max_seq_len <= cluster_floor  -> trivial + register<4> + streaming
  * - Level 3: max_seq_len > cluster_floor   -> + epilogue process of cluster path
  */
-template <bool kPDL, int kLevel, bool RawOnly>
+template <bool kPDL, int kLevel, bool RawOnly, bool Full = false>
 TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams params) {
-  device::enable_smem_spilling();
-  if constexpr (RawOnly) {
+  if constexpr (!Full) device::enable_smem_spilling();
+  if constexpr (RawOnly && !Full) {
     // The persistent route increments here, not in its preceding cluster pool.
     // The following non-PDL resolver waits for every TopK CTA to finish.
     if (blockIdx.x == 0 && threadIdx.x == 0 && params.touch_clock != nullptr) ++params.touch_clock[0];
@@ -190,7 +268,11 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   auto problem = params.problem<RawOnly>(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
-  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL, RawOnly>(problem);
+  if (problem.seq_len <= problem.topk) {
+    trivial_transform<kPDL, RawOnly>(problem);
+    if constexpr (Full) resolve_full(params, blockIdx.x);
+    return;
+  }
   __shared__ int32_t topk_indices[kMaxTopK];
   problem.out = topk_indices;
 
@@ -223,18 +305,25 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
   problem_transform<RawOnly>(problem, params.get_output_ptr(blockIdx.x));
+  if constexpr (Full) resolve_full(params, blockIdx.x);
 }
 
-template <bool kPDL, bool RawOnly>
+template <bool kPDL, bool RawOnly, bool Full = false>
 CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
-  device::enable_smem_spilling();
-  if constexpr (RawOnly) {
+  if constexpr (!Full) device::enable_smem_spilling();
+  if constexpr (RawOnly && !Full) {
     if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && params.touch_clock != nullptr)
       ++params.touch_clock[0];
   }
   auto problem = params.problem<RawOnly>(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
-  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL, RawOnly>(problem);
+  if (problem.seq_len <= problem.topk) {
+    trivial_transform<kPDL, RawOnly>(problem);
+    if constexpr (Full) {
+      if (blockIdx.y == blockIdx.x % kClusterSize) resolve_full(params, blockIdx.x);
+    }
+    return;
+  }
   __shared__ int32_t topk_indices[kMaxTopK];
   problem.out = topk_indices;
 
@@ -260,7 +349,10 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
 
   device::PDLWaitPrimary<kPDL>();
   __syncthreads();
-  if (blockIdx.y == worker_rank) problem_transform<RawOnly>(problem, params.get_output_ptr(blockIdx.x));
+  if (blockIdx.y == worker_rank) {
+    problem_transform<RawOnly>(problem, params.get_output_ptr(blockIdx.x));
+    if constexpr (Full) resolve_full(params, blockIdx.x);
+  }
 }
 
 // --- Plan: choose cluster_threshold from the seq_len distribution -----------
@@ -377,7 +469,7 @@ struct TopKKernel {
         static_cluster_threshold);
   }
 
-  static void transform(
+  static void transform_impl(
       const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView seq_lens,
       const tvm::ffi::TensorView page_table,
@@ -386,7 +478,8 @@ struct TopKKernel {
       const tvm::ffi::TensorView metadata,
       const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
       const bool raw_only,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> touch_clock) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> touch_clock,
+      KVDuoFullParams full = {}) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
@@ -469,17 +562,18 @@ struct TopKKernel {
         .page_table_stride = P.unwrap(),
         .topk = topk,
         .page_bits = page_bits,
+        .full = full,
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
     };
 
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
     constexpr bool kUsePDL = true;
-    auto launch = [&]<bool RawOnly>() {
+    auto launch = [&]<bool RawOnly, bool Full>() {
       if (use_cluster) {
         if (batch_size <= kNumPersistentClusters) {
           LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
               .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-              .launch(topk_small_batch_kernel<kUsePDL, RawOnly>, params);
+              .launch(topk_small_batch_kernel<kUsePDL, RawOnly, Full>, params);
         } else {
           const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
           LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
@@ -487,28 +581,94 @@ struct TopKKernel {
               .launch(topk_persistent_cluster_kernel<kUsePDL, RawOnly>, params);
           LaunchKernel(batch_size, kBlockSize, device)
               .config({.use_pdl = kUsePDL})
-              .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3, RawOnly>, params);
+              .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3, RawOnly, Full>, params);
         }
       } else if (max_seq_len <= kReg2MaxSeqLen) {
         LaunchKernel(batch_size, kBlockSize, device)
             .config({.use_pdl = kUsePDL})
-            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0, RawOnly>, params);
+            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0, RawOnly, Full>, params);
       } else if (max_seq_len <= kReg4MaxSeqLen) {
         LaunchKernel(batch_size, kBlockSize, device)
             .config({.use_pdl = kUsePDL})
-            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/1, RawOnly>, params);
+            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/1, RawOnly, Full>, params);
       } else {
         LaunchKernel(batch_size, kBlockSize, device)
             .config({.use_pdl = kUsePDL})
-            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2, RawOnly>, params);
+            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2, RawOnly, Full>, params);
       }
     };
-    if (raw_only) {
-      launch.template operator()<true>();
+    if (full.output != nullptr) {
+      RuntimeCheck(raw_only && clock_ptr == nullptr, "FULL TopK requires reserved clocks and raw selection");
+      launch.template operator()<true, true>();
+    } else if (raw_only) {
+      launch.template operator()<true, false>();
     } else {
-      launch.template operator()<false>();
+      launch.template operator()<false, false>();
     }
   }
+  static void transform(
+      tvm::ffi::TensorView scores, tvm::ffi::TensorView seq_lens, tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView page_indices, uint32_t page_size, tvm::ffi::TensorView metadata,
+      tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices, bool raw_only,
+      tvm::ffi::Optional<tvm::ffi::TensorView> clock) {
+    transform_impl(scores, seq_lens, page_table, page_indices, page_size, metadata, raw_indices, raw_only, clock);
+  }
+
+  static void transform_full(
+      tvm::ffi::TensorView scores, tvm::ffi::TensorView seq_lens, tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView page_indices, uint32_t page_size, tvm::ffi::TensorView metadata,
+      tvm::ffi::TensorView raw_indices, tvm::ffi::TensorView output,
+      tvm::ffi::TensorView requests, tvm::ffi::TensorView lookup, tvm::ffi::TensorView mapping,
+      tvm::ffi::TensorView touches, tvm::ffi::TensorView status, tvm::ffi::TensorView stats,
+      tvm::ffi::TensorView growth, tvm::ffi::TensorView observe, tvm::ffi::TensorView real_requests,
+      tvm::ffi::TensorView clock_base, tvm::ffi::TensorView prefill_ema, tvm::ffi::TensorView prefill_steps,
+      int64_t layer, int64_t layer_stride, int64_t full_page_size) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto B = SymbolicSize{"batch"};
+    auto K = SymbolicSize{"topk"};
+    auto R = SymbolicSize{"request_count"};
+    auto N = SymbolicSize{"logical_size"};
+    auto C = SymbolicSize{"context"};
+    auto S = SymbolicSize{"lookup_stride"};
+    TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device).verify(raw_indices).verify(output);
+    TensorMatcher({B}).with_dtype<int64_t>().with_device(device).verify(requests);
+    TensorMatcher({R, C}).with_strides({S, 1}).with_dtype<int64_t>().with_device(device).verify(lookup);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(mapping).verify(touches);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device).verify(status).verify(growth);
+    TensorMatcher({R, 2}).with_dtype<int32_t>().with_device(device).verify(stats);
+    TensorMatcher({R, 2}).with_dtype<float>().with_device(device).verify(prefill_ema);
+    TensorMatcher({R}).with_dtype<int64_t>().with_device(device).verify(prefill_steps);
+    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(observe).verify(real_requests);
+    TensorMatcher({1}).with_dtype<int64_t>().with_device(device).verify(clock_base);
+    RuntimeCheck(full_page_size > 0 && std::has_single_bit(static_cast<uint64_t>(full_page_size)), "Invalid FULL page size");
+    RuntimeCheck(layer >= 0 && layer_stride >= 0, "Invalid FULL layer geometry");
+    const auto raw_begin = reinterpret_cast<uintptr_t>(raw_indices.data_ptr());
+    const auto out_begin = reinterpret_cast<uintptr_t>(output.data_ptr());
+    const auto bytes = B.unwrap() * K.unwrap() * sizeof(int32_t);
+    RuntimeCheck(raw_begin >= out_begin + bytes || out_begin >= raw_begin + bytes, "FULL output must not alias raw selection");
+    KVDuoFullParams full{
+        .output = static_cast<int32_t*>(output.data_ptr()),
+        .requests = static_cast<const int64_t*>(requests.data_ptr()),
+        .lookup = static_cast<const int64_t*>(lookup.data_ptr()),
+        .mapping = static_cast<const int64_t*>(mapping.data_ptr()),
+        .touches = static_cast<int64_t*>(touches.data_ptr()),
+        .status = static_cast<int32_t*>(status.data_ptr()),
+        .stats = static_cast<int32_t*>(stats.data_ptr()),
+        .growth = static_cast<int32_t*>(growth.data_ptr()),
+        .observe = static_cast<const int32_t*>(observe.data_ptr()),
+        .real_requests = static_cast<const int32_t*>(real_requests.data_ptr()),
+        .clock_base = static_cast<const int64_t*>(clock_base.data_ptr()),
+        .prefill_ema = static_cast<float*>(prefill_ema.data_ptr()),
+        .prefill_steps = static_cast<int64_t*>(prefill_steps.data_ptr()),
+        .lookup_stride = S.unwrap(), .context = C.unwrap(), .request_count = R.unwrap(),
+        .logical_size = N.unwrap(), .location_base = layer * layer_stride, .layer = layer,
+        .page_bits = static_cast<int>(std::countr_zero(static_cast<uint64_t>(full_page_size))),
+    };
+    transform_impl(scores, seq_lens, page_table, page_indices, page_size, metadata, raw_indices, true, std::nullopt, full);
+  }
+
 };
 
 }  // namespace

@@ -20,6 +20,10 @@ from sglang.kernels.ops.kvcache.kvduo_full_reclaim import (
     summarize_kvduo_full_pages,
 )
 from sglang.kernels.ops.kvcache.kvduo_full_write import publish_kvduo_full_write
+from sglang.kernels.ops.kvcache.kvduo_full_decode import (
+    KVDuoFullTopK,
+    begin_kvduo_decode,
+)
 from sglang.kernels.ops.kvcache.kvduo_hot_growth import publish_kvduo_hot_growth
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
@@ -334,6 +338,9 @@ class HiSparseCoordinator:
                 (mapping_size,), -1, dtype=torch.int64, device=device
             )
             self.full_touch_clock = torch.zeros(1, dtype=torch.int64, device=device)
+            self.kvduo_full_clock_base = torch.zeros(
+                1, dtype=torch.int64, device=device
+            )
             self.kvduo_swap_status = torch.zeros(
                 (self.mem_pool_device.layer_num, max_num_req_slots),
                 dtype=torch.int32,
@@ -2108,6 +2115,53 @@ class HiSparseCoordinator:
                 self.token_to_kv_pool_allocator.free_hisparse_indices(physical)
             raise
 
+    def kvduo_batch_fully_resident(self, requests_cpu) -> bool:
+        if not self.enable_mixed_residency or requests_cpu is None:
+            return False
+        if isinstance(requests_cpu, torch.Tensor):
+            if requests_cpu.device.type != "cpu":
+                return False
+            requests_cpu = requests_cpu.tolist()
+        return bool(len(requests_cpu)) and all(
+            int(req) in self._active_kvduo_reqs
+            and not self._mixed_slots[int(req)]
+            and int(req) not in self._kvduo_pending_hot_minimum
+            and not getattr(
+                self._active_kvduo_reqs[int(req)], "hisparse_staging", False
+            )
+            for req in requests_cpu
+        )
+
+    def kvduo_full_topk_metadata(self, layer, requests, output):
+        return KVDuoFullTopK(
+            output,
+            requests,
+            self.req_to_full_lookup,
+            self.mem_pool_device.full_to_hisparse_device_index_mapping,
+            self.full_last_touch,
+            self.kvduo_swap_status[layer],
+            self.kvduo_resolver_stats[layer],
+            self.kvduo_hot_growth_events[layer],
+            self.kvduo_observe,
+            self.num_real_reqs,
+            self.kvduo_full_clock_base,
+            self.kvduo_prefill_ema[layer],
+            self.kvduo_prefill_steps[layer],
+            layer,
+            self.mem_pool_device.flat_layer_slot_stride,
+            self.page_size,
+        )
+
+    def publish_kvduo_decode_controls(self, batch_size, *, fully_resident=False):
+        begin_kvduo_decode(
+            self.full_touch_clock,
+            self.kvduo_full_clock_base,
+            self.kvduo_observe,
+            self.num_real_reqs,
+            batch_size=batch_size,
+            full_layers=self.mem_pool_device.layer_num if fully_resident else 0,
+        )
+
     def _consume_kvduo_hot_growth_events(self) -> torch.Tensor:
         """Read each H2D capacity event before the immediately following replay.
 
@@ -2125,6 +2179,8 @@ class HiSparseCoordinator:
         self,
         req_pool_indices: torch.Tensor,
         req_pool_indices_cpu: Sequence[int] | torch.Tensor | None = None,
+        *,
+        publish_observation: bool = True,
     ) -> None:
         """Perform physical capacity management at the graph replay boundary.
 
@@ -2139,7 +2195,8 @@ class HiSparseCoordinator:
             device_module.current_stream(self.device).wait_stream(
                 self.decode_producer_stream
             )
-        self.kvduo_observe.fill_(1)
+        if publish_observation:
+            self.kvduo_observe.fill_(1)
         tracked_pending_minimum = getattr(self, "_kvduo_pending_hot_minimum", None)
         pending_minimum = tracked_pending_minimum
         if pending_minimum is None:

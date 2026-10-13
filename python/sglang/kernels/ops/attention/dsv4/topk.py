@@ -37,6 +37,7 @@ def _jit_topk_v2_module():
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=[
             ("topk_transform", "TopKKernel::transform"),
+            ("topk_transform_full", "TopKKernel::transform_full"),
             ("topk_plan", "TopKKernel::plan"),
         ],
     )
@@ -94,6 +95,7 @@ def topk_transform_512_v2(
     *,
     raw_only: bool = False,
     touch_clock: Optional[torch.Tensor] = None,
+    full_metadata=None,
 ) -> None:
     """Fused top-k + page-table transform (DeepSeek-V4 top-k v2 kernel).
 
@@ -127,8 +129,50 @@ def topk_transform_512_v2(
             and mapped_start < raw_start + out_raw_indices.nbytes
         ):
             raise ValueError("TopK raw-only output must not alias the mapped output")
-    module = _jit_topk_v2_module()
-    module.topk_transform(
+    if full_metadata is not None:
+        if not raw_only or touch_clock is not None:
+            raise ValueError(
+                "FULL TopK requires raw-only selection and reserved clocks"
+            )
+        spec = full_metadata
+        if (
+            spec.output.shape != out_raw_indices.shape
+            or spec.output.dtype != torch.int32
+            or spec.output.device != scores.device
+        ):
+            raise ValueError("FULL TopK requires a matching output bank")
+        if (
+            spec.output.data_ptr() < out_raw_indices.data_ptr() + out_raw_indices.nbytes
+            and out_raw_indices.data_ptr() < spec.output.data_ptr() + spec.output.nbytes
+        ):
+            raise ValueError("FULL TopK output must not alias raw selection")
+        _jit_topk_v2_module().topk_transform_full(
+            scores,
+            seq_lens,
+            page_tables,
+            out_page_indices,
+            page_size,
+            metadata,
+            out_raw_indices,
+            spec.output,
+            spec.requests,
+            spec.lookup,
+            spec.mapping,
+            spec.touches,
+            spec.status,
+            spec.stats,
+            spec.growth,
+            spec.observe,
+            spec.real_requests,
+            spec.clock_base,
+            spec.prefill_ema,
+            spec.prefill_steps,
+            spec.layer,
+            spec.layer_stride,
+            spec.page_size,
+        )
+        return
+    _jit_topk_v2_module().topk_transform(
         scores,
         seq_lens,
         page_tables,

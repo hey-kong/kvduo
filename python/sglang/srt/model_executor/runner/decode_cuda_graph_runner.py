@@ -43,6 +43,9 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+    FullCudaGraphBackend,
+)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -408,6 +411,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
+        self.kvduo_full_graph = self._can_capture_kvduo_full_graph()
 
         # --- capture --------------------------------------------------
         try:
@@ -451,6 +455,51 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
+        )
+
+    def _can_capture_kvduo_full_graph(self):
+        coordinator = self.model_runner.hisparse_coordinator
+        topk = getattr(self.attn_backend, "dsa_topk_backend", None)
+        eligible = bool(
+            coordinator is not None
+            and coordinator.enable_mixed_residency
+            and coordinator.is_dsv4_hisparse
+            and self.capture_forward_mode == ForwardMode.DECODE
+            and self.captured_req_width == 1
+            and isinstance(self.backend, FullCudaGraphBackend)
+            and not self.enable_two_batch_overlap
+            and not self.require_mlp_sync
+            and not self.enable_prefill_cp
+            and not self.enable_pdmux
+            and self.pp_size == 1
+            and not self.model_runner.server_args.enable_lora
+            and not self.enable_torch_compile
+            and topk is not None
+            and not topk.is_torch()
+            and not topk.is_flashinfer()
+            and not getattr(
+                self.attn_backend, "debug_use_external_c4_sparse_indices", False
+            )
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and not envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+            and torch.cuda.is_available()
+            and not torch.version.hip
+            and torch.cuda.get_device_capability(self.device)[0] >= 9
+        )
+        if coordinator is not None and coordinator.enable_mixed_residency:
+            return coordinator._kvduo_consensus(eligible) and eligible
+        return eligible
+
+    def _kvduo_full_replay(self, forward_batch, raw_bs):
+        coordinator = self.model_runner.hisparse_coordinator
+        return bool(
+            getattr(self, "kvduo_full_graph", False)
+            and forward_batch.forward_mode.is_decode()
+            and coordinator.kvduo_batch_fully_resident(
+                forward_batch.req_pool_indices_cpu[:raw_bs]
+                if forward_batch.req_pool_indices_cpu is not None
+                else None
+            )
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
@@ -895,6 +944,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if getattr(self, "record_nolora_graph", False)
             else [(None, None)]
         )
+        if getattr(self, "kvduo_full_graph", False):
+            lora_variants.append(("kvduo_full", None))
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -907,7 +958,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
 
             for variant_label, _variant_has_lora in lora_variants:
-                _set_capture_lora_variant(variant_label)
+                _set_capture_lora_variant(
+                    None if variant_label == "kvduo_full" else variant_label
+                )
                 with torch_compile_decoration.patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
@@ -935,6 +988,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens
         )
+        forward_batch.kvduo_full_decode = variant_label == "kvduo_full"
+        if forward_batch.kvduo_full_decode:
+            # Dummy capture rows have no allocated FULL backing.
+            forward_batch.hisparse_coordinator.num_real_reqs.zero_()
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -1177,7 +1234,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if self.model_runner.hisparse_coordinator is not None:
             coordinator = self.model_runner.hisparse_coordinator
-            coordinator.num_real_reqs.fill_(raw_bs)
             if coordinator.enable_mixed_residency:
                 coordinator.prepare_kvduo_graph_replay(
                     buffers.req_pool_indices[:raw_bs],
@@ -1186,9 +1242,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         if forward_batch.req_pool_indices_cpu is not None
                         else None
                     ),
+                    publish_observation=False,
                 )
+            else:
+                coordinator.num_real_reqs.fill_(raw_bs)
 
         variant_label = self._resolve_lora_variant(forward_batch)
+        if (
+            self.model_runner.hisparse_coordinator is not None
+            and coordinator.enable_mixed_residency
+        ):
+            fully_resident = self._kvduo_full_replay(forward_batch, raw_bs)
+            if fully_resident:
+                variant_label = "kvduo_full"
+            coordinator.publish_kvduo_decode_controls(
+                raw_bs, fully_resident=fully_resident
+            )
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label
