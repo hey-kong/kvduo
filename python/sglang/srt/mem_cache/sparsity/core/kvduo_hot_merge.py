@@ -31,6 +31,41 @@ class KVDuoHotMergeTensors:
     destination_locations: torch.Tensor
 
 
+def free_kvduo_whole_pages(allocator, starts, page_size, workspace=None):
+    """Return known unique whole-page ownership without filtering token indices."""
+    import torch
+
+    if not starts:
+        return
+    if (
+        page_size <= 0
+        or len(set(starts)) != len(starts)
+        or any(start <= 0 or start % page_size for start in starts)
+        or getattr(allocator, "page_size", page_size) != page_size
+    ):
+        raise ValueError("KVDuo reclaim requires unique aligned non-dummy pages")
+    if workspace is None:
+        page_ids = torch.tensor(
+            [start // page_size for start in starts],
+            dtype=torch.int64,
+            device=allocator.device,
+        )
+    else:
+        count = len(starts)
+        for i, start in enumerate(starts):
+            workspace.page_ids_host[i] = start // page_size
+        page_ids = workspace.page_ids[:count]
+        page_ids.copy_(workspace.page_ids_host[:count], non_blocking=True)
+    # Match the immediate physical-page return used by free_hisparse_indices.
+    allocator.is_not_in_free_group = True
+    allocator._release_page_ids(page_ids)
+    if getattr(allocator, "debug_mode", False):
+        allocator._debug_check_no_duplicate_pages()
+    if workspace is not None:
+        workspace.completion.record(torch.cuda.current_stream(page_ids.device))
+        workspace.free_pending = True
+
+
 def prepare_kvduo_hot_merge(
     tokens: torch.Tensor,
     locations: torch.Tensor,

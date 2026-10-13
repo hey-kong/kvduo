@@ -27,6 +27,11 @@ from sglang.kernels.ops.kvcache.kvduo_full_decode import (
 )
 from sglang.kernels.ops.kvcache.kvduo_hot_growth import publish_kvduo_hot_growth
 from sglang.kernels.ops.kvcache.kvduo_control import pack_kvduo_feedback
+from sglang.kernels.ops.kvcache.kvduo_hot_merge import (
+    allocate_kvduo_merge_workspace,
+    execute_kvduo_hot_merge,
+    finish_kvduo_hot_merge,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -40,6 +45,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.sparsity.core.kvduo_hot_merge import (
+    free_kvduo_whole_pages,
     kvduo_shrink_target,
     prepare_kvduo_hot_merge,
 )
@@ -501,6 +507,11 @@ class HiSparseCoordinator:
             self.token_to_kv_pool_allocator.kvduo_physical_allocation_guard = (
                 self._guard_kvduo_physical_allocation
             )
+            self._kvduo_merge_workspace = None
+            if self.req_device_buffer_tokens.is_cuda:
+                self._kvduo_merge_workspace = allocate_kvduo_merge_workspace(
+                    self.req_device_buffer_tokens[0, 0], self.lru_slots[0, 0]
+                )
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -2597,6 +2608,51 @@ class HiSparseCoordinator:
             self._establish_kvduo_hot_base(owner, pages)
             return 0
 
+        if self.req_device_buffer_tokens.is_cuda:
+            workspace = getattr(self, "_kvduo_merge_workspace", None)
+            if workspace is None:
+                workspace = self._kvduo_merge_workspace = (
+                    allocate_kvduo_merge_workspace(
+                        self.req_device_buffer_tokens[owner], self.lru_slots[owner]
+                    )
+                )
+            execute_kvduo_hot_merge(
+                self.req_device_buffer_tokens[owner],
+                self.req_device_buffer_token_locs[owner],
+                self.lru_slots[owner],
+                self.mem_pool_device.get_flat_key_buffer(),
+                workspace,
+                capacity=capacity,
+                k=self.hot_page_size,
+                top_k=self.top_k,
+                target_pages=target_pages,
+                paged=self.is_dsv4_hisparse,
+                published_capacity=self.kvduo_req_hot_capacity_gpu[owner],
+                capacity_ema=self.kvduo_capacity_ema[owner],
+                capacity_steps=self.kvduo_capacity_steps[owner],
+                growth_events=self.kvduo_hot_growth_events[owner],
+                base_capacity=self.kvduo_hot_base_capacity[owner],
+                prefill_ema=self.kvduo_prefill_ema[owner],
+                prefill_steps=self.kvduo_prefill_steps[owner],
+            )
+            kept, released = finish_kvduo_hot_merge(
+                workspace, len(pages), target_pages, self.hot_page_size
+            )
+            kept_starts = [pages[index] for index in kept]
+            released_starts = [pages[index] for index in released]
+            self.kvduo_req_hot_capacity[owner] = target_pages * self.hot_page_size
+            self._kvduo_req_layer_pages[owner] = kept_starts
+            self._establish_kvduo_hot_base(owner, kept_starts, publish_stats=False)
+            for start in released_starts:
+                del self._kvduo_hot_page_owners[start]
+            free_kvduo_whole_pages(
+                self.token_to_kv_pool_allocator.hisparse_attn_allocator,
+                released_starts,
+                self.page_size,
+                workspace,
+            )
+            return len(released_starts) * self.page_size
+
         plan = prepare_kvduo_hot_merge(
             self.req_device_buffer_tokens[layer_id, req_idx],
             self.req_device_buffer_token_locs[layer_id, req_idx],
@@ -2611,16 +2667,6 @@ class HiSparseCoordinator:
         new_capacity = target_pages * self.hot_page_size
         new_tokens, new_locs, new_lru = plan.tokens, plan.locations, plan.lru_slots
         src_locs, dst_locs = plan.source_locations, plan.destination_locations
-        released = torch.tensor(
-            [
-                slot
-                for start in released_starts
-                for slot in range(start, start + self.page_size)
-            ],
-            dtype=torch.int64,
-            device=self.device,
-        )
-
         finished = device_module.Event() if new_tokens.is_cuda else None
         self._move_kvduo_hot_entries(layer_id, src_locs, dst_locs)
         self.req_device_buffer_tokens[layer_id, req_idx].copy_(new_tokens)
@@ -2641,7 +2687,11 @@ class HiSparseCoordinator:
         for start in released_starts:
             del self._kvduo_hot_page_owners[start]
         if released_starts:
-            self.token_to_kv_pool_allocator.free_hisparse_indices(released)
+            free_kvduo_whole_pages(
+                self.token_to_kv_pool_allocator.hisparse_attn_allocator,
+                released_starts,
+                self.page_size,
+            )
         return len(released_starts) * self.page_size
 
     def reclaim_kvduo_hot_pages(self, num_tokens: int) -> int:
@@ -2912,15 +2962,16 @@ class HiSparseCoordinator:
             reservation[1].difference_update(old_keys)
         self._prune_kvduo_prefill_budget()
 
-    def _establish_kvduo_hot_base(self, owner, pages) -> None:
+    def _establish_kvduo_hot_base(self, owner, pages, *, publish_stats=True) -> None:
         """Every ordinary merge, including no-release, starts a new base/phase."""
         self._kvduo_hot_base_pages[owner] = tuple(pages)
         self._kvduo_hot_base_generation[owner] = self._kvduo_request_generation[
             owner[1]
         ]
-        self.kvduo_hot_base_capacity[owner] = len(pages) * self.hot_page_size
-        self.kvduo_prefill_ema[owner] = 0
-        self.kvduo_prefill_steps[owner] = 0
+        if publish_stats:
+            self.kvduo_hot_base_capacity[owner] = len(pages) * self.hot_page_size
+            self.kvduo_prefill_ema[owner] = 0
+            self.kvduo_prefill_steps[owner] = 0
         self._kvduo_prefill_budget_reference.pop(self._kvduo_owner_key(owner), None)
         self._kvduo_hand_sequence += 1
         self._kvduo_hot_processed[owner] = self._kvduo_hand_sequence

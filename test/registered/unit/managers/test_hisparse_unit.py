@@ -551,6 +551,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         physical = SimpleNamespace(
             available_size=MagicMock(return_value=4),
             alloc=MagicMock(return_value=torch.arange(20, 24)),
+            device="cpu",
+            page_size=4,
+            _release_page_ids=MagicMock(),
         )
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
             hisparse_attn_allocator=physical, free_hisparse_indices=MagicMock()
@@ -587,12 +590,8 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.kvduo_capacity_steps[1, 0] = 65
         coordinator._merge_kvduo_hot_pages(1, 0)
         self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
-        returned = (
-            coordinator.token_to_kv_pool_allocator.free_hisparse_indices.call_args.args[
-                0
-            ]
-        )
-        self.assertEqual(returned.tolist(), [24, 25, 26, 27])
+        returned = physical._release_page_ids.call_args.args[0]
+        self.assertEqual(returned.tolist(), [6])
         physical.alloc.reset_mock()
         coordinator._ensure_kvduo_hot_capacity_targets(1, {0: 8}, allow_reclaim=False)
         physical.alloc.assert_called_once_with(4)

@@ -543,7 +543,11 @@ def _jit_kvduo_merge_module(capacity: int, block_size: int):
         capacity,
         block_size,
         cuda_files=["kvduo_hot_merge.cuh"],
-        cuda_wrappers=[("plan", f"kvduo_hot_merge_plan<{args}>")],
+        cuda_wrappers=[
+            ("plan", f"kvduo_hot_merge_plan<{args}>"),
+            ("execute_linear", f"kvduo_hot_merge_execute<{args}, false>"),
+            ("execute_c4", f"kvduo_hot_merge_execute<{args}, true>"),
+        ],
     )
 
 
@@ -589,6 +593,7 @@ def build_kvduo_hot_merge_plan(
         k,
         target_pages,
         hash_size,
+        torch.iinfo(torch.int32).max,
     )
     return summary, new_tokens, new_locations, new_lru, sources, destinations
 
