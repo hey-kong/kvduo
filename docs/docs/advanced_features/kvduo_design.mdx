@@ -43,7 +43,7 @@ FULL 只能在 Host 副本完整、有效且版本同步后回收。候选页排
 
 共享池之外的 logical、SWA、indexer、压缩状态及 Host 预算仍需检查。请求进入混合驻留时，首次需要 HOT 的 decode 前必须补足最低容量。
 
-可选 `decode_emergency_reclaim=true` 仅用于必需 decode：正常 FULL 回收和预算内 HOT merge 后仍缺页时，将可安全处理、未锁定的 HOT 对象缩至最低容量，优先处理可释放页数最多的对象，空间足够即停止。此应急路径不受 EMA 预算及观察门槛限制，可能增加 H2D 换入；最低容量、页保护、TP 一致性和 prefill 预留仍有效。默认关闭，prefill 和可选扩容不使用此路径。
+`decode_emergency_reclaim` 默认开启，仅用于必需 decode：正常 FULL 回收和预算内 HOT merge 后仍缺页时，将可安全处理、未锁定的 HOT 对象缩至最低容量，优先处理可释放页数最多的对象，空间足够即停止。它允许观察不足或超出普通 miss 预算的对象应急缩容，优先保留运行中的请求，可能增加 H2D 换入和 merge 停顿；最低容量、页保护、TP 一致性和 prefill 预留仍有效。prefill 和可选扩容不使用此路径，可设置 `decode_emergency_reclaim=false` 关闭。
 
 首次 decode 准入失败时，日志记录逻辑／SWA、Host、物理空闲页、HOT 最低额度、prefill 预留及回收结果；整请求回退仍作为兜底。应急 HOT 回收无法解决独立池不足。
 
@@ -184,7 +184,7 @@ python3 -m sglang.launch_server \
 | `tail_protected_pages` | `2` | 每请求保护的最新 FULL 页数 |
 | `full_reclaim_policy` | `"request"` | `"request"` 按请求批量释放全部合格 FULL 页；`"page"` 按页 LRU 回收 |
 | `max_relative_miss_increase` | `0.10` | 普通缩容、对象回退及累计预算共用的预计 miss 相对增幅容忍比例 |
-| `decode_emergency_reclaim` | `false` | 必需 decode 的普通回收失败后，允许 HOT 应急缩至最低容量，优先避免整请求回退 |
+| `decode_emergency_reclaim` | `true` | 必需 decode 的普通回收失败后，允许 HOT 应急缩至最低容量，优先避免整请求回退 |
 
 前四项须为正整数，回收策略只接受 `"request"` 或 `"page"`，miss 容忍比例须为有限非负数，应急开关须为布尔值；未知字段报错。`--kvduo-config` 必须配合 `--enable-kvduo`。默认 10% 是实验初值。
 

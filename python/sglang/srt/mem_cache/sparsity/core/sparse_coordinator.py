@@ -78,7 +78,7 @@ class KVDuoConfig:
     tail_protected_pages: int = 2
     max_relative_miss_increase: float = 0.10
     full_reclaim_policy: str = "request"
-    decode_emergency_reclaim: bool = False
+    decode_emergency_reclaim: bool = True
 
 
 class SparseCoordinator:

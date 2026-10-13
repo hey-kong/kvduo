@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.sparsity import parse_kvduo_config
 from sglang.srt.mem_cache.sparsity.core.kvduo_state import KVDuoPressureAction
 from sglang.test.ci.ci_register import register_cpu_ci
 from test_kvduo_hot_merge import (
@@ -45,6 +46,28 @@ def pressure_batch(enabled, *, pages=4):
     batch.hisparse_coordinator = c
     batch.tree_cache = make_cache(allocator)
     return batch, c, physical
+
+
+@pytest.mark.parametrize(
+    "raw,enabled",
+    [
+        (None, True),
+        ("{}", True),
+        (
+            '{"top_k":512,"host_to_device_ratio":2,"swap_in_block_size":960}',
+            True,
+        ),
+        ('{"decode_emergency_reclaim":false}', False),
+    ],
+)
+def test_default_config_enables_emergency_decode_recovery_and_allows_opt_out(
+    raw, enabled
+):
+    config = parse_kvduo_config(SimpleNamespace(kvduo_config=raw))
+    batch, c, physical = pressure_batch(config.decode_emergency_reclaim)
+    assert batch.check_decode_mem() is enabled
+    assert physical.free_pages == (3 if enabled else 0)
+    assert c.kvduo_req_hot_capacity[0, 0] == (4 if enabled else 16)
 
 
 @pytest.mark.parametrize("enabled", [False, True])

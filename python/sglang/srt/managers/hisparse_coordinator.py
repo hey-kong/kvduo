@@ -177,7 +177,7 @@ class HiSparseCoordinator:
         tail_protected_pages: int = 0,
         prefill_policy: KVDuoPrefillPolicy | None = None,
         full_reclaim_policy: str = "request",
-        decode_emergency_reclaim: bool = False,
+        decode_emergency_reclaim: bool = True,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
