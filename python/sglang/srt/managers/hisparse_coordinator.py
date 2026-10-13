@@ -17,6 +17,7 @@ from sglang.kernels.ops.kvcache.hisparse import (
 )
 from sglang.kernels.ops.kvcache.kvduo_full_reclaim import (
     select_kvduo_full_pages,
+    select_kvduo_full_requests,
     summarize_kvduo_full_pages,
 )
 from sglang.kernels.ops.kvcache.kvduo_full_write import publish_kvduo_full_write
@@ -175,6 +176,7 @@ class HiSparseCoordinator:
         swap_in_block_size: int = 960,
         tail_protected_pages: int = 0,
         prefill_policy: KVDuoPrefillPolicy | None = None,
+        full_reclaim_policy: str = "request",
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -191,6 +193,9 @@ class HiSparseCoordinator:
         self.swap_in_block_size = swap_in_block_size
         self.tail_protected_pages = tail_protected_pages
         self.enable_mixed_residency = tail_protected_pages > 0
+        if full_reclaim_policy not in ("request", "page"):
+            raise ValueError("full_reclaim_policy must be 'request' or 'page'")
+        self.full_reclaim_policy = full_reclaim_policy
         self.kvduo_prefill_policy = prefill_policy or KVDuoPrefillPolicy()
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
@@ -1622,6 +1627,11 @@ class HiSparseCoordinator:
             self.kvduo_resolver_stats[:, req.req_pool_idx, :] = 0
             self.kvduo_hot_growth_events[:, req.req_pool_idx] = 0
             self._reset_kvduo_hot_metadata(req.req_pool_idx)
+            self._kvduo_decode_sequence += 1
+            self._kvduo_decode_order[req.req_pool_idx] = (
+                self._kvduo_request_generation[req.req_pool_idx],
+                self._kvduo_decode_sequence,
+            )
             self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
             self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
             return
@@ -2750,6 +2760,8 @@ class HiSparseCoordinator:
         self._kvduo_hot_base_pages = {}
         self._kvduo_hot_generation = {}
         self._kvduo_request_generation = [0] * requests
+        self._kvduo_decode_order = {}
+        self._kvduo_decode_sequence = 0
         self._kvduo_hot_base_generation = {}
         self._kvduo_prefill_budget_reference = {}
         self._kvduo_prefill_budget_cost = {}
@@ -2766,6 +2778,7 @@ class HiSparseCoordinator:
             for layer in range(self.mem_pool_device.layer_num)
         }
         self._kvduo_request_generation[req_idx] += 1
+        self._kvduo_decode_order.pop(req_idx, None)
         for bank in (
             self.kvduo_hot_base_capacity,
             self.kvduo_capacity_ema,
@@ -4191,7 +4204,7 @@ class HiSparseCoordinator:
         request_indices=None,
         release_all=False,
     ) -> int:
-        """Demote cold request-owned full pages for mandatory physical pressure.
+        """Demote eligible request-owned FULL pages using the configured policy.
 
         The host copy is complete before requests leave staging. This control
         path may synchronize only when allocation pressure occurs; steady-state
@@ -4255,7 +4268,8 @@ class HiSparseCoordinator:
 
         minimum_costs = {}
         owners = sorted({req_idx for req_idx, _ in candidate_meta})
-        if reserve_hot_minimum:
+        request_policy = self.full_reclaim_policy == "request"
+        if reserve_hot_minimum or (request_policy and not release_all):
             # The first FULL demotion needs minimum HOT capacity in EVERY
             # logical layer. An allocation cannot count these as free space,
             # or make a fully resident request mixed without room to execute.
@@ -4274,14 +4288,36 @@ class HiSparseCoordinator:
                     )
                 )
         owner_indices = {req_idx: i for i, req_idx in enumerate(owners)}
-        selected = select_kvduo_full_pages(
-            page_touch,
-            valid,
-            [owner_indices[req_idx] for req_idx, _ in candidate_meta],
-            [minimum_costs.get(req_idx, 0) for req_idx in owners],
-            (num_tokens + self.page_size - 1) // self.page_size,
-            release_all=release_all,
-        )
+        page_owners = [owner_indices[req_idx] for req_idx, _ in candidate_meta]
+        costs = [minimum_costs.get(req_idx, 0) for req_idx in owners]
+        needed = (num_tokens + self.page_size - 1) // self.page_size
+        if request_policy:
+            admission_order = []
+            for req_idx in owners:
+                record = self._kvduo_decode_order.get(req_idx)
+                admission_order.append(
+                    record[1]
+                    if record is not None
+                    and record[0] == self._kvduo_request_generation[req_idx]
+                    else torch.iinfo(torch.int64).max
+                )
+            selected = select_kvduo_full_requests(
+                valid,
+                page_owners,
+                costs,
+                admission_order,
+                needed,
+                release_all=release_all,
+            )
+        else:
+            selected = select_kvduo_full_pages(
+                page_touch,
+                valid,
+                page_owners,
+                costs,
+                needed,
+                release_all=release_all,
+            )
 
         if (
             not self._kvduo_consensus(tuple(candidate_meta[i] for i in selected))
@@ -4291,11 +4327,15 @@ class HiSparseCoordinator:
         selected_gpu = torch.tensor(selected, dtype=torch.int64, device=self.device)
         selected_logical = logical_pages[selected_gpu]
         selected_physical = physical_pages[selected_gpu]
+        published = device_module.Event() if selected_logical.is_cuda else None
+        first_holes = {}
+        for i in selected:
+            req_idx, start = candidate_meta[i]
+            first_holes[req_idx] = min(first_holes.get(req_idx, start), start)
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
             selected_logical.flatten()
         ] = 0
-        for i in selected:
-            req_idx, start = candidate_meta[i]
+        for req_idx, start in first_holes.items():
             req = self._active_kvduo_reqs[req_idx]
             req.kvduo_mixed_residency = True
             req.kvduo_radix_insert_len = min(
@@ -4304,8 +4344,7 @@ class HiSparseCoordinator:
             )
             self._mixed_slots[req_idx] = True
             self._kvduo_pending_hot_minimum.add(req_idx)
-        if selected_logical.is_cuda:
-            published = device_module.Event()
+        if published is not None:
             published.record(device_module.current_stream(self.device))
             published.synchronize()
         self.token_to_kv_pool_allocator.free_hisparse_indices(

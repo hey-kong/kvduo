@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+from collections import Counter
 from collections.abc import Sequence
 
 import torch
@@ -17,6 +18,7 @@ def _jit_full_reclaim_module():
             ("summarize_i32", "kvduo_full_page_summary<128, int32_t>"),
             ("summarize_i64", "kvduo_full_page_summary<128, int64_t>"),
             ("select", "kvduo_full_page_select<128>"),
+            ("select_requests", "kvduo_full_request_select<128>"),
         ],
     )
 
@@ -190,3 +192,83 @@ def select_kvduo_full_pages(
     packet[1:] = compact_order[:bound]
     result = packet.cpu().tolist()
     return result[1 : 1 + result[0]]
+
+
+def select_kvduo_full_requests(
+    valid: torch.Tensor,
+    owner_indices: Sequence[int],
+    minimum_costs: Sequence[int],
+    admission_order: Sequence[int],
+    needed_pages: int,
+    *,
+    release_all: bool = False,
+) -> list[int]:
+    """Release complete eligible owner sets, largest net gain first.
+
+    Equal gains prefer earlier decode admission, then the stable owner index.
+    Page validity and one-time HOT minimum costs match the page policy. GPU
+    planning never sorts page ages or downloads the full validity vector.
+    """
+    n = valid.numel()
+    if (
+        valid.ndim != 1
+        or len(owner_indices) != n
+        or len(admission_order) != len(minimum_costs)
+        or any(owner < 0 or owner >= len(minimum_costs) for owner in owner_indices)
+        or any(cost < 0 for cost in minimum_costs)
+        or any(order < 0 for order in admission_order)
+    ):
+        raise ValueError("Invalid FULL request selection geometry")
+    if n == 0 or needed_pages <= 0:
+        return []
+    if valid.is_cuda:
+        device = valid.device
+        owners = torch.tensor(owner_indices, dtype=torch.int64, device=device)
+        costs = torch.tensor(minimum_costs, dtype=torch.int64, device=device)
+        order = torch.tensor(admission_order, dtype=torch.int64, device=device)
+        largest_owner = max(Counter(owner_indices).values())
+        bound = (
+            n
+            if release_all
+            else min(n, needed_pages - 1 + sum(minimum_costs) + largest_owner)
+        )
+        workspace = torch.empty(
+            2 * len(minimum_costs), dtype=torch.int32, device=device
+        )
+        packet = torch.empty(bound + 1, dtype=torch.int64, device=device)
+        _jit_full_reclaim_module().select_requests(
+            valid.int(),
+            owners,
+            costs,
+            order,
+            workspace,
+            packet,
+            needed_pages,
+            release_all,
+        )
+        result = packet.cpu().tolist()
+        if not 0 <= result[0] <= bound:
+            raise RuntimeError("FULL request plan exceeded its selection bound")
+        return result[1 : 1 + result[0]]
+
+    validity = valid.bool().tolist()
+    counts = Counter(owner for owner, ok in zip(owner_indices, validity) if ok)
+    eligible = sorted(
+        (owner for owner, count in counts.items() if count > minimum_costs[owner]),
+        key=lambda owner: (
+            -(counts[owner] - minimum_costs[owner]),
+            admission_order[owner],
+            owner,
+        ),
+    )
+    chosen, net = set(), 0
+    for owner in eligible:
+        if not release_all and net >= needed_pages:
+            break
+        chosen.add(owner)
+        net += counts[owner] - minimum_costs[owner]
+    return [
+        i
+        for i, (owner, ok) in enumerate(zip(owner_indices, validity))
+        if ok and owner in chosen
+    ]

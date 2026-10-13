@@ -184,8 +184,11 @@ def test_radix_reclaim_continues_past_host_only_entries_and_stops_without_progre
     batch.tree_cache.evict.assert_called_once()
 
 
-def make_full_coordinator(*, pages=8, layers=1, ratio=1, initial_pages=2):
+def make_full_coordinator(
+    *, pages=8, layers=1, ratio=1, initial_pages=2, full_reclaim_policy="page"
+):
     coordinator, physical = make_coordinator(layers=layers, free_pages=0)
+    coordinator.full_reclaim_policy = full_reclaim_policy
     coordinator.compress_ratio = ratio
     coordinator.is_dsv4_hisparse = ratio > 1
     coordinator.mem_pool_device.page_size = coordinator.page_size
@@ -255,25 +258,31 @@ def make_full_coordinator(*, pages=8, layers=1, ratio=1, initial_pages=2):
     return coordinator, physical, req
 
 
-def test_decode_full_reclaim_funds_both_append_and_new_mixed_minima():
-    coordinator, physical, req = make_full_coordinator(layers=2)
+@pytest.mark.parametrize("policy,reclaimed", [("page", 3), ("request", 6)])
+def test_decode_full_reclaim_funds_both_append_and_new_mixed_minima(policy, reclaimed):
+    coordinator, physical, req = make_full_coordinator(
+        layers=2, full_reclaim_policy=policy
+    )
     coordinator._reclaim_for_physical_allocation = MethodType(
         HiSparseCoordinator._reclaim_for_physical_allocation, coordinator
     )
     req.kv_committed_len = 16
     result = coordinator.ensure_kvduo_decode_capacity([req])
     assert result.action is KVDuoPressureAction.SUCCESS
-    assert physical.free_pages == 3
+    assert physical.free_pages == reclaimed
     assert coordinator._kvduo_mandatory_hot_pages() == 2
     assert coordinator._guard_kvduo_physical_allocation(2)
     physical.free_pages -= 1  # the admitted FULL append page
     coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
-    assert physical.free_pages == 0
+    assert physical.free_pages == reclaimed - 3
     assert coordinator.kvduo_req_hot_capacity[:, 0].tolist() == [4, 4]
 
 
-def test_decode_defers_when_full_reclaim_cannot_fund_new_mixed_minima():
-    coordinator, physical, req = make_full_coordinator(pages=4, layers=2)
+@pytest.mark.parametrize("policy", ["page", "request"])
+def test_decode_defers_when_full_reclaim_cannot_fund_new_mixed_minima(policy):
+    coordinator, physical, req = make_full_coordinator(
+        pages=4, layers=2, full_reclaim_policy=policy
+    )
     coordinator._reclaim_for_physical_allocation = MethodType(
         HiSparseCoordinator._reclaim_for_physical_allocation, coordinator
     )
@@ -286,17 +295,22 @@ def test_decode_defers_when_full_reclaim_cannot_fund_new_mixed_minima():
 
 
 @pytest.mark.parametrize("ratio", [1, 4])
-def test_prefill_full_demotion_reserves_new_mixed_owners_minimum_in_every_layer(ratio):
-    coordinator, physical, req = make_full_coordinator(layers=2, ratio=ratio)
+@pytest.mark.parametrize("policy,reclaimed", [("page", 3), ("request", 6)])
+def test_prefill_full_demotion_reserves_new_mixed_owners_minimum_in_every_layer(
+    ratio, policy, reclaimed
+):
+    coordinator, physical, req = make_full_coordinator(
+        layers=2, ratio=ratio, full_reclaim_policy=policy
+    )
     token = coordinator.reserve_kvduo_prefill(1, [0])
     assert token is not None
-    assert physical.free_pages == 3  # two HOT minima plus one prefill page
+    assert physical.free_pages == reclaimed
     assert coordinator._kvduo_mandatory_hot_pages() == 2
     assert coordinator._kvduo_reserved_prefill_pages() == 1
     assert req.kvduo_mixed_residency
     coordinator.reclaim_kvduo_hot_pages.assert_not_called()
     coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
-    assert physical.free_pages == 1
+    assert physical.free_pages == reclaimed - 2
     assert coordinator._kvduo_mandatory_hot_pages() == 0
     assert coordinator.kvduo_req_hot_capacity[:, 0].tolist() == [4, 4]
 

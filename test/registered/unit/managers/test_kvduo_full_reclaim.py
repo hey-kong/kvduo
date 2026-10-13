@@ -7,6 +7,7 @@ import torch
 
 from sglang.kernels.ops.kvcache.kvduo_full_reclaim import (
     select_kvduo_full_pages,
+    select_kvduo_full_requests,
     summarize_kvduo_full_pages,
 )
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -18,6 +19,207 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from test_kvduo_pressure_admission import make_full_coordinator
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def test_request_selection_uses_net_gain_then_decode_age_and_stable_owner():
+    owners = [0] * 6 + [1] * 5 + [2] * 4
+    valid = torch.ones(len(owners), dtype=torch.int32)
+    # Owner 1 releases fewer pages than 0, but needs no new HOT minimum.
+    assert select_kvduo_full_requests(valid, owners, [2, 0, 1], [1, 2, 3], 1) == list(
+        range(6, 11)
+    )
+    # All three have the same net gain; earlier decode admission wins.
+    assert select_kvduo_full_requests(valid, owners, [3, 2, 1], [3, 2, 1], 1) == list(
+        range(11, 15)
+    )
+    assert select_kvduo_full_requests(valid, owners, [3, 2, 1], [1, 1, 1], 1) == list(
+        range(6)
+    )
+
+
+@pytest.mark.parametrize("release_all", [False, True])
+def test_request_selection_preserves_validity_and_releases_complete_owner_sets(
+    release_all,
+):
+    generator = torch.Generator().manual_seed(712)
+    owners = torch.randint(0, 9, (521,), generator=generator).tolist()
+    for _ in range(50):
+        valid = (torch.rand(521, generator=generator) > 0.25).int()
+        costs = torch.randint(0, 65, (9,), generator=generator).tolist()
+        age = torch.randperm(9, generator=generator).tolist()
+        need = int(torch.randint(1, 300, (), generator=generator))
+        counts = Counter(owner for owner, ok in zip(owners, valid.tolist()) if ok)
+        ordered = sorted(
+            (owner for owner in counts if counts[owner] > costs[owner]),
+            key=lambda owner: (costs[owner] - counts[owner], age[owner], owner),
+        )
+        chosen, net = set(), 0
+        for owner in ordered:
+            if not release_all and net >= need:
+                break
+            chosen.add(owner)
+            net += counts[owner] - costs[owner]
+        expected = [
+            i
+            for i, (owner, ok) in enumerate(zip(owners, valid.tolist()))
+            if ok and owner in chosen
+        ]
+        assert (
+            select_kvduo_full_requests(
+                valid, owners, costs, age, need, release_all=release_all
+            )
+            == expected
+        )
+
+
+def make_request_reclaim_coordinator(counts, *, layers=1, ratio=1, policy="request"):
+    c, physical, prototype = make_full_coordinator(
+        pages=max(counts) + 2, layers=layers, ratio=ratio, full_reclaim_policy=policy
+    )
+    width = (max(counts) + 2) * c.page_size
+    requests = len(counts)
+    c.req_to_token_pool.req_to_token = torch.arange(
+        requests * width * ratio, dtype=torch.int32
+    ).view(requests, -1)
+    mapping = torch.arange(requests * width) + c.page_size
+    c.mem_pool_device.full_to_hisparse_device_index_mapping = mapping
+    c.full_data_version = torch.ones_like(mapping)
+    c.full_host_version = torch.ones_like(mapping)
+    c.full_last_touch = torch.arange(mapping.numel())
+    c.kvduo_req_hot_capacity = torch.zeros((layers, requests), dtype=torch.int64)
+    c._kvduo_host_valid_len = [(n + 2) * c.page_size for n in counts]
+    c._mixed_slots = [False] * requests
+    c._kvduo_request_generation = [1] * requests
+    c._kvduo_decode_order = {i: (1, i + 1) for i in range(requests)}
+    c._kvduo_pending_hot_minimum.clear()
+    c._active_kvduo_reqs = {}
+    for i, n in enumerate(counts):
+        req = SimpleNamespace(**vars(prototype))
+        req.req_pool_idx = i
+        req.kv = SimpleNamespace(kv_allocated_len=(n + 2) * c.page_size * ratio)
+        req.kvduo_radix_insert_len = req.kv.kv_allocated_len
+        c._active_kvduo_reqs[i] = req
+    c._kvduo_consensus = MagicMock(return_value=True)
+    return c, physical, width
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_request_reclaim_releases_largest_owner_once_and_funds_all_layer_minima(
+    ratio, monkeypatch
+):
+    c, physical, width = make_request_reclaim_coordinator([3, 6], layers=2, ratio=ratio)
+    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
+    original = mapping.clone()
+    # Request selection needs counts, not page-age sorting.
+    monkeypatch.setattr(
+        torch, "argsort", MagicMock(side_effect=AssertionError("page sort"))
+    )
+    assert (
+        c.reclaim_kvduo_full_pages(c.page_size, reserve_hot_minimum=True)
+        == 6 * c.page_size
+    )
+    assert torch.equal(mapping[:width], original[:width])
+    assert torch.all(mapping[width : width + 6 * c.page_size] == 0)
+    assert torch.equal(
+        mapping[width + 6 * c.page_size :], original[width + 6 * c.page_size :]
+    )
+    assert c._mixed_slots == [False, True]
+    assert c._kvduo_pending_hot_minimum == {1}
+    assert c._kvduo_mandatory_hot_pages() == 2
+    assert physical.free_pages == 6
+    c.token_to_kv_pool_allocator.free_hisparse_indices.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "policy,expected_pages,expected_mixed",
+    [
+        ("request", 6, [False, True]),
+        ("page", 2, [True, False]),
+    ],
+)
+def test_full_reclaim_policy_switch_preserves_page_lru(
+    policy, expected_pages, expected_mixed
+):
+    c, _, _ = make_request_reclaim_coordinator([3, 6], policy=policy)
+    assert (
+        c.reclaim_kvduo_full_pages(c.page_size, reserve_hot_minimum=True)
+        == expected_pages * c.page_size
+    )
+    assert c._mixed_slots == expected_mixed
+
+
+def test_request_reclaim_stops_after_enough_net_space_and_skips_zero_gain():
+    c, physical, _ = make_request_reclaim_coordinator([3, 5, 4])
+    assert (
+        c.reclaim_kvduo_full_pages(6 * c.page_size, reserve_hot_minimum=True)
+        == 9 * c.page_size
+    )
+    assert c._mixed_slots == [False, True, True]
+    assert physical.free_pages - c._kvduo_mandatory_hot_pages() == 7
+    c, physical, _ = make_request_reclaim_coordinator([1, 2], layers=2)
+    original = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
+    assert c.reclaim_kvduo_full_pages(c.page_size) == 0
+    assert physical.free_pages == 0 and c._mixed_slots == [False, False]
+    assert torch.equal(
+        c.mem_pool_device.full_to_hisparse_device_index_mapping, original
+    )
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_request_reclaim_age_is_generation_bound(stale):
+    c, _, _ = make_request_reclaim_coordinator([4, 4])
+    c._kvduo_decode_order = {0: (1, 2), 1: (0 if stale else 1, 1)}
+    assert c.reclaim_kvduo_full_pages(c.page_size) == 4 * c.page_size
+    assert c._mixed_slots == ([True, False] if stale else [False, True])
+
+
+def test_request_reclaim_preserves_prefix_tail_stale_host_and_protected_pages_before_free():
+    c, _, width = make_request_reclaim_coordinator([8])
+    req = c._active_kvduo_reqs[0]
+    req.cache_protected_len = c.page_size
+    c.full_host_version[2 * c.page_size] = 0
+    c._kvduo_pressure_protected = torch.tensor([4 * c.page_size], dtype=torch.int32)
+    # The last historical page has not completed Host backup yet.
+    c._kvduo_host_valid_len[0] = 7 * c.page_size
+    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
+    original = mapping.clone()
+    released = [
+        i
+        for page in (1, 3, 5, 6)
+        for i in range(page * c.page_size, (page + 1) * c.page_size)
+    ]
+    untouched = [i for i in range(width) if i not in released]
+
+    def free(indices):
+        assert torch.all(mapping[released] == 0)
+        assert torch.equal(mapping[untouched], original[untouched])
+        assert indices.tolist() == original[released].tolist()
+
+    c.token_to_kv_pool_allocator.free_hisparse_indices.side_effect = free
+    assert c.reclaim_kvduo_full_pages(c.page_size) == len(released)
+    assert req.kvduo_radix_insert_len == c.page_size
+
+
+def test_request_reclaim_tp_disagreement_does_not_publish_or_free():
+    c, physical, _ = make_request_reclaim_coordinator([3, 6])
+    original = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
+    c._kvduo_consensus.return_value = False
+    assert c.reclaim_kvduo_full_pages(c.page_size) == 0
+    assert torch.equal(
+        c.mem_pool_device.full_to_hisparse_device_index_mapping, original
+    )
+    assert c._mixed_slots == [False, False] and physical.free_pages == 0
+    c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
+
+
+def test_decode_admission_order_is_cleared_on_finish_and_recreated_on_slot_reuse():
+    c, _, req = make_full_coordinator(full_reclaim_policy="request")
+    generation, sequence = c._kvduo_decode_order[0]
+    c.request_finished(req)
+    assert 0 not in c._kvduo_decode_order
+    c.alloc_device_buffer(req)
+    new_generation, new_sequence = c._kvduo_decode_order[0]
+    assert new_generation > generation and new_sequence > sequence
 
 
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])

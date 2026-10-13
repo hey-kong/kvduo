@@ -146,6 +146,7 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         "swap_in_block_size",
         "tail_protected_pages",
         "max_relative_miss_increase",
+        "full_reclaim_policy",
     }
     unknown = set(values) - known
     if unknown:
@@ -176,12 +177,19 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
     )
 
     policy = KVDuoPrefillPolicy(values.get("max_relative_miss_increase", 0.10))
+    full_reclaim_policy = values.get("full_reclaim_policy", "request")
+    if not isinstance(full_reclaim_policy, str) or full_reclaim_policy not in (
+        "request",
+        "page",
+    ):
+        raise ValueError("full_reclaim_policy must be 'request' or 'page'")
     return KVDuoConfig(
         top_k=top_k,
         host_to_device_ratio=ratio,
         swap_in_block_size=block_size,
         tail_protected_pages=tail_pages,
         max_relative_miss_increase=policy.max_relative_miss_increase,
+        full_reclaim_policy=full_reclaim_policy,
     )
 
 

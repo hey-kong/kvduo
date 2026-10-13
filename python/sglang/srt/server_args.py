@@ -2695,7 +2695,8 @@ class ServerArgs:
         Arg(
             help=(
                 "A JSON object for KVDuo. Example: "
-                '\'{"top_k": 2048, "tail_protected_pages": 2}\''
+                '\'{"top_k": 2048, "tail_protected_pages": 2, '
+                '"full_reclaim_policy": "request"}\''
             )
         ),
         NS("memory"),
