@@ -798,6 +798,7 @@ class C4IndexerBackendMixin:
         )
 
         raw_indices = None
+        touch_clock_advanced = False
         if capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
@@ -849,6 +850,14 @@ class C4IndexerBackendMixin:
                 raw_only=(
                     hisparse_decode and hisparse_coordinator.enable_mixed_residency
                 ),
+                **(
+                    {"touch_clock": hisparse_coordinator.full_touch_clock}
+                    if hisparse_decode and hisparse_coordinator.enable_mixed_residency
+                    else {}
+                ),
+            )
+            touch_clock_advanced = (
+                hisparse_decode and hisparse_coordinator.enable_mixed_residency
             )
         else:
             topk_transform_512(
@@ -870,6 +879,11 @@ class C4IndexerBackendMixin:
                         compressed_seq_lens=indexer_metadata.c4_seq_lens,
                         top_k_result=raw_indices,
                         layer_id=compress_layer_id,
+                        **(
+                            {"touch_clock_advanced": True}
+                            if touch_clock_advanced
+                            else {}
+                        ),
                     )
                 )
             else:

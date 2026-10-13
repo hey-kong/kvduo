@@ -94,6 +94,7 @@ def indexer_case(monkeypatch):
         backend.hisparse_coordinator = (
             SimpleNamespace(
                 enable_mixed_residency=coordinator == "kvduo",
+                full_touch_clock=torch.zeros(1, dtype=torch.int64),
                 raw_indices_buffer=raw,
                 swap_in_selected_pages=MagicMock(
                     side_effect=lambda **kw: torch.where(
@@ -111,7 +112,7 @@ def indexer_case(monkeypatch):
         c4_indexer = SimpleNamespace(use_fp4_indexer=False, layer_id=7)
         v1 = MagicMock(side_effect=emit_topk)
         v2 = MagicMock(
-            side_effect=lambda scores, seq, pages, out, page_size, plan, raw, raw_only=False: emit_topk(
+            side_effect=lambda scores, seq, pages, out, page_size, plan, raw, raw_only=False, touch_clock=None: emit_topk(
                 scores, seq, pages, out, page_size, raw, raw_only
             )
         )
@@ -163,7 +164,10 @@ def test_kvduo_decode_v2_passes_raw_positions_to_resolver(
     for _ in range(2):
         case.run()
         args = case.v2.call_args.args
-        assert case.v2.call_args.kwargs == {"raw_only": True}
+        assert case.v2.call_args.kwargs == {
+            "raw_only": True,
+            "touch_clock": case.backend.hisparse_coordinator.full_touch_clock,
+        }
         assert torch.all(case.output == -123)
         assert args[1] is case.metadata.c4_seq_lens
         assert args[5] is case.metadata.topk_metadata
@@ -178,6 +182,7 @@ def test_kvduo_decode_v2_passes_raw_positions_to_resolver(
         assert call["top_k_result"] is selected
         assert call["req_pool_indices"] is case.batch.req_pool_indices
         assert call["layer_id"] == 2
+        assert call["touch_clock_advanced"] is True
         assert torch.equal(
             case.core.c4_sparse_page_indices,
             torch.where(selected >= 0, selected + 10_000, -1),
@@ -206,6 +211,10 @@ def test_kvduo_v2_ineligible_decode_keeps_v1(indexer_case, reason):
     case.v1.assert_called_once()
     case.v2.assert_not_called()
     assert case.backend.hisparse_coordinator.swap_in_selected_pages.call_count == 1
+    assert (
+        "touch_clock_advanced"
+        not in case.backend.hisparse_coordinator.swap_in_selected_pages.call_args.kwargs
+    )
 
 
 def test_ordinary_decode_keeps_v2_without_raw_output(indexer_case):
@@ -251,7 +260,7 @@ def test_topk_v2_wrapper_passes_output_mode_without_device_reads(monkeypatch, ra
             MagicMock(side_effect=AssertionError("device read")),
         )
     ops.topk_transform_512_v2(*args, raw_only=raw_only)
-    module.topk_transform.assert_called_once_with(*args, raw_only)
+    module.topk_transform.assert_called_once_with(*args, raw_only, None)
 
 
 def test_topk_v2_raw_only_rejects_missing_or_aliased_output_before_loading(monkeypatch):
@@ -278,4 +287,33 @@ def test_topk_v2_raw_only_rejects_missing_or_aliased_output_before_loading(monke
         ops.topk_transform_512_v2(
             *overlapping_args, backing[1:].view_as(out), raw_only=True
         )
+
+
+@pytest.mark.parametrize(
+    "raw_only,clock",
+    [
+        (False, torch.zeros(1, dtype=torch.int64)),
+        (True, torch.zeros(1)),
+        (True, torch.zeros(2, dtype=torch.int64)),
+    ],
+)
+def test_topk_v2_rejects_invalid_clock_before_launch(monkeypatch, raw_only, clock):
+    from sglang.kernels.ops.attention.dsv4 import topk as ops
+
+    load = MagicMock(side_effect=AssertionError("invalid clock reached JIT"))
+    monkeypatch.setattr(ops, "_jit_topk_v2_module", load)
+    out = torch.empty((1, 512), dtype=torch.int32)
+    with pytest.raises(ValueError, match="clock"):
+        ops.topk_transform_512_v2(
+            torch.zeros((1, 1024)),
+            torch.ones(1, dtype=torch.int32),
+            torch.empty((1, 0), dtype=torch.int32),
+            out,
+            64,
+            torch.zeros((2, 2), dtype=torch.int32),
+            torch.empty_like(out),
+            raw_only=raw_only,
+            touch_clock=clock,
+        )
+    load.assert_not_called()
     load.assert_not_called()

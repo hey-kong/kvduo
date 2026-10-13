@@ -1007,11 +1007,20 @@ def test_kvduo_dsv4_topk_v2_raw_resolver_graph_with_full_hot_host_and_padding(co
         touch_clock=torch.tensor([7], dtype=torch.int64, device=DEVICE),
         lru_scratch=lru_scratch,
         validate_status=True,
+        full_page_size=DSV4_PAGE_SIZE,
     )
 
     def run():
         topk_transform_512_v2(
-            scores, lengths, page_table, selected, 64, plan, raw, raw_only=True
+            scores,
+            lengths,
+            page_table,
+            selected,
+            64,
+            plan,
+            raw,
+            raw_only=True,
+            touch_clock=kwargs["touch_clock"],
         )
         load_cache_to_device_buffer_dsv4_mla(**kwargs)
 
@@ -1060,12 +1069,23 @@ def test_kvduo_dsv4_topk_v2_raw_resolver_graph_with_full_hot_host_and_padding(co
         lru[1].copy_(initial_lru)
         device[hot_start // DSV4_PAGE_SIZE :].fill_(0x22)
         previous_stats = stats.clone()
+        previous_clock = kwargs["touch_clock"].item()
         scores[0].neg_()
         raw.fill_(-123)
         output.fill_(-123)
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(stats - previous_stats, expected_delta)
+        assert kwargs["touch_clock"].item() == previous_clock + 1
+        # All selected FULL pages retain their current page-level age.
+        for row in range(2):
+            full = logical[row, raw[row][raw[row] >= 0].long()]
+            full = full[mapping[full] > 0]
+            for page in torch.unique(full // DSV4_PAGE_SIZE).tolist():
+                touches = kwargs["full_last_touch"][
+                    page * DSV4_PAGE_SIZE : (page + 1) * DSV4_PAGE_SIZE
+                ]
+                assert touches.max().item() == previous_clock + 1
         check()
         assert pointers == [
             bank.data_ptr() for bank in (raw, selected, output, plan, tokens, lru)
@@ -1490,6 +1510,85 @@ def test_kvduo_segment_and_extra_ema_use_actual_pre_update_hot_reuse_and_misses(
         segments + [expected[1] if capacity and observed else 0]
     ]
     assert kwargs["capacity_steps"].item() == int(observed and capacity > 0)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_full_page_touch_aggregation_keeps_outputs_counts_and_page_age(compact):
+    k, capacity, P = 64, 96, 16
+    logical = torch.arange(64, dtype=torch.int64, device=DEVICE).repeat(2, 1)
+    mapping = torch.arange(128, 192, dtype=torch.int64, device=DEVICE)
+    selected = torch.full((3, k), -1, dtype=torch.int32, device=DEVICE)
+    selected[0, :48] = torch.cat([torch.arange(32), torch.arange(16)]).to(DEVICE)
+    selected[1, :35] = (torch.arange(35) % 32 + 32).to(DEVICE)
+    selected[1, 35:40] = 64  # Out-of-range selections are not hits.
+    versions = torch.ones_like(mapping)
+    hot_shape = (2, capacity + P)
+    clock = torch.tensor([87], dtype=torch.int64, device=DEVICE)
+    kwargs = dict(
+        top_k_tokens=selected,
+        device_buffer_tokens=torch.full(
+            hot_shape, -1, dtype=torch.int32, device=DEVICE
+        ),
+        device_buffer_locs=torch.full(hot_shape, -1, dtype=torch.int32, device=DEVICE),
+        host_cache_locs=torch.full((2, 64), -1, dtype=torch.int64, device=DEVICE),
+        host_cache=torch.zeros((64, 1, KV_DIM), dtype=DTYPE, pin_memory=True),
+        device_buffer=torch.zeros((192, 1, KV_DIM), dtype=DTYPE, device=DEVICE),
+        top_k_device_locs=torch.full_like(selected, -99),
+        req_pool_indices=torch.tensor([1, 0, 9999], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([64, 64, 0], dtype=torch.int32, device=DEVICE),
+        lru_slots=torch.arange(capacity, dtype=torch.int16, device=DEVICE).repeat(2, 1),
+        item_size_bytes=ITEM_SIZE_BYTES,
+        num_top_k=k,
+        hot_buffer_size=capacity,
+        page_size=48,
+        block_size=256,
+        num_real_reqs=torch.tensor([2], dtype=torch.int32, device=DEVICE),
+        req_hot_buffer_sizes=torch.zeros(2, dtype=torch.int32, device=DEVICE),
+        req_to_logical_token=logical,
+        full_to_device_loc=mapping,
+        full_last_touch=torch.zeros_like(mapping),
+        full_data_version=versions,
+        full_host_version=versions.clone(),
+        swap_status=torch.zeros(2, dtype=torch.int32, device=DEVICE),
+        resolver_stats=torch.zeros((2, 2), dtype=torch.int32, device=DEVICE),
+        touch_clock=clock,
+        lru_scratch=(
+            torch.empty((2, capacity), dtype=torch.int16, device=DEVICE)
+            if compact
+            else None
+        ),
+        validate_status=True,
+    )
+    banks = (
+        kwargs["device_buffer_tokens"],
+        kwargs["device_buffer_locs"],
+        kwargs["lru_slots"],
+    )
+    before = [bank.clone() for bank in banks]
+    load_cache_to_device_buffer_mla(**kwargs)
+    torch.cuda.synchronize()
+    expected_output = kwargs["top_k_device_locs"].clone()
+    expected_stats = kwargs["resolver_stats"].clone()
+    expected_age = kwargs["full_last_touch"].reshape(-1, P).amax(1)
+    kwargs["full_last_touch"].zero_()
+    kwargs["resolver_stats"].zero_()
+    kwargs["full_page_size"] = P
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        load_cache_to_device_buffer_mla(**kwargs)
+    for stamp in (87, 91):
+        clock.fill_(stamp)
+        kwargs["resolver_stats"].zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(kwargs["top_k_device_locs"], expected_output)
+        assert torch.equal(kwargs["resolver_stats"], expected_stats)
+        assert torch.equal(
+            kwargs["full_last_touch"].reshape(-1, P).amax(1), expected_age + stamp - 87
+        )
+        if not is_hip():
+            assert (kwargs["full_last_touch"] == stamp).sum().item() < 64
+        assert all(torch.equal(bank, old) for bank, old in zip(banks, before))
 
 
 def test_kvduo_ema_decays_on_valid_zero_counts_and_marks_reuse_after_h2d():

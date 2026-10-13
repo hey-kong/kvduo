@@ -77,11 +77,21 @@ def test_raw_only_matches_selection_without_reading_page_table(batch, seq, k):
     scores, lengths, pages, unused_pages, outputs = make_case(batch, seq, k)
     raw, untouched, mapped, reference = outputs
     metadata = plan_topk_v2(lengths)
+    clock = torch.tensor([41], dtype=torch.int64, device="cuda")
     topk_transform_512_v2(
-        scores, lengths, unused_pages, untouched, 64, metadata, raw, raw_only=True
+        scores,
+        lengths,
+        unused_pages,
+        untouched,
+        64,
+        metadata,
+        raw,
+        raw_only=True,
+        touch_clock=clock,
     )
     topk_transform_512_v2(scores, lengths, pages, mapped, 64, metadata, reference)
     torch.cuda.synchronize()
+    assert clock.item() == 42
     check(scores, lengths, pages, outputs)
 
 
@@ -92,13 +102,22 @@ def test_raw_only_graph_replays_changing_lengths_and_scores(batch, k):
     raw, untouched, mapped, reference = outputs
     metadata = plan_topk_v2(lengths)
     module = _jit_topk_v2_module()
-    banks = (scores, lengths, pages, unused_pages, metadata, *outputs)
+    clock = torch.tensor([41], dtype=torch.int64, device="cuda")
+    banks = (scores, lengths, pages, unused_pages, metadata, clock, *outputs)
     addresses = [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
 
     def run():
         module.topk_plan(lengths, metadata, 0)
         topk_transform_512_v2(
-            scores, lengths, unused_pages, untouched, 64, metadata, raw, raw_only=True
+            scores,
+            lengths,
+            unused_pages,
+            untouched,
+            64,
+            metadata,
+            raw,
+            raw_only=True,
+            touch_clock=clock,
         )
         topk_transform_512_v2(scores, lengths, pages, mapped, 64, metadata, reference)
 
@@ -117,7 +136,9 @@ def test_raw_only_graph_replays_changing_lengths_and_scores(batch, k):
                 device="cuda",
             )
         )
+        before = clock.item()
         graph.replay()
         torch.cuda.synchronize()
+        assert clock.item() == before + 1
         check(scores, lengths, pages, outputs)
     assert addresses == [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
