@@ -197,6 +197,31 @@ def test_dsv4_load_back_rejects_stale_main_only_plan_before_pins_or_allocation()
     assert all(not record.pinned for record in c.host_prefix_cache.records.values())
 
 
+@pytest.mark.parametrize("finished", [True, False])
+def test_host_restore_ownership_is_not_confused_with_shared_radix_prefix(finished):
+    cache, allocator, _ = make_cache()
+    tokens = list(range(16))
+    original = alloc(allocator, 16)
+    source = make_req(cache, tokens, slots=original, rid="source")
+    cache.cache_finished_req(source, kv_len_to_handle=16)
+    restored = alloc(allocator, 16)
+    target = make_req(cache, tokens, slots=restored, rid="target")
+    target.cache_protected_len = 16
+    target.kvduo_shared_prefix_len = 0
+    allocator.free_swa(restored[:12])
+    target.swa_evicted_seqlen = 12
+    if finished:
+        cache.cache_finished_req(target, kv_len_to_handle=16)
+        assert allocator.swa_available_size() == allocator.size_swa
+    else:
+        cache.cache_unfinished_req(target, chunked=True)
+        assert not hasattr(target, "kvduo_shared_prefix_len")
+        assert torch.all(mapped(allocator, target.prefix_indices[-4:]) > 0)
+        cache.cache_finished_req(target, kv_len_to_handle=16)
+    assert allocator.full_available_size() == allocator.size_full - 16
+    assert allocator.swa_available_size() == allocator.size_swa
+
+
 def _swa_host_match_tp_worker(rank, init_file):
     import torch.distributed as dist
 

@@ -45,13 +45,15 @@ FULL 只能在 Host 副本完整、有效且版本同步后回收。候选页排
 
 KVDuo 的 SWA 只为活跃计算保留数据，不为未来前缀复用长期占用 HBM。已完成 prefill chunk 的窗口外请求自有 SWA 及时释放；decode 准入前再次清理。共享前缀的 SWA 窗口由各请求独立加锁，仍被其他请求或待执行、在途 prefill 使用的数据保持保护。清理按页对齐，保留当前窗口、必要保护区及未完成计算所需的数据。
 
-无人使用的缓存 SWA 单独释放，FULL 前缀和 Host 后备按原策略管理，不保存 Host SWA。DeepSeek-V4 的 C4-only Host 记录不足以恢复 prefill 起点之前的 SWA 和相关边界状态，因此不用于扩展 prefill 前缀。只复用原生验证通过的 GPU 前缀，从该边界继续计算；没有有效 GPU 前缀时从头 prefill。Host 后备仍用于 decode 换入。该策略可减少 SWA 压力引起的整请求回退，但会降低后续请求的前缀复用率。
+请求结束后释放无人使用的 HBM SWA，保留有效的 Host 前缀副本。DeepSeek-V4 在完成 prefill chunk、清理 SWA 前，备份完整页的 C4、indexer、C128 历史，以及 SWA 和相关 C4 压缩状态；decode 结束前也保存最后一个可用边界，复用已有主 KV Host 后备。Host 历史池与窗口池容量有上限，窗口池按 `host_to_device_ratio` 配置，淘汰未被请求或搬运引用的旧记录；因此会增加 Host 内存和备份开销。
+
+前缀复用只选择各 TP rank 都具备完整、有效副本的页对齐边界：恢复缺失的历史数据及边界前的 SWA 窗口和压缩状态，然后继续 prefill。只分配恢复窗口所需的 HBM SWA，不恢复整段历史 SWA。C128 请求状态按 HiCache 的页对齐规则重新开始。副本缺失、过期或尚未完成搬运时缩短命中；没有有效边界才从头计算。取消、请求结束和槽位复用释放相关引用，缓存清空同时清理 Host 副本。纯 HiSparse 路径保持原行为。
 
 `decode_emergency_reclaim` 默认关闭，可设置 `decode_emergency_reclaim=true` 开启。它仅用于必需 decode：正常 FULL 回收和预算内 HOT merge 后仍缺页时，将可安全处理、未锁定的 HOT 对象缩至最低容量，优先处理可释放页数最多的对象，空间足够即停止。它允许观察不足或超出普通 miss 预算的对象应急缩容，优先保留运行中的请求，可能增加 H2D 换入和 merge 停顿；最低容量、页保护、TP 一致性和 prefill 预留仍有效。prefill 和可选扩容不使用此路径。
 
 首次 decode 准入失败时，日志记录逻辑／SWA、Host、物理空闲页、HOT 最低额度、prefill 预留及回收结果；整请求回退仍作为兜底。应急 HOT 回收无法解决独立池不足。
 
-回退前检查并预留完整 prompt 所需的 Host 后备。Staging 实际分配后转为真实占用；取消或请求结束时释放预留及其前缀 pin。
+回退前检查并预留完整 prompt 所需的主 KV Host 后备。已完成 chunk 的备份和 staging 分配将预留转为真实占用；取消或请求结束时释放剩余预留及其前缀 pin。
 
 ## 设计点 2：按近期收益调整 HOT 容量
 

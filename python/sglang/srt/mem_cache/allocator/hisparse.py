@@ -690,10 +690,14 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_hisparse(free_indices)
         self.logical_attn_allocator.free_full(free_indices)
 
-    def rollback_restore_allocation(self, free_indices: torch.Tensor) -> None:
-        """Release the C4 and Full pages owned by a restore allocation."""
+    def rollback_restore_allocation(
+        self, free_indices: torch.Tensor, *, swa_tail_len: int = 0
+    ) -> None:
+        """Release every pool owned by a checkpoint restore allocation."""
         if free_indices.numel() == 0:
             return
+        if swa_tail_len:
+            self.logical_attn_allocator.free_swa(free_indices[-swa_tail_len:])
         self.free_hisparse(free_indices)
         self.logical_attn_allocator.free_full(free_indices)
 
@@ -705,8 +709,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
+        *,
+        swa_tail_len: int = 0,
     ):
-        """Allocate Full+C4 for host restore, leaving SWA to tail prefill."""
+        """Allocate Full+C4 and the preceding SWA checkpoint window."""
         num_full_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu,
             page_size=self.page_size,
@@ -722,6 +728,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             > self.logical_attn_allocator.full_available_size() // self.page_size
             or num_c4_pages
             > self.hisparse_attn_allocator.available_size() // self.hisparse_page_size
+            or (
+                swa_tail_len
+                and (swa_tail_len + self.page_size - 1) // self.page_size
+                > self.logical_attn_allocator.swa_available_size() // self.page_size
+            )
         ):
             return None
 
@@ -732,7 +743,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             last_loc,
             extend_num_tokens,
-            swa_tail_len=0,
+            swa_tail_len=swa_tail_len,
         )
         assert logical_indices is not None
         compressed = self.hisparse_kvcache.translate_loc_from_full_to_compressed(

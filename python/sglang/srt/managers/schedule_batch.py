@@ -1626,6 +1626,8 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.cache_protected_len = 0
+        if hasattr(self, "kvduo_shared_prefix_len"):
+            del self.kvduo_shared_prefix_len
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
@@ -3263,7 +3265,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def release_kvduo_prefill_swa(self):
         if getattr(self.tree_cache, "kvduo_active_swa", False) is not True:
             return
-        self.tree_cache.maintain_kvduo_swa(
+        frontiers = [
             (req, prefix_len + extend_len)
             for req, prefix_len, extend_len in zip(
                 self.reqs, self.prefix_lens, self.extend_lens
@@ -3271,7 +3273,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if not req.finished()
             and not req.is_retracted
             and (not self.decoding_reqs or req not in self.decoding_reqs)
+        ]
+        state_cache = getattr(
+            self.tree_cache.kvduo_coordinator, "kvduo_prefill_host_cache", None
         )
+        if state_cache is not None:
+            for req, completed_len in frontiers:
+                state_cache.backup(req, completed_len)
+        self.tree_cache.maintain_kvduo_swa(frontiers)
 
     def maybe_evict_swa(self):
         if getattr(self.tree_cache, "kvduo_active_swa", False) is True:

@@ -291,6 +291,11 @@ class UnifiedRadixCache(BasePrefixCache):
             self.work_list.append(send_work)
 
     def reset(self) -> None:
+        state_cache = getattr(
+            getattr(self, "kvduo_coordinator", None), "kvduo_prefill_host_cache", None
+        )
+        if state_cache is not None:
+            state_cache.clear()
         self._reset_full()
 
     def _reset_full(self) -> None:
@@ -408,12 +413,11 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self._match_prefix_without_kvduo(params)
         coordinator = getattr(self, "kvduo_coordinator", None)
         if coordinator is not None and params.req is not None:
+
             def match_common_gpu_prefix(common_len: int) -> MatchResult:
                 key = params.key
                 raw_limit = common_len + 1 if key.is_bigram else common_len
-                limit = (
-                    raw_limit if key.limit is None else min(key.limit, raw_limit)
-                )
+                limit = raw_limit if key.limit is None else min(key.limit, raw_limit)
                 common_params = MatchPrefixParams(
                     key=RadixKey(
                         token_ids=key.token_ids,
@@ -733,10 +737,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
         result = None
         insert_params = None
+        shared_prefix_len = getattr(
+            req, "kvduo_shared_prefix_len", req.cache_protected_len
+        )
 
         if is_insert:
             insert_params = InsertParams(
-                prev_prefix_len=req.cache_protected_len,
+                prev_prefix_len=shared_prefix_len,
                 priority=getattr(req, "priority", 0) or 0,
             )
 
@@ -757,7 +764,7 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_indices_full = kv_indices
             tail_free_start = None
             if effective_cache_len < len(token_ids):
-                tail_free_start = max(effective_cache_len, req.cache_protected_len)
+                tail_free_start = max(effective_cache_len, shared_prefix_len)
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
@@ -778,8 +785,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free_segments(segments)
         else:
             self.token_to_kv_pool_allocator.free_segment(
-                kv_indices[req.cache_protected_len :],
-                start_pos=req.cache_protected_len,
+                kv_indices[shared_prefix_len:],
+                start_pos=shared_prefix_len,
             )
 
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
@@ -819,10 +826,13 @@ class UnifiedRadixCache(BasePrefixCache):
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        shared_prefix_len = getattr(
+            req, "kvduo_shared_prefix_len", req.cache_protected_len
+        )
 
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
-            prev_prefix_len=req.cache_protected_len,
+            prev_prefix_len=shared_prefix_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
         )
@@ -877,8 +887,8 @@ class UnifiedRadixCache(BasePrefixCache):
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
+            (req.req_pool_idx, slice(shared_prefix_len, len(new_indices))),
+            new_indices[shared_prefix_len:],
         )
 
         self._dec_req_lock(req)
@@ -905,6 +915,8 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             req.prefix_indices = new_indices
         req.cache_protected_len = len(new_indices)
+        if hasattr(req, "kvduo_shared_prefix_len"):
+            del req.kvduo_shared_prefix_len
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         # carry the skip set so this node's dec releases only what we locked
@@ -2014,11 +2026,10 @@ class UnifiedRadixCache(BasePrefixCache):
         Returns (device_indices, last_node) tuple."""
         coordinator = getattr(self, "kvduo_coordinator", None)
         if coordinator is not None and params.req is not None:
+
             def reclaim_radix(full_tokens: int, swa_tokens: int) -> tuple[int, int]:
                 result = self.evict(
-                    EvictParams(
-                        num_tokens=full_tokens, swa_num_tokens=swa_tokens
-                    )
+                    EvictParams(num_tokens=full_tokens, swa_num_tokens=swa_tokens)
                 )
                 return result.num_tokens_evicted, result.swa_num_tokens_evicted
 
