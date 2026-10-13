@@ -224,6 +224,9 @@ class SchedulerBatchResultProcessor:
 
             self._validate_pp_skip_output_comm(batch, result)
 
+            if getattr(self.tree_cache, "kvduo_active_swa", False) is True:
+                batch.release_kvduo_prefill_swa()
+
             hidden_state_offset = 0
             prefill_hidden_capture_mode = self._get_prefill_hidden_capture_mode(
                 batch,

@@ -43,6 +43,10 @@ FULL 只能在 Host 副本完整、有效且版本同步后回收。候选页排
 
 共享池之外的 logical、SWA、indexer、压缩状态及 Host 预算仍需检查。请求进入混合驻留时，首次需要 HOT 的 decode 前必须补足最低容量。
 
+KVDuo 的 SWA 只为活跃计算保留数据，不为未来前缀复用长期占用 HBM。已完成 prefill chunk 的窗口外请求自有 SWA 及时释放；decode 准入前再次清理。共享前缀的 SWA 窗口由各请求独立加锁，仍被其他请求或待执行、在途 prefill 使用的数据保持保护。清理按页对齐，保留当前窗口、必要保护区及未完成计算所需的数据。
+
+无人使用的缓存 SWA 单独释放，FULL 前缀和 Host 后备按原策略管理。后续匹配仍检查 SWA 是否有效；缺失时缩短可复用前缀，按原恢复或 prefill 路径补齐。该策略可减少 SWA 压力引起的整请求回退，但会降低后续请求的 SWA 前缀复用率。
+
 `decode_emergency_reclaim` 默认开启，仅用于必需 decode：正常 FULL 回收和预算内 HOT merge 后仍缺页时，将可安全处理、未锁定的 HOT 对象缩至最低容量，优先处理可释放页数最多的对象，空间足够即停止。它允许观察不足或超出普通 miss 预算的对象应急缩容，优先保留运行中的请求，可能增加 H2D 换入和 merge 停顿；最低容量、页保护、TP 一致性和 prefill 预留仍有效。prefill 和可选扩容不使用此路径，可设置 `decode_emergency_reclaim=false` 关闭。
 
 首次 decode 准入失败时，日志记录逻辑／SWA、Host、物理空闲页、HOT 最低额度、prefill 预留及回收结果；整请求回退仍作为兜底。应急 HOT 回收无法解决独立池不足。

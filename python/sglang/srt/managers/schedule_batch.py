@@ -2755,6 +2755,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if selected_indices is None
                 else [self.reqs[i] for i in selected_indices]
             )
+            if getattr(self.tree_cache, "kvduo_active_swa", False) is True:
+                self.tree_cache.maintain_kvduo_swa(
+                    (req, req.seqlen - 1)
+                    for req in requests
+                    if req.decode_batch_idx >= 1
+                )
             logical = self.token_to_kv_pool_allocator.logical_attn_allocator
             evict_from_tree_cache(self.tree_cache, num_tokens, allocator=logical)
             if logical.available_size() < num_tokens:
@@ -3253,7 +3259,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_num_tokens=self.extend_num_tokens,
         )
 
+    def release_kvduo_prefill_swa(self):
+        if getattr(self.tree_cache, "kvduo_active_swa", False) is not True:
+            return
+        self.tree_cache.maintain_kvduo_swa(
+            (req, prefix_len + extend_len)
+            for req, prefix_len, extend_len in zip(
+                self.reqs, self.prefix_lens, self.extend_lens
+            )
+            if not req.finished()
+            and not req.is_retracted
+            and (not self.decoding_reqs or req not in self.decoding_reqs)
+        )
+
     def maybe_evict_swa(self):
+        if getattr(self.tree_cache, "kvduo_active_swa", False) is True:
+            # Extend cleanup uses the completed batch's immutable length
+            # snapshots, rather than a future chunk's mutable request state.
+            if self.forward_mode.is_decode():
+                self.tree_cache.maintain_kvduo_swa(
+                    (req, req.seqlen - 1)
+                    for req in self.reqs
+                    if req.decode_batch_idx >= 1
+                )
+            return
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_server_args()

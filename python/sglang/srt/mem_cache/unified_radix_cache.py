@@ -4,7 +4,15 @@ import logging
 import threading
 import time
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeVar,
+)
 
 import torch
 
@@ -23,6 +31,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -585,6 +594,12 @@ class UnifiedRadixCache(BasePrefixCache):
             return result
         if self.disable:
             return IncLockRefResult()
+        if self.kvduo_active_swa and ComponentType.SWA not in skip_lock_components:
+            # A match may end inside a large existing node. Bound the SWA lock
+            # before acquiring it, without changing the FULL prefix length.
+            self.components[ComponentType.SWA]._maybe_split_leaf_for_swa_lock(
+                self.tree_core.node_by_id(node_id)
+            )
         return self.tree_core.inc_lock_ref(node_id, skip_lock_components)
 
     def dec_lock_ref(
@@ -620,10 +635,76 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         if self.disable:
             return
+        if self.kvduo_active_swa:
+            node = self.tree_core.node_by_id(node_id)
+            self.components[ComponentType.SWA].release_component_lock(
+                node,
+                DecLockRefParams(
+                    swa_uuid_for_lock=swa_uuid_for_lock,
+                    skip_lock_node_ids=skip_lock_node_ids or {},
+                ),
+            )
+            self.tree_core._update_evictable_leaf_sets(node)
+            return
         result = self.tree_core.dec_swa_lock_only(
             node_id, swa_uuid_for_lock, skip_lock_node_ids
         )
         self._free_values(result.device_frees, result.host_frees)
+
+    @property
+    def kvduo_active_swa(self) -> bool:
+        coordinator = getattr(self, "kvduo_coordinator", None)
+        return self.is_swa_enabled and (
+            getattr(coordinator, "enable_mixed_residency", False) is True
+        )
+
+    def release_kvduo_cached_swa(self) -> None:
+        """Keep cached SWA only while a computation holds its window lock."""
+        if self.kvduo_active_swa and not self.disable:
+            count = self.swa_evictable_size()
+            if count:
+                self.evict(EvictParams(num_tokens=0, swa_num_tokens=count))
+
+    def maintain_kvduo_swa(self, frontiers: Iterable[tuple[Req, int]]) -> None:
+        """Trim SWA behind completed computation, including request-owned restores."""
+        if not self.kvduo_active_swa:
+            return
+        for req, completed_len in frontiers:
+            if req.kv is None or req.req_pool_idx is None:
+                continue
+            # cache_protected_len may also cover a Host-restored suffix whose
+            # SWA belongs to the request. Only the actual tree span is shared.
+            cached_len = 0
+            node = (
+                self.tree_core.node_by_id(req.last_node)
+                if req.last_node is not None and not self.disable
+                else self.tree_core.root_node
+            )
+            while node is not self.tree_core.root_node:
+                cached_len += len(node.key)
+                node = node.parent
+            free_swa_out_of_window_slots(
+                req,
+                completed_len,
+                sliding_window_size=self.sliding_window_size,
+                page_size=self.page_size,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                cache_protected_len=cached_len,
+            )
+            if (
+                not req.swa_prefix_lock_released
+                and req.swa_uuid_for_lock is not None
+                and completed_len - cached_len >= self.sliding_window_size
+                and not getattr(req, "swa_evict_floor", 0)
+            ):
+                self.dec_swa_lock_only(
+                    req.last_node,
+                    req.swa_uuid_for_lock,
+                    skip_lock_node_ids=req.skip_lock_node_ids,
+                )
+                req.swa_prefix_lock_released = True
+        self.release_kvduo_cached_swa()
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         if self.disable:
@@ -730,6 +811,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.finished_reason, FINISH_ABORT
             ):
                 self.session_refs.register_session_ref(req)
+
+        self.release_kvduo_cached_swa()
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
