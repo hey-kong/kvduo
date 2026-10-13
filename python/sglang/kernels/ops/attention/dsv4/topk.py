@@ -146,6 +146,7 @@ def topk_transform_512_v2(
             and out_raw_indices.data_ptr() < spec.output.data_ptr() + spec.output.nbytes
         ):
             raise ValueError("FULL TopK output must not alias raw selection")
+        packed_metadata = spec.native_metadata(scores, out_raw_indices)
         _jit_topk_v2_module().topk_transform_full(
             scores,
             seq_lens,
@@ -154,22 +155,7 @@ def topk_transform_512_v2(
             page_size,
             metadata,
             out_raw_indices,
-            spec.output,
-            spec.requests,
-            spec.lookup,
-            spec.mapping,
-            spec.touches,
-            spec.status,
-            spec.stats,
-            spec.growth,
-            spec.observe,
-            spec.real_requests,
-            spec.clock_base,
-            spec.prefill_ema,
-            spec.prefill_steps,
-            spec.layer,
-            spec.layer_stride,
-            spec.page_size,
+            *packed_metadata,
         )
         return
     _jit_topk_v2_module().topk_transform(

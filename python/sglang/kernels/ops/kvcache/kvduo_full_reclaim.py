@@ -73,14 +73,15 @@ def summarize_kvduo_full_pages(
         )
         summarize(
             logical_pages,
-            mapping,
-            data_versions,
-            host_versions,
-            touches,
-            protected_pages,
-            physical,
-            scores,
-            valid,
+            mapping.data_ptr(),
+            data_versions.data_ptr(),
+            host_versions.data_ptr(),
+            touches.data_ptr(),
+            protected_pages.data_ptr() if protected_pages is not None else 0,
+            physical.data_ptr(),
+            scores.data_ptr(),
+            valid.data_ptr(),
+            mapping.numel(),
         )
     else:
         in_range = (logical_pages >= 0) & (logical_pages < mapping.numel())

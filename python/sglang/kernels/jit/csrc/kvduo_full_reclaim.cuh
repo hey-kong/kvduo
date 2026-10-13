@@ -187,49 +187,39 @@ void kvduo_full_page_select(
 template <int BLOCK_SIZE, typename LogicalT>
 void kvduo_full_page_summary(
     tvm::ffi::TensorView logical_pages,
-    tvm::ffi::TensorView mapping,
-    tvm::ffi::TensorView data_versions,
-    tvm::ffi::TensorView host_versions,
-    tvm::ffi::TensorView touches,
-    tvm::ffi::Optional<tvm::ffi::TensorView> protected_pages,
-    tvm::ffi::TensorView physical_pages,
-    tvm::ffi::TensorView scores,
-    tvm::ffi::TensorView valid_pages) {
+    uint64_t mapping,
+    uint64_t data_versions,
+    uint64_t host_versions,
+    uint64_t touches,
+    uint64_t protected_pages,
+    uint64_t physical_pages,
+    uint64_t scores,
+    uint64_t valid_pages,
+    int64_t logical_size) {
   using namespace host;
   auto pages = SymbolicSize{"pages"};
   auto page_size = SymbolicSize{"page_size"};
-  auto logical_size = SymbolicSize{"logical_size"};
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA, kDLROCM>();
   TensorMatcher({pages, page_size}).with_dtype<LogicalT>().with_device(device).verify(logical_pages);
-  TensorMatcher({pages, page_size}).with_dtype<int64_t>().with_device(device).verify(physical_pages);
-  TensorMatcher({logical_size})
-      .with_dtype<int64_t>()
-      .with_device(device)
-      .verify(mapping)
-      .verify(data_versions)
-      .verify(host_versions)
-      .verify(touches);
-  TensorMatcher({pages}).with_dtype<int64_t>().with_device(device).verify(scores);
-  TensorMatcher({pages}).with_dtype<int32_t>().with_device(device).verify(valid_pages);
-  if (protected_pages.has_value()) {
-    TensorMatcher({pages}).with_dtype<int32_t>().with_device(device).verify(protected_pages.value());
-  }
-  RuntimeCheck(page_size.unwrap() > 0 && logical_size.unwrap() > 0, "Invalid FULL page geometry");
+  RuntimeCheck(page_size.unwrap() > 0 && logical_size > 0, "Invalid FULL page geometry");
   if (pages.unwrap() == 0) return;
+  RuntimeCheck(
+      mapping && data_versions && host_versions && touches && physical_pages && scores && valid_pages,
+      "FULL summary pointers must be non-null");
   LaunchKernel(pages.unwrap(), BLOCK_SIZE, device.unwrap())(
       kvduo_full_page_summary_kernel<BLOCK_SIZE, LogicalT>,
       static_cast<const LogicalT*>(logical_pages.data_ptr()),
-      static_cast<const int64_t*>(mapping.data_ptr()),
-      static_cast<const int64_t*>(data_versions.data_ptr()),
-      static_cast<const int64_t*>(host_versions.data_ptr()),
-      static_cast<const int64_t*>(touches.data_ptr()),
-      protected_pages.has_value() ? static_cast<const int32_t*>(protected_pages.value().data_ptr()) : nullptr,
-      static_cast<int64_t*>(physical_pages.data_ptr()),
-      static_cast<int64_t*>(scores.data_ptr()),
-      static_cast<int32_t*>(valid_pages.data_ptr()),
+      reinterpret_cast<const int64_t*>(mapping),
+      reinterpret_cast<const int64_t*>(data_versions),
+      reinterpret_cast<const int64_t*>(host_versions),
+      reinterpret_cast<const int64_t*>(touches),
+      reinterpret_cast<const int32_t*>(protected_pages),
+      reinterpret_cast<int64_t*>(physical_pages),
+      reinterpret_cast<int64_t*>(scores),
+      reinterpret_cast<int32_t*>(valid_pages),
       page_size.unwrap(),
-      logical_size.unwrap());
+      logical_size);
 }
 
 }  // namespace

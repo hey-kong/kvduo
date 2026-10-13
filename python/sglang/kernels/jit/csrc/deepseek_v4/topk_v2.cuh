@@ -631,19 +631,23 @@ struct TopKKernel {
       uint32_t page_size,
       tvm::ffi::TensorView metadata,
       tvm::ffi::TensorView raw_indices,
-      tvm::ffi::TensorView output,
-      tvm::ffi::TensorView requests,
-      tvm::ffi::TensorView lookup,
-      tvm::ffi::TensorView mapping,
-      tvm::ffi::TensorView touches,
-      tvm::ffi::TensorView status,
-      tvm::ffi::TensorView stats,
-      tvm::ffi::TensorView growth,
-      tvm::ffi::TensorView observe,
-      tvm::ffi::TensorView real_requests,
-      tvm::ffi::TensorView clock_base,
-      tvm::ffi::TensorView prefill_ema,
-      tvm::ffi::TensorView prefill_steps,
+      uint64_t output,
+      uint64_t requests,
+      uint64_t lookup,
+      uint64_t mapping,
+      uint64_t touches,
+      uint64_t status,
+      uint64_t stats,
+      uint64_t growth,
+      uint64_t observe,
+      uint64_t real_requests,
+      uint64_t clock_base,
+      uint64_t prefill_ema,
+      uint64_t prefill_steps,
+      int64_t request_count,
+      int64_t context,
+      int64_t lookup_stride,
+      int64_t logical_size,
       int64_t layer,
       int64_t layer_stride,
       int64_t full_page_size) {
@@ -652,46 +656,39 @@ struct TopKKernel {
     device.set_options<kDLCUDA>();
     auto B = SymbolicSize{"batch"};
     auto K = SymbolicSize{"topk"};
-    auto R = SymbolicSize{"request_count"};
-    auto N = SymbolicSize{"logical_size"};
-    auto C = SymbolicSize{"context"};
-    auto S = SymbolicSize{"lookup_stride"};
-    TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device).verify(raw_indices).verify(output);
-    TensorMatcher({B}).with_dtype<int64_t>().with_device(device).verify(requests);
-    TensorMatcher({R, C}).with_strides({S, 1}).with_dtype<int64_t>().with_device(device).verify(lookup);
-    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(mapping).verify(touches);
-    TensorMatcher({R}).with_dtype<int32_t>().with_device(device).verify(status).verify(growth);
-    TensorMatcher({R, 2}).with_dtype<int32_t>().with_device(device).verify(stats);
-    TensorMatcher({R, 2}).with_dtype<float>().with_device(device).verify(prefill_ema);
-    TensorMatcher({R}).with_dtype<int64_t>().with_device(device).verify(prefill_steps);
-    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(observe).verify(real_requests);
-    TensorMatcher({1}).with_dtype<int64_t>().with_device(device).verify(clock_base);
+    TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device).verify(raw_indices);
+    RuntimeCheck(
+        request_count > 0 && context > 0 && lookup_stride >= context && logical_size > 0,
+        "Invalid FULL metadata geometry");
+    RuntimeCheck(
+        output && requests && lookup && mapping && touches && status && stats && growth && observe && real_requests &&
+            clock_base && prefill_ema && prefill_steps,
+        "FULL metadata pointers must be non-null");
     RuntimeCheck(
         full_page_size > 0 && std::has_single_bit(static_cast<uint64_t>(full_page_size)), "Invalid FULL page size");
     RuntimeCheck(layer >= 0 && layer_stride >= 0, "Invalid FULL layer geometry");
     const auto raw_begin = reinterpret_cast<uintptr_t>(raw_indices.data_ptr());
-    const auto out_begin = reinterpret_cast<uintptr_t>(output.data_ptr());
     const auto bytes = B.unwrap() * K.unwrap() * sizeof(int32_t);
     RuntimeCheck(
-        raw_begin >= out_begin + bytes || out_begin >= raw_begin + bytes, "FULL output must not alias raw selection");
+        raw_begin >= output + bytes || output >= raw_begin + bytes, "FULL output must not alias raw selection");
     KVDuoFullParams full{
-        .output = static_cast<int32_t*>(output.data_ptr()),
-        .requests = static_cast<const int64_t*>(requests.data_ptr()),
-        .lookup = static_cast<const int64_t*>(lookup.data_ptr()),
-        .mapping = static_cast<const int64_t*>(mapping.data_ptr()),
-        .touches = static_cast<int64_t*>(touches.data_ptr()),
-        .status = static_cast<int32_t*>(status.data_ptr()),
-        .stats = static_cast<int32_t*>(stats.data_ptr()),
-        .growth = static_cast<int32_t*>(growth.data_ptr()),
-        .observe = static_cast<const int32_t*>(observe.data_ptr()),
-        .real_requests = static_cast<const int32_t*>(real_requests.data_ptr()),
-        .clock_base = static_cast<const int64_t*>(clock_base.data_ptr()),
-        .prefill_ema = static_cast<float*>(prefill_ema.data_ptr()),
-        .prefill_steps = static_cast<int64_t*>(prefill_steps.data_ptr()),
-        .lookup_stride = S.unwrap(),
-        .context = C.unwrap(),
-        .request_count = R.unwrap(),
-        .logical_size = N.unwrap(),
+        .output = reinterpret_cast<int32_t*>(output),
+        .requests = reinterpret_cast<const int64_t*>(requests),
+        .lookup = reinterpret_cast<const int64_t*>(lookup),
+        .mapping = reinterpret_cast<const int64_t*>(mapping),
+        .touches = reinterpret_cast<int64_t*>(touches),
+        .status = reinterpret_cast<int32_t*>(status),
+        .stats = reinterpret_cast<int32_t*>(stats),
+        .growth = reinterpret_cast<int32_t*>(growth),
+        .observe = reinterpret_cast<const int32_t*>(observe),
+        .real_requests = reinterpret_cast<const int32_t*>(real_requests),
+        .clock_base = reinterpret_cast<const int64_t*>(clock_base),
+        .prefill_ema = reinterpret_cast<float*>(prefill_ema),
+        .prefill_steps = reinterpret_cast<int64_t*>(prefill_steps),
+        .lookup_stride = lookup_stride,
+        .context = context,
+        .request_count = request_count,
+        .logical_size = logical_size,
         .location_base = layer * layer_stride,
         .layer = layer,
         .page_bits = static_cast<int>(std::countr_zero(static_cast<uint64_t>(full_page_size))),
