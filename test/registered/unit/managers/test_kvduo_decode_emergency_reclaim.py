@@ -51,16 +51,17 @@ def pressure_batch(enabled, *, pages=4):
 @pytest.mark.parametrize(
     "raw,enabled",
     [
-        (None, True),
-        ("{}", True),
+        (None, False),
+        ("{}", False),
         (
             '{"top_k":512,"host_to_device_ratio":2,"swap_in_block_size":960}',
-            True,
+            False,
         ),
         ('{"decode_emergency_reclaim":false}', False),
+        ('{"decode_emergency_reclaim":true}', True),
     ],
 )
-def test_default_config_enables_emergency_decode_recovery_and_allows_opt_out(
+def test_default_config_disables_emergency_decode_recovery_and_allows_opt_in(
     raw, enabled
 ):
     config = parse_kvduo_config(SimpleNamespace(kvduo_config=raw))

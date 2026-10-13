@@ -92,6 +92,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
+        coordinator.is_dsv4_hisparse = False
         coordinator.page_size = 2
         coordinator.compress_ratio = 1
         coordinator.tp_world_size = 1
@@ -169,19 +170,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         self.assertEqual(requirements, (1, 0, 1))
 
-    def test_regular_cache_reserves_swa_window_from_kvduo_host_match(self):
-        from sglang.srt.mem_cache.radix_cache import RadixKey
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
-        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache._sliding_window_size = 4
-        cache.swa_reprefill_tail_tokens = MagicMock(return_value=0)
-        coordinator = SimpleNamespace(is_dsv4_hisparse=True)
-        key = RadixKey(token_ids=array("i", range(12)))
-
-        self.assertEqual(cache._kvduo_max_prefix_len(key, coordinator), 8)
-
-    def test_host_only_prefix_is_matched_and_restored_before_prefill(self):
+    def test_generic_host_only_prefix_is_matched_and_restored_before_prefill(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
         from sglang.srt.mem_cache.base_prefix_cache import MatchResult
         from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
@@ -199,7 +188,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator.page_size = 2
         coordinator.compress_ratio = 1
         coordinator.device = "cpu"
-        coordinator.is_dsv4_hisparse = True
+        coordinator.is_dsv4_hisparse = False
         coordinator.tp_world_size = 1
         coordinator.item_size_bytes = 4
         coordinator.mem_pool_device = SimpleNamespace(layer_num=2)
@@ -387,6 +376,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         free_pages = {"full": 0, "swa": 0, "physical": 0}
         logical_allocator = SimpleNamespace(
+            available_size=lambda: free_pages["full"] * 2,
             full_available_size=lambda: free_pages["full"] * 2,
             swa_available_size=lambda: free_pages["swa"] * 2,
         )
@@ -459,7 +449,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         self.assertIsNone(deferred)
         radix_reclaimer.assert_called_once_with(2, 0)
         # Restore intentionally owns no SWA page. A successful local rank must
-        # return its Full and C4 pages when another TP rank rejects allocation.
+        # return its Full and main KV pages when another TP rank rejects allocation.
         self.assertEqual(free_pages, {"full": 4, "swa": 0, "physical": 1})
         self.assertNotEqual(free_pages, before_partial_alloc)
         rollback = coordinator.token_to_kv_pool_allocator.rollback_restore_allocation

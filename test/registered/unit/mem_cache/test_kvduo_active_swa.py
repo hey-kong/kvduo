@@ -1,6 +1,7 @@
 """KVDuo keeps SWA for active computation without retaining idle prefixes."""
 
 from array import array
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -12,7 +13,9 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -21,6 +24,10 @@ from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixPara
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
+    HostPrefixRecord,
+    KVDuoHostPrefixCache,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -107,6 +114,123 @@ def mapped(allocator, slots):
     return allocator.full_to_swa_index_mapping[slots]
 
 
+def host_prefix_stack(gpu_prefix_len):
+    cache, allocator, _ = make_cache()
+    slots = alloc(allocator, 16)
+    insert(cache, slots, range(16))
+    if gpu_prefix_len:
+        match = cache._match_prefix_without_kvduo(
+            MatchPrefixParams(key=RadixKey(array("q", range(gpu_prefix_len))))
+        )
+        make_req(cache, range(16), match=match, rid="active-prefix")
+    cache.release_kvduo_cached_swa()
+
+    c = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    c.enable_mixed_residency = c.is_dsv4_hisparse = True
+    c.page_size, c.compress_ratio, c.tp_world_size = 1, 4, 1
+    c.device = "cpu"
+    c.host_prefix_cache = KVDuoHostPrefixCache(32)
+    c.token_to_kv_pool_allocator = SimpleNamespace(alloc_kvduo_restore=MagicMock())
+    cache.kvduo_coordinator = c
+    req = Req("incoming", "", array("q", range(20)), SamplingParams(max_new_tokens=8))
+    req._refresh_fill_ids()
+    for ordinal in range(4):
+        identity = c._host_prefix_identity(req, ordinal)
+        c.host_prefix_cache.insert(
+            HostPrefixRecord(
+                identity,
+                domains=("main_kv",),
+                host_locations={"main_kv": (ordinal,)},
+                data_versions={"main_kv": (1,)},
+                host_versions={"main_kv": (1,)},
+            )
+        )
+    return cache, allocator, c, req
+
+
+@pytest.mark.parametrize("gpu_prefix_len", [0, 8, 16])
+def test_main_only_host_hit_cannot_bypass_swa_gate_or_change_prefill_boundary(
+    gpu_prefix_len,
+):
+    cache, allocator, c, req = host_prefix_stack(gpu_prefix_len)
+    # Exercise release of references from an earlier speculative match too.
+    identity = next(iter(c.host_prefix_cache.records))
+    c.host_prefix_cache.acquire(identity, req.rid, 0)
+    req.kvduo_host_prefix_records = {identity}
+    req.kvduo_residency_plan = object()
+    req.init_next_round_input(cache)
+    assert len(req.prefix_indices) == gpu_prefix_len
+    assert req.host_hit_length == 0
+    assert req.kvduo_residency_plan is None
+    assert not req.kvduo_host_prefix_records
+    assert all(
+        record.fully_valid and not record.pinned
+        for record in c.host_prefix_cache.records.values()
+    )
+
+    adder = PrefillAdder(
+        page_size=cache.page_size,
+        tree_cache=cache,
+        token_to_kv_pool_allocator=allocator,
+        running_batch=ScheduleBatch(reqs=[]),
+        new_token_ratio=0,
+        rem_input_tokens=64,
+        rem_chunk_tokens=None,
+    )
+    assert adder.add_one_req(req, False, None) is AddReqResult.CONTINUE
+    assert req.extend_range.start == gpu_prefix_len
+    assert req.extend_range.end == 20
+    # The first query must have every preceding SWA KV it can read. A main-only
+    # Host extension to 16 would fail this assertion when the GPU hit is 0/8.
+    preceding = req.prefix_indices[max(0, gpu_prefix_len - 3) : gpu_prefix_len]
+    assert torch.all(mapped(allocator, preceding) > 0)
+    c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_not_called()
+
+
+def test_dsv4_load_back_rejects_stale_main_only_plan_before_pins_or_allocation():
+    _, _, c, req = host_prefix_stack(0)
+    req.kvduo_residency_plan = object()
+    req.prefix_indices = torch.empty(0, dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="required SWA and boundary state"):
+        c.init_kvduo_load_back(req, 16)
+    c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_not_called()
+    assert all(not record.pinned for record in c.host_prefix_cache.records.values())
+
+
+def _swa_host_match_tp_worker(rank, init_file):
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        cache, _, c, req = host_prefix_stack(8 if rank == 0 else 0)
+        c.tp_world_size, c.tp_group = 2, dist.group.WORLD
+        req.init_next_round_input(cache)
+        assert len(req.prefix_indices) == 0
+        assert req.host_hit_length == 0
+        assert req.kvduo_residency_plan is None
+        assert all(not record.pinned for record in c.host_prefix_cache.records.values())
+    finally:
+        dist.destroy_process_group()
+
+
+def test_tp_swa_validity_divergence_rematches_to_common_safe_gpu_boundary(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.start_processes(
+        _swa_host_match_tp_worker,
+        args=(str(tmp_path / "swa-host-match-gloo"),),
+        nprocs=2,
+        join=True,
+        start_method="spawn",
+    )
+
+
 def test_completed_chunk_snapshot_preserves_inflight_chunk_and_full():
     cache, allocator, _ = make_cache()
     slots = alloc(allocator, 24)
@@ -114,6 +238,8 @@ def test_completed_chunk_snapshot_preserves_inflight_chunk_and_full():
     full_available = allocator.full_available_size()
     batch = ScheduleBatch(reqs=[req], prefix_lens=[0], extend_lens=[12])
     batch.tree_cache = cache
+    batch = batch.copy()
+    assert batch.tree_cache is cache
     # The request already describes the next in-flight chunk ending at 24.
     ScheduleBatch.release_kvduo_prefill_swa(batch)
     assert req.kv.swa_evicted_seqlen == 8
@@ -127,7 +253,8 @@ def test_completed_chunk_snapshot_preserves_inflight_chunk_and_full():
 
 
 @pytest.mark.parametrize("middle_chunk", [True, False])
-def test_result_handler_cleans_completed_prefill_after_copy_done(middle_chunk):
+@pytest.mark.parametrize("overlap", [True, False])
+def test_result_handler_cleans_completed_prefill_after_copy_done(middle_chunk, overlap):
     cache, allocator, _ = make_cache()
     cache.kvduo_coordinator.end_kvduo_prefill = MagicMock()
     slots = alloc(allocator, 24)
@@ -137,6 +264,13 @@ def test_result_handler_cleans_completed_prefill_after_copy_done(middle_chunk):
     batch = ScheduleBatch(reqs=[req], prefix_lens=[0], extend_lens=[24])
     batch.tree_cache = cache
     batch.forward_mode = ForwardMode.EXTEND
+    if overlap:
+        copied = batch.copy()
+        # The next chunk may already have replaced the scheduling metadata.
+        batch.prefix_lens = [24]
+        batch.extend_lens = [8]
+        batch = copied
+        assert batch.tree_cache is cache
     result = SimpleNamespace(
         copy_done=MagicMock(),
         routed_experts_output=None,

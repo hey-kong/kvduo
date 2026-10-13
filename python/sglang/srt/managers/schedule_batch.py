@@ -3228,6 +3228,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
+            tree_cache=self.tree_cache,
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
             forward_mode=self.forward_mode,

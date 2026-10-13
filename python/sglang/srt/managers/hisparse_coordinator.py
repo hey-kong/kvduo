@@ -183,7 +183,7 @@ class HiSparseCoordinator:
         tail_protected_pages: int = 0,
         prefill_policy: KVDuoPrefillPolicy | None = None,
         full_reclaim_policy: str = "request",
-        decode_emergency_reclaim: bool = True,
+        decode_emergency_reclaim: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -580,6 +580,7 @@ class HiSparseCoordinator:
         The Radix node remains the lock anchor for its GPU portion.  Host pages
         use content identities and request references, so they remain pinned
         even before a recyclable request-pool slot is assigned.
+        C4-only DeepSeek-V4 backups are not valid prefill checkpoints.
         """
         if not self.enable_mixed_residency:
             return match_result
@@ -592,10 +593,14 @@ class HiSparseCoordinator:
         fill_ids = req.get_fill_ids()
         max_prefix = req._compute_max_prefix_len(len(fill_ids))
         if max_prefix_len is not None:
-            # Preserve the cache's own match cap. In particular, DeepSeek V4's
-            # unified SWA cache holds back a trailing window for re-prefill;
-            # KVDuo must not extend a main/C4-only host hit into that window.
             max_prefix = min(max_prefix, max_prefix_len)
+        if self.is_dsv4_hisparse:
+            # C4-only Host records cannot restore the preceding SWA window or
+            # the other state required at a new prefill boundary. Recomputing
+            # a window after that boundary does not supply its first query.
+            # Keep the tree-validated GPU hit and its TP convergence below.
+            max_prefix = min(max_prefix, gpu_len)
+            req.kvduo_residency_plan = None
         max_prefix = max_prefix // page_tokens * page_tokens
         host_end = gpu_len // page_tokens * page_tokens
         first_host_page = gpu_len // page_tokens
@@ -723,6 +728,11 @@ class HiSparseCoordinator:
         plan = getattr(req, "kvduo_residency_plan", None)
         if plan is None or host_hit_length <= 0:
             return torch.empty(0, dtype=torch.int64, device=self.device)
+        if self.is_dsv4_hisparse:
+            raise RuntimeError(
+                "KVDuo cannot restore a DeepSeek-V4 prefill prefix from C4-only "
+                "Host records: required SWA and boundary state are not backed up"
+            )
         commitment = begin_kvduo_prefix_restore(plan, self.host_prefix_cache)
         prefix_len = len(req.prefix_indices)
         target_len = prefix_len + host_hit_length

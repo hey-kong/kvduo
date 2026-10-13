@@ -45,9 +45,9 @@ FULL 只能在 Host 副本完整、有效且版本同步后回收。候选页排
 
 KVDuo 的 SWA 只为活跃计算保留数据，不为未来前缀复用长期占用 HBM。已完成 prefill chunk 的窗口外请求自有 SWA 及时释放；decode 准入前再次清理。共享前缀的 SWA 窗口由各请求独立加锁，仍被其他请求或待执行、在途 prefill 使用的数据保持保护。清理按页对齐，保留当前窗口、必要保护区及未完成计算所需的数据。
 
-无人使用的缓存 SWA 单独释放，FULL 前缀和 Host 后备按原策略管理。后续匹配仍检查 SWA 是否有效；缺失时缩短可复用前缀，按原恢复或 prefill 路径补齐。该策略可减少 SWA 压力引起的整请求回退，但会降低后续请求的 SWA 前缀复用率。
+无人使用的缓存 SWA 单独释放，FULL 前缀和 Host 后备按原策略管理，不保存 Host SWA。DeepSeek-V4 的 C4-only Host 记录不足以恢复 prefill 起点之前的 SWA 和相关边界状态，因此不用于扩展 prefill 前缀。只复用原生验证通过的 GPU 前缀，从该边界继续计算；没有有效 GPU 前缀时从头 prefill。Host 后备仍用于 decode 换入。该策略可减少 SWA 压力引起的整请求回退，但会降低后续请求的前缀复用率。
 
-`decode_emergency_reclaim` 默认开启，仅用于必需 decode：正常 FULL 回收和预算内 HOT merge 后仍缺页时，将可安全处理、未锁定的 HOT 对象缩至最低容量，优先处理可释放页数最多的对象，空间足够即停止。它允许观察不足或超出普通 miss 预算的对象应急缩容，优先保留运行中的请求，可能增加 H2D 换入和 merge 停顿；最低容量、页保护、TP 一致性和 prefill 预留仍有效。prefill 和可选扩容不使用此路径，可设置 `decode_emergency_reclaim=false` 关闭。
+`decode_emergency_reclaim` 默认关闭，可设置 `decode_emergency_reclaim=true` 开启。它仅用于必需 decode：正常 FULL 回收和预算内 HOT merge 后仍缺页时，将可安全处理、未锁定的 HOT 对象缩至最低容量，优先处理可释放页数最多的对象，空间足够即停止。它允许观察不足或超出普通 miss 预算的对象应急缩容，优先保留运行中的请求，可能增加 H2D 换入和 merge 停顿；最低容量、页保护、TP 一致性和 prefill 预留仍有效。prefill 和可选扩容不使用此路径。
 
 首次 decode 准入失败时，日志记录逻辑／SWA、Host、物理空闲页、HOT 最低额度、prefill 预留及回收结果；整请求回退仍作为兜底。应急 HOT 回收无法解决独立池不足。
 
@@ -188,7 +188,7 @@ python3 -m sglang.launch_server \
 | `tail_protected_pages` | `2` | 每请求保护的最新 FULL 页数 |
 | `full_reclaim_policy` | `"request"` | `"request"` 按请求批量释放全部合格 FULL 页；`"page"` 按页 LRU 回收 |
 | `max_relative_miss_increase` | `0.10` | 普通缩容、对象回退及累计预算共用的预计 miss 相对增幅容忍比例 |
-| `decode_emergency_reclaim` | `true` | 必需 decode 的普通回收失败后，允许 HOT 应急缩至最低容量，优先避免整请求回退 |
+| `decode_emergency_reclaim` | `false` | 开启后，必需 decode 的普通回收失败时允许 HOT 应急缩至最低容量，优先避免整请求回退 |
 
 前四项须为正整数，回收策略只接受 `"request"` 或 `"page"`，miss 容忍比例须为有限非负数，应急开关须为布尔值；未知字段报错。`--kvduo-config` 必须配合 `--enable-kvduo`。默认 10% 是实验初值。
 
