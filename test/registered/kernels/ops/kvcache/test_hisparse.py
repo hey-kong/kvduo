@@ -1349,10 +1349,12 @@ def test_kvduo_merge_copies_flat_c4_values_and_scales_before_freeing_pages():
     def free_after_copy(indices):
         assert torch.equal(backing.cpu(), expected)
         assert coordinator._kvduo_req_layer_pages[(0, 0)] == [128, 256]
-        assert indices.cpu().tolist() == list(range(64, 128)) + list(range(192, 256))
+        assert indices.cpu().tolist() == [1, 3]
 
     free = MagicMock(side_effect=free_after_copy)
-    coordinator.token_to_kv_pool_allocator = SimpleNamespace(free_hisparse_indices=free)
+    coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+        hisparse_attn_allocator=SimpleNamespace(page_size=64, _release_page_ids=free)
+    )
     coordinator.kvduo_capacity_ema[..., :2] = 100
     assert coordinator._merge_kvduo_hot_pages(0, 0) == 2 * DSV4_PAGE_SIZE
     assert not coordinator.kvduo_hot_growth_events.any()
@@ -1419,7 +1421,9 @@ def test_kvduo_resolver_graph_replays_after_actual_merge_without_recapture():
     coordinator.kvduo_capacity_steps = kwargs["capacity_steps"].unsqueeze(0)
     coordinator.kvduo_capacity_steps.fill_(65)
     coordinator.token_to_kv_pool_allocator = SimpleNamespace(
-        free_hisparse_indices=MagicMock()
+        hisparse_attn_allocator=SimpleNamespace(
+            page_size=1, _release_page_ids=MagicMock()
+        )
     )
     coordinator.kvduo_capacity_ema[..., :2] = 100
     assert coordinator._merge_kvduo_hot_pages(0, 0) == 2

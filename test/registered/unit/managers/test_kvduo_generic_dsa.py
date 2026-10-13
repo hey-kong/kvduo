@@ -177,7 +177,8 @@ def test_generic_merge_moves_payload_across_storage_layers_before_whole_page_fre
     c.kvduo_capacity_steps[owner] = 65
     c.kvduo_capacity_ema[owner] = 0
     payloads = pool.get_flat_key_buffer()[locations[survivors]].clone()
-    free = allocator.free_hisparse_indices
+    physical = allocator.hisparse_attn_allocator
+    free = physical._release_page_ids
 
     def free_after_copy(indices):
         assert c._kvduo_req_layer_pages[owner] == [pages[2]]
@@ -186,12 +187,10 @@ def test_generic_merge_moves_payload_across_storage_layers_before_whole_page_fre
         for slot, token in enumerate(survivors):
             mapped = locs[torch.where(tokens == token)[0][0]]
             assert torch.equal(pool.get_flat_key_buffer()[mapped], payloads[slot])
-        assert indices.tolist() == [
-            index for page in pages[:2] for index in range(page, page + 64)
-        ]
+        assert indices.tolist() == [page // 64 for page in pages[:2]]
         free(indices)
 
-    allocator.free_hisparse_indices = MagicMock(side_effect=free_after_copy)
+    physical._release_page_ids = MagicMock(side_effect=free_after_copy)
     before = allocator.hisparse_attn_allocator.available_size()
     assert c._merge_kvduo_hot_pages(*owner) == 128
     assert allocator.hisparse_attn_allocator.available_size() == before + 128
@@ -200,7 +199,7 @@ def test_generic_merge_moves_payload_across_storage_layers_before_whole_page_fre
         == survivors
     )
     assert c._kvduo_hot_base_pages[owner] == (pages[2],)
-    allocator.free_hisparse_indices.assert_called_once()
+    physical._release_page_ids.assert_called_once()
 
 
 @pytest.mark.parametrize("clock_advanced", [False, True])

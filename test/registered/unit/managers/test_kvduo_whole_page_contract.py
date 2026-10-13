@@ -3,7 +3,6 @@
 import ast
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[4]
 COORDINATOR = ROOT / "python/sglang/srt/managers/hisparse_coordinator.py"
 BACKEND = ROOT / "python/sglang/srt/layers/attention/deepseek_v4_backend.py"
@@ -52,13 +51,31 @@ def test_owner_keys_keep_asymmetric_requests_and_layers_separate():
 
 
 def test_merge_returns_whole_allocator_pages_after_payload_copy_completion():
-    merge = _method_source(COORDINATOR, "HiSparseCoordinator", "_merge_kvduo_hot_pages")
-    assert "range(start, start + self.page_size)" in merge
-    assert "len(released_starts) * self.page_size" in merge
-    assert merge.index("_move_kvduo_hot_entries") < merge.index(
-        "finished.synchronize()"
+    import torch
+    from unittest.mock import MagicMock
+    from test_kvduo_hot_merge import (
+        make_merge_coordinator,
+        assert_payloads_match_tokens,
     )
-    assert merge.index("finished.synchronize()") < merge.index("free_hisparse_indices")
+
+    c, physical = make_merge_coordinator({(0, 0): 4})
+    survivors = [0, 1, 4, 5, 8, 9, 12, 13]
+    c.lru_slots[0, 0, :16] = torch.tensor(
+        [slot for slot in range(16) if slot not in survivors] + survivors,
+        dtype=torch.int16,
+    )
+    free = physical._release_page_ids
+
+    def free_after_copy(page_ids):
+        assert_payloads_match_tokens(c, 0, 0)
+        assert c._kvduo_req_layer_pages[0, 0] == [2, 4]
+        assert page_ids.tolist() == [3, 4]
+        free(page_ids)
+
+    physical._release_page_ids = MagicMock(side_effect=free_after_copy)
+    assert c._merge_kvduo_hot_pages(0, 0, 2) == 2 * c.page_size
+    physical._release_page_ids.assert_called_once()
+    assert physical.free_pages == 2
 
 
 def test_batched_addresses_match_the_per_slot_reference_for_many_requests():

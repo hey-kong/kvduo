@@ -97,6 +97,8 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
     )
     coordinator._require_allocation_ready = MagicMock()
     physical = SimpleNamespace(free_pages=free_pages, next_page=2, released_starts=[])
+    physical.device = "cpu"
+    physical.page_size = coordinator.page_size
 
     def allocate(slots):
         pages = slots // coordinator.page_size
@@ -137,6 +139,15 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
         hisparse_attn_allocator=physical,
         free_hisparse_indices=MagicMock(side_effect=free),
     )
+
+    def release_page_ids(page_ids):
+        indices = (
+            page_ids[:, None] * coordinator.page_size
+            + torch.arange(coordinator.page_size)
+        ).flatten()
+        coordinator.token_to_kv_pool_allocator.free_hisparse_indices(indices)
+
+    physical._release_page_ids = MagicMock(side_effect=release_page_ids)
     return coordinator, physical
 
 

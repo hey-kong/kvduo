@@ -476,7 +476,7 @@ def test_gpu_plan_reads_only_summary_and_rejects_invalid_metadata_before_copy(
     monkeypatch.setattr(torch.Tensor, "cpu", read_summary)
     c._move_kvduo_hot_entries = MagicMock()
     with pytest.raises((ValueError, RuntimeError), match=match):
-        c._merge_kvduo_hot_pages(0, 0, 2)
+        prepare_kvduo_hot_merge(*rows, 16, 4, 2, 2)
     assert len(reads) == 1 and launch.call_count == 1
     assert all(torch.equal(row, saved) for row, saved in zip(rows, before))
     c._move_kvduo_hot_entries.assert_not_called()
@@ -544,5 +544,5 @@ def test_gpu_merge_dispatch_compiles_real_lru_width_and_uses_global_workspace(
     assert args[:3] == (tokens, locs, lru)
     assert args[8].numel() == 4 * capacity + 65536
     assert args[9].numel() == 3
-    assert args[10:] == (capacity, k, 2, 65536)
+    assert args[10:] == (capacity, k, 2, 65536, torch.iinfo(torch.int32).max)
     assert outputs[1].shape == tokens.shape and outputs[3].shape == lru.shape
