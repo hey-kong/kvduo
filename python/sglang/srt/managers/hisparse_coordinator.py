@@ -177,6 +177,7 @@ class HiSparseCoordinator:
         tail_protected_pages: int = 0,
         prefill_policy: KVDuoPrefillPolicy | None = None,
         full_reclaim_policy: str = "request",
+        decode_emergency_reclaim: bool = True,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -196,6 +197,9 @@ class HiSparseCoordinator:
         if full_reclaim_policy not in ("request", "page"):
             raise ValueError("full_reclaim_policy must be 'request' or 'page'")
         self.full_reclaim_policy = full_reclaim_policy
+        if not isinstance(decode_emergency_reclaim, bool):
+            raise ValueError("decode_emergency_reclaim must be a boolean")
+        self.decode_emergency_reclaim = decode_emergency_reclaim
         self.kvduo_prefill_policy = prefill_policy or KVDuoPrefillPolicy()
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
@@ -1324,6 +1328,7 @@ class HiSparseCoordinator:
         prefill_reservation: int | None = None,
         allow_hot_reclaim: bool = True,
         hot_minimum_credit: int = 0,
+        allow_emergency_hot_reclaim: bool = False,
     ) -> KVDuoPressureResult:
         """Reclaim physical KV pages while protecting pending allocations.
 
@@ -1439,6 +1444,12 @@ class HiSparseCoordinator:
             # must use its admitted rollback budget instead of this HOT fallback.
             if remaining > 0 and allow_hot_reclaim:
                 reclaimed_slots += self.reclaim_kvduo_hot_pages(remaining)
+            if allow_emergency_hot_reclaim and allow_hot_reclaim:
+                remaining = max(0, need_size + minimum_slots - available_slots())
+                if remaining > 0:
+                    reclaimed_slots += self._reclaim_kvduo_emergency_hot_pages(
+                        remaining
+                    )
             return reclaimed_slots // self.page_size * self._physical_page_bytes()
 
         return execute_kvduo_pressure_plan(
@@ -1465,7 +1476,9 @@ class HiSparseCoordinator:
         if physical_slots == 0:
             return True
         result = self._reclaim_for_physical_allocation(
-            physical_slots, reserve_hot_minimum=self.enable_mixed_residency
+            physical_slots,
+            reserve_hot_minimum=self.enable_mixed_residency,
+            allow_emergency_hot_reclaim=self.decode_emergency_reclaim,
         )
         return result.action is KVDuoPressureAction.SUCCESS
 
@@ -1556,7 +1569,52 @@ class HiSparseCoordinator:
             )
         self._reclaim_kvduo_radix_pages(required_pages, tree_cache)
         return self._reclaim_for_physical_allocation(
-            pages * self.page_size, reserve_hot_minimum=True
+            pages * self.page_size,
+            reserve_hot_minimum=True,
+            allow_emergency_hot_reclaim=(
+                self.decode_emergency_reclaim and pages + minimum_pages > 0
+            ),
+        )
+
+    def log_kvduo_decode_pressure(self, requests, logical_need, pressure=None) -> None:
+        """Report initial admission failures without synchronizing cache tensors."""
+        logical = self.token_to_kv_pool_allocator.logical_attn_allocator
+        full_available = getattr(
+            logical, "full_available_size", logical.available_size
+        )()
+        swa_available = getattr(logical, "swa_available_size", lambda: -1)()
+        logger.warning(
+            "KVDuo decode admission failed before request retraction: "
+            "reason=%s, detail=%s, requests=%d, logical_need=%d, "
+            "logical_available=%d, logical_full_available=%d, swa_available=%d, "
+            "physical_free_pages=%d, pending_hot_minimum_pages=%d, "
+            "prefill_reserved_pages=%d, host_available=%d, "
+            "host_prefill_reserved=%d, reclaimed_bytes=%d, shortfall_bytes=%d, "
+            "full_reclaim_policy=%s, decode_emergency_reclaim=%s",
+            pressure.reason.name if pressure is not None else "LOGICAL_OR_SWA_SHORTAGE",
+            (
+                pressure.detail
+                if pressure is not None
+                else "independent logical/SWA allocation cannot fit"
+            ),
+            len(requests),
+            logical_need,
+            logical.available_size(),
+            full_available,
+            swa_available,
+            self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+            // self.page_size,
+            self._kvduo_mandatory_hot_pages(),
+            self._kvduo_reserved_prefill_pages(),
+            self.mem_pool_host.available_size(),
+            sum(
+                reservation[1]
+                for reservation in self._kvduo_prefill_host_reservations.values()
+            ),
+            pressure.reclaimed_bytes if pressure is not None else 0,
+            pressure.remaining_shortfall_bytes if pressure is not None else 0,
+            self.full_reclaim_policy,
+            self.decode_emergency_reclaim,
         )
 
     def alloc_device_buffer(self, req: Req) -> None:
@@ -2712,6 +2770,47 @@ class HiSparseCoordinator:
                 (l, r) == owner for l, r, _ in self._kvduo_hot_pressure_protected
             )
         )
+
+    def _reclaim_kvduo_emergency_hot_pages(self, num_tokens: int) -> int:
+        """Last-resort mandatory decode recovery; ordinary EMA policy is unchanged."""
+        if not self.enable_mixed_residency or num_tokens <= 0:
+            return 0
+        self._wait_kvduo_hot_merge_boundary()
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        target = allocator.available_size() + num_tokens
+        layers = self.mem_pool_device.layer_num
+        objects = len(self._kvduo_request_generation) * layers
+        plans = []
+        for owner, pages in self._kvduo_req_layer_pages.items():
+            releasable = len(pages) - self.min_hot_pages
+            if releasable > 0 and self._kvduo_can_merge(owner):
+                layer, req = owner
+                distance = (req * layers + layer - self._kvduo_hand) % objects
+                plans.append(
+                    (releasable, distance, owner, self._kvduo_request_generation[req])
+                )
+        plans.sort(key=lambda item: (-item[0], item[1]))
+        if not self._kvduo_consensus(tuple(plans)):
+            return 0
+        reclaimed = merged = 0
+        for _, _, (layer, req), generation in plans:
+            if generation != self._kvduo_request_generation[req]:
+                continue
+            freed = self._merge_kvduo_hot_pages(layer, req, self.min_hot_pages)
+            if freed:
+                reclaimed += freed
+                merged += 1
+                self._kvduo_hand = (req * layers + layer + 1) % objects
+            if allocator.available_size() >= target:
+                break
+        if reclaimed:
+            logger.warning(
+                "KVDuo emergency HOT reclaim for mandatory decode: "
+                "objects=%d, released_pages=%d; EMA budget/maturity bypassed",
+                merged,
+                reclaimed // self.page_size,
+            )
+        return reclaimed
 
     def _init_kvduo_prefill_rollback_state(self, requests: int) -> None:
         shape = (self.mem_pool_device.layer_num, requests)
