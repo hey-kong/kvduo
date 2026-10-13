@@ -197,6 +197,7 @@ template <
     bool IsDsv4Layout,
     bool UseGlobalScratch,
     bool UseLruScratch,
+    bool ValidateStatus,
     typename SeqLensT,
     typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_kernel(
@@ -438,6 +439,20 @@ __global__ void load_cache_to_device_buffer_kernel(
     }
   }
   __syncthreads();
+
+  if constexpr (ValidateStatus) {
+    if (enable_full_lookup && swap_status[rid] != 0) {
+      if (tid == 0) {
+#ifdef USE_ROCM
+        __builtin_trap();
+#else
+        // Unlike assert(), this check remains active in release/NDEBUG builds.
+        __assert_fail("KVDuo resolver produced an incomplete address table", __FILE__, __LINE__, __func__);
+#endif
+      }
+      return;
+    }
+  }
 
   // Mixed objects can also skip the entire HOT scan and LRU writeback when
   // this selection is fully resident. Valid zero HOT counts still update EMA.
@@ -766,7 +781,8 @@ template <
     bool IsMLA,
     bool IsDsv4Layout,
     bool UseGlobalScratch,
-    bool UseLruScratch = false>
+    bool UseLruScratch = false,
+    bool ValidateStatus = false>
 void load_cache_to_device_buffer(
     uint64_t top_k_tokens_ptr,
     uint64_t device_buffer_tokens_ptr,
@@ -818,6 +834,7 @@ void load_cache_to_device_buffer(
   using namespace host;
 
   using SlotT = typename SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::SlotT;
+  RuntimeCheck(!ValidateStatus || enable_full_lookup, "Fused resolver validation requires KVDuo FULL metadata");
   RuntimeCheck((resolver_scratch_ptr != 0) == UseGlobalScratch, "HiSparse scratch does not match the compiled path");
   RuntimeCheck((lru_scratch_ptr != 0) == UseLruScratch, "HiSparse LRU scratch does not match the compiled path");
   RuntimeCheck(!UseGlobalScratch || !UseLruScratch, "HiSparse scratch paths are mutually exclusive");
@@ -915,6 +932,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             UseGlobalScratch,
             UseLruScratch,
+            ValidateStatus,
             int64_t,
             int64_t>,
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
@@ -929,6 +947,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             UseGlobalScratch,
             UseLruScratch,
+            ValidateStatus,
             int64_t,
             int32_t>,
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
@@ -943,6 +962,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             UseGlobalScratch,
             UseLruScratch,
+            ValidateStatus,
             int32_t,
             int64_t>,
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
@@ -957,6 +977,7 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             UseGlobalScratch,
             UseLruScratch,
+            ValidateStatus,
             int32_t,
             int32_t>,
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(seq_lens_ptr)),

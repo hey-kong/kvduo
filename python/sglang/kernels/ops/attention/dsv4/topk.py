@@ -91,8 +91,12 @@ def topk_transform_512_v2(
     page_size: int,
     metadata: torch.Tensor,
     out_raw_indices: Optional[torch.Tensor] = None,
+    *,
+    raw_only: bool = False,
 ) -> None:
     """Fused top-k + page-table transform (DeepSeek-V4 top-k v2 kernel).
+
+    With raw_only, write only out_raw_indices and leave out_page_indices intact.
 
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE, and
     ``metadata`` must come from :func:`plan_topk_v2` over the same ``seq_lens``
@@ -103,6 +107,16 @@ def topk_transform_512_v2(
     the valid way to express "no tokens": the row takes the trivial path and
     the output is all -1.
     """
+    if raw_only and out_raw_indices is None:
+        raise ValueError("TopK raw-only mode requires a raw output tensor")
+    if raw_only:
+        raw_start = out_raw_indices.data_ptr()
+        mapped_start = out_page_indices.data_ptr()
+        if (
+            raw_start < mapped_start + out_page_indices.nbytes
+            and mapped_start < raw_start + out_raw_indices.nbytes
+        ):
+            raise ValueError("TopK raw-only output must not alias the mapped output")
     module = _jit_topk_v2_module()
     module.topk_transform(
         scores,
@@ -112,4 +126,5 @@ def topk_transform_512_v2(
         page_size,
         metadata,
         out_raw_indices,
+        raw_only,
     )

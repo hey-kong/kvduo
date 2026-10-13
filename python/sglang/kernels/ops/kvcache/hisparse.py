@@ -86,6 +86,7 @@ def _jit_sparse_module(
     is_dsv4_layout: bool = False,
     use_global_scratch: bool = False,
     use_lru_scratch: bool = False,
+    validate_status: bool = False,
 ) -> Module:
     template_args = make_cpp_args(
         block_size,
@@ -95,6 +96,7 @@ def _jit_sparse_module(
         is_dsv4_layout,
         use_global_scratch,
         use_lru_scratch,
+        validate_status,
     )
     cache_args = make_cpp_args(
         item_size_bytes,
@@ -105,6 +107,7 @@ def _jit_sparse_module(
         is_dsv4_layout,
         use_global_scratch,
         use_lru_scratch,
+        validate_status,
     )
     return load_jit(
         "sparse_cache",
@@ -190,6 +193,7 @@ def _load_cache_to_device_buffer_mla(
     prefill_steps: torch.Tensor | None = None,
     resolver_scratch: torch.Tensor | None = None,
     lru_scratch: torch.Tensor | None = None,
+    validate_status: bool = False,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
@@ -221,6 +225,7 @@ def _load_cache_to_device_buffer_mla(
         is_dsv4_layout=is_dsv4_layout,
         use_global_scratch=resolver_scratch is not None,
         use_lru_scratch=lru_scratch is not None,
+        validate_status=validate_status,
     )
 
     # Pass only scalars through TVM FFI.  Its PyTorch fallback can reject tensor
@@ -237,6 +242,8 @@ def _load_cache_to_device_buffer_mla(
         and resolver_stats is not None
         and touch_clock is not None
     )
+    if validate_status and not enable_full_lookup:
+        raise ValueError("Fused resolver validation requires complete KVDuo metadata")
     if enable_full_lookup:
         assert req_to_logical_token.dtype == torch.int64
         assert full_to_device_loc.dtype == torch.int64
@@ -393,6 +400,7 @@ def load_cache_to_device_buffer_mla(
     prefill_steps: torch.Tensor | None = None,
     resolver_scratch: torch.Tensor | None = None,
     lru_scratch: torch.Tensor | None = None,
+    validate_status: bool = False,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
     _load_cache_to_device_buffer_mla(
@@ -432,6 +440,7 @@ def load_cache_to_device_buffer_mla(
         prefill_steps=prefill_steps,
         resolver_scratch=resolver_scratch,
         lru_scratch=lru_scratch,
+        validate_status=validate_status,
     )
 
 
@@ -471,6 +480,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     prefill_steps: torch.Tensor | None = None,
     resolver_scratch: torch.Tensor | None = None,
     lru_scratch: torch.Tensor | None = None,
+    validate_status: bool = False,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -510,6 +520,7 @@ def load_cache_to_device_buffer_dsv4_mla(
         prefill_steps=prefill_steps,
         resolver_scratch=resolver_scratch,
         lru_scratch=lru_scratch,
+        validate_status=validate_status,
     )
 
 

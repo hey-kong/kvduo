@@ -15,6 +15,73 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
+
+def test_fused_validation_has_a_distinct_jit_cache_key(monkeypatch):
+    load = MagicMock()
+    monkeypatch.setattr(ops, "load_jit", load)
+    for validate in (False, True):
+        ops._jit_sparse_module.__wrapped__(
+            576, 256, 512, 1536, True, False, False, False, validate
+        )
+    calls = load.call_args_list
+    assert calls[0].args != calls[1].args
+    assert calls[0].kwargs["cuda_wrappers"] != calls[1].kwargs["cuda_wrappers"]
+
+
+@pytest.mark.parametrize(
+    "loader",
+    [ops.load_cache_to_device_buffer_mla, ops.load_cache_to_device_buffer_dsv4_mla],
+)
+@pytest.mark.parametrize("validate", [False, True])
+def test_resolver_wrappers_select_validation_without_extra_tensor_operations(
+    monkeypatch, loader, validate
+):
+    module = SimpleNamespace(load_cache_to_device_buffer=MagicMock())
+    compile_module = MagicMock(return_value=module)
+    monkeypatch.setattr(ops, "_jit_sparse_module", compile_module)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda _: SimpleNamespace(cuda_stream=123)
+    )
+    versions = torch.ones(8, dtype=torch.int64)
+    clock = torch.zeros(1, dtype=torch.int64)
+    status = torch.zeros(1, dtype=torch.int32)
+    for operation in ("all", "_assert_async"):
+        monkeypatch.setattr(
+            torch, operation, MagicMock(side_effect=AssertionError("unfused check"))
+        )
+    loader(
+        top_k_tokens=torch.zeros((1, 1), dtype=torch.int32),
+        device_buffer_tokens=torch.full((1, 3), -1, dtype=torch.int32),
+        host_cache_locs=torch.zeros((1, 8), dtype=torch.int64),
+        device_buffer_locs=torch.ones((1, 3), dtype=torch.int32),
+        host_cache=torch.zeros((8, 32)),
+        device_buffer=torch.zeros((8, 32)),
+        top_k_device_locs=torch.zeros((1, 1), dtype=torch.int32),
+        req_pool_indices=torch.zeros(1, dtype=torch.int64),
+        seq_lens=torch.ones(1, dtype=torch.int32),
+        lru_slots=torch.tensor([[0, 1]], dtype=torch.int16),
+        item_size_bytes=32,
+        num_top_k=1,
+        hot_buffer_size=2,
+        num_real_reqs=torch.ones(1, dtype=torch.int32),
+        req_to_logical_token=torch.arange(8, dtype=torch.int64).view(1, -1),
+        full_to_device_loc=versions,
+        full_last_touch=versions.clone(),
+        full_data_version=versions,
+        full_host_version=versions.clone(),
+        swap_status=status,
+        resolver_stats=torch.zeros((1, 2), dtype=torch.int32),
+        touch_clock=clock,
+        validate_status=validate,
+    )
+    assert compile_module.call_args.kwargs["validate_status"] == validate
+    assert module.load_cache_to_device_buffer.call_count == 1
+    assert not any(
+        isinstance(arg, torch.Tensor)
+        for arg in module.load_cache_to_device_buffer.call_args.args
+    )
+
+
 LAYOUTS = [
     (2048, 39936, 32),
     (2048, 39936, 64),

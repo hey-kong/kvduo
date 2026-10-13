@@ -846,6 +846,9 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
                 raw_indices,
+                raw_only=(
+                    hisparse_decode and hisparse_coordinator.enable_mixed_residency
+                ),
             )
         else:
             topk_transform_512(
