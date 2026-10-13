@@ -28,6 +28,18 @@ def test_fused_validation_has_a_distinct_jit_cache_key(monkeypatch):
     assert calls[0].kwargs["cuda_wrappers"] != calls[1].kwargs["cuda_wrappers"]
 
 
+def test_full_touch_aggregation_has_a_distinct_jit_cache_key(monkeypatch):
+    load = MagicMock()
+    monkeypatch.setattr(ops, "load_jit", load)
+    for size in (1, 64):
+        ops._jit_sparse_module.__wrapped__(
+            576, 256, 512, 1536, True, False, False, True, True, size
+        )
+    calls = load.call_args_list
+    assert calls[0].args != calls[1].args
+    assert calls[0].kwargs["cuda_wrappers"] != calls[1].kwargs["cuda_wrappers"]
+
+
 @pytest.mark.parametrize(
     "loader",
     [ops.load_cache_to_device_buffer_mla, ops.load_cache_to_device_buffer_dsv4_mla],

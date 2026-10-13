@@ -93,6 +93,7 @@ def topk_transform_512_v2(
     out_raw_indices: Optional[torch.Tensor] = None,
     *,
     raw_only: bool = False,
+    touch_clock: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused top-k + page-table transform (DeepSeek-V4 top-k v2 kernel).
 
@@ -109,6 +110,15 @@ def topk_transform_512_v2(
     """
     if raw_only and out_raw_indices is None:
         raise ValueError("TopK raw-only mode requires a raw output tensor")
+    if touch_clock is not None and (
+        not raw_only
+        or touch_clock.shape != (1,)
+        or touch_clock.dtype != torch.int64
+        or touch_clock.device != scores.device
+    ):
+        raise ValueError(
+            "TopK FULL clock requires raw-only mode and an int64 device scalar"
+        )
     if raw_only:
         raw_start = out_raw_indices.data_ptr()
         mapped_start = out_page_indices.data_ptr()
@@ -127,4 +137,5 @@ def topk_transform_512_v2(
         metadata,
         out_raw_indices,
         raw_only,
+        touch_clock,
     )

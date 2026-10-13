@@ -198,6 +198,7 @@ template <
     bool UseGlobalScratch,
     bool UseLruScratch,
     bool ValidateStatus,
+    int FullPageSize,
     typename SeqLensT,
     typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_kernel(
@@ -405,9 +406,22 @@ __global__ void load_cache_to_device_buffer_kernel(
       req_top_k_device_locs[i] = -1;
       atomicMax(&swap_status[rid], 1);
     } else if (full_loc > 0) {
-      atomicMax(
-          reinterpret_cast<unsigned long long*>(&full_last_touch[logical_loc]),
-          static_cast<unsigned long long>(touch_clock[0]));
+      bool touch = true;
+#ifndef USE_ROCM
+      if constexpr (FullPageSize > 1) {
+        // FULL reclamation uses the maximum touch over the whole page. One
+        // selected entry per physical page/warp suffices; locations and hit
+        // counts still publish for every selected entry, including duplicates.
+        const unsigned peers =
+            __match_any_sync(__activemask(), static_cast<unsigned long long>(full_loc / FullPageSize));
+        touch = (tid % WARP_SIZE) == __ffs(peers) - 1;
+      }
+#endif
+      if (touch) {
+        atomicMax(
+            reinterpret_cast<unsigned long long*>(&full_last_touch[logical_loc]),
+            static_cast<unsigned long long>(touch_clock[0]));
+      }
       s_top_k_tokens[i] = TOKEN_HIT;
       req_top_k_device_locs[i] = static_cast<int32_t>(full_loc + full_location_base);
       ++local_full_hits;
@@ -782,7 +796,8 @@ template <
     bool IsDsv4Layout,
     bool UseGlobalScratch,
     bool UseLruScratch = false,
-    bool ValidateStatus = false>
+    bool ValidateStatus = false,
+    int FullPageSize = 1>
 void load_cache_to_device_buffer(
     uint64_t top_k_tokens_ptr,
     uint64_t device_buffer_tokens_ptr,
@@ -933,6 +948,7 @@ void load_cache_to_device_buffer(
             UseGlobalScratch,
             UseLruScratch,
             ValidateStatus,
+            FullPageSize,
             int64_t,
             int64_t>,
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
@@ -948,6 +964,7 @@ void load_cache_to_device_buffer(
             UseGlobalScratch,
             UseLruScratch,
             ValidateStatus,
+            FullPageSize,
             int64_t,
             int32_t>,
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
@@ -963,6 +980,7 @@ void load_cache_to_device_buffer(
             UseGlobalScratch,
             UseLruScratch,
             ValidateStatus,
+            FullPageSize,
             int32_t,
             int64_t>,
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(seq_lens_ptr)),
@@ -978,6 +996,7 @@ void load_cache_to_device_buffer(
             UseGlobalScratch,
             UseLruScratch,
             ValidateStatus,
+            FullPageSize,
             int32_t,
             int32_t>,
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(seq_lens_ptr)),

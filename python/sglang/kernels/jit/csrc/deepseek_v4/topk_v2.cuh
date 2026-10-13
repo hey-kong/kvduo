@@ -65,6 +65,7 @@ struct TopKLaunchParams {
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
   int32_t* __restrict__ raw_indices;      // optional raw (pre-transform) indices output; nullptr if unused
+  int64_t* __restrict__ touch_clock;
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
   int64_t score_stride;
   int64_t page_table_stride;
@@ -181,6 +182,11 @@ SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
 template <bool kPDL, int kLevel, bool RawOnly>
 TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
+  if constexpr (RawOnly) {
+    // The persistent route increments here, not in its preceding cluster pool.
+    // The following non-PDL resolver waits for every TopK CTA to finish.
+    if (blockIdx.x == 0 && threadIdx.x == 0 && params.touch_clock != nullptr) ++params.touch_clock[0];
+  }
   auto problem = params.problem<RawOnly>(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
@@ -222,6 +228,10 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
 template <bool kPDL, bool RawOnly>
 CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
+  if constexpr (RawOnly) {
+    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && params.touch_clock != nullptr)
+      ++params.touch_clock[0];
+  }
   auto problem = params.problem<RawOnly>(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
   if (problem.seq_len <= problem.topk) return trivial_transform<kPDL, RawOnly>(problem);
@@ -375,7 +385,8 @@ struct TopKKernel {
       const uint32_t page_size,
       const tvm::ffi::TensorView metadata,
       const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
-      const bool raw_only) {
+      const bool raw_only,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> touch_clock) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
@@ -415,6 +426,12 @@ struct TopKKernel {
       raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
     }
     RuntimeCheck(!raw_only || raw_indices_ptr != nullptr, "TopK raw-only mode requires raw indices");
+    int64_t* clock_ptr = nullptr;
+    if (touch_clock.has_value()) {
+      RuntimeCheck(raw_only, "FULL clock requires raw-only TopK");
+      TensorMatcher({1}).with_dtype<int64_t>().with_device(device_).verify(touch_clock.value());
+      clock_ptr = static_cast<int64_t*>(touch_clock.value().data_ptr());
+    }
     const auto raw_start = reinterpret_cast<uintptr_t>(raw_indices_ptr);
     const auto mapped_start = reinterpret_cast<uintptr_t>(page_indices.data_ptr());
     const auto output_bytes = B.unwrap() * K.unwrap() * sizeof(int32_t);
@@ -446,6 +463,7 @@ struct TopKKernel {
         .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
         .page_indices = raw_only ? raw_indices_ptr : static_cast<int32_t*>(page_indices.data_ptr()),
         .raw_indices = raw_only ? nullptr : raw_indices_ptr,
+        .touch_clock = clock_ptr,
         .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
         .score_stride = S.unwrap(),
         .page_table_stride = P.unwrap(),

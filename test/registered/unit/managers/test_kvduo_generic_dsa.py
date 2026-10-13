@@ -202,12 +202,15 @@ def test_generic_merge_moves_payload_across_storage_layers_before_whole_page_fre
     allocator.free_hisparse_indices.assert_called_once()
 
 
+@pytest.mark.parametrize("clock_advanced", [False, True])
 def test_generic_resolver_receives_flat_backing_and_local_full_layer_offset(
     monkeypatch,
+    clock_advanced,
 ):
     import sglang.srt.managers.hisparse_coordinator as module
 
     c, pool, _ = make_stack(monkeypatch, start_layer=7)
+    c.full_touch_clock.fill_(40)
     c.mem_pool_host.kv_buffer = torch.zeros((3, 128, 1, 16), dtype=torch.bfloat16)
     for operation in ("all", "_assert_async"):
         monkeypatch.setattr(
@@ -222,11 +225,14 @@ def test_generic_resolver_receives_flat_backing_and_local_full_layer_offset(
         torch.tensor([64]),
         torch.zeros((1, 64), dtype=torch.int32),
         8,
+        touch_clock_advanced=clock_advanced,
     )
     kwargs = swap.call_args.kwargs
     assert kwargs["device_buffer"] is pool.get_flat_key_buffer()
     assert kwargs["full_location_base"] == pool.flat_layer_slot_stride
     assert kwargs["page_size"] == 3 * 64
+    assert kwargs["full_page_size"] == 64
+    assert c.full_touch_clock.item() == (40 if clock_advanced else 41)
     assert kwargs["validate_status"] is True
     assert kwargs["host_cache"].data_ptr() == c.mem_pool_host.kv_buffer[1].data_ptr()
 

@@ -20,6 +20,7 @@ from sglang.kernels.ops.kvcache.kvduo_full_reclaim import (
     summarize_kvduo_full_pages,
 )
 from sglang.kernels.ops.kvcache.kvduo_full_write import publish_kvduo_full_write
+from sglang.kernels.ops.kvcache.kvduo_hot_growth import publish_kvduo_hot_growth
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -1905,20 +1906,22 @@ class HiSparseCoordinator:
                     raise RuntimeError("KVDuo HOT capacity changed during allocation")
 
             layer_stride = getattr(self.mem_pool_device, "flat_layer_slot_stride", 0)
-            storage_offsets = (
-                torch.arange(
-                    self.hot_storage_layers, dtype=torch.int64, device=self.device
+            fused_publish = physical.is_cuda
+            if not fused_publish:
+                storage_offsets = (
+                    torch.arange(
+                        self.hot_storage_layers, dtype=torch.int64, device=self.device
+                    )
+                    * layer_stride
                 )
-                * layer_stride
-            )
-            within_page = torch.arange(
-                self.page_size, dtype=torch.int64, device=self.device
-            )
-            all_page_locs = (
-                page_starts_device[:, None, None]
-                + storage_offsets[None, :, None]
-                + within_page[None, None, :]
-            ).reshape(pages_needed, K)
+                within_page = torch.arange(
+                    self.page_size, dtype=torch.int64, device=self.device
+                )
+                all_page_locs = (
+                    page_starts_device[:, None, None]
+                    + storage_offsets[None, :, None]
+                    + within_page[None, None, :]
+                ).reshape(pages_needed, K)
 
             next_page = 0
             for layer_id, req_idx, current, target, grow in requests:
@@ -1926,7 +1929,9 @@ class HiSparseCoordinator:
                 request_page_count = grow // K
                 starts = page_starts[next_page : next_page + request_page_count]
                 page_locs = (
-                    all_page_locs[next_page : next_page + request_page_count]
+                    page_starts_device[next_page : next_page + request_page_count]
+                    if fused_publish
+                    else all_page_locs[next_page : next_page + request_page_count]
                     .reshape(-1)
                     .to(torch.int32)
                 )
@@ -1939,16 +1944,20 @@ class HiSparseCoordinator:
                         target,
                         starts,
                         page_locs,
-                        torch.cat(
-                            [
-                                torch.arange(
-                                    current,
-                                    target,
-                                    dtype=self.lru_slots.dtype,
-                                    device=self.device,
-                                ),
-                                previous_lru[:current],
-                            ]
+                        (
+                            None
+                            if fused_publish
+                            else torch.cat(
+                                [
+                                    torch.arange(
+                                        current,
+                                        target,
+                                        dtype=self.lru_slots.dtype,
+                                        device=self.device,
+                                    ),
+                                    previous_lru[:current],
+                                ]
+                            )
                         ),
                         self.req_device_buffer_token_locs[
                             layer_id, req_idx, current:target
@@ -1995,13 +2004,41 @@ class HiSparseCoordinator:
                 # Record the pair before its first write so even an exception
                 # halfway through publication restores this pair as well.
                 published.append(entry)
-                self.req_device_buffer_token_locs[layer_id, req_idx, current:target] = (
-                    page_locs
-                )
-                self.req_device_buffer_tokens[layer_id, req_idx, current:target] = -1
-                self.lru_slots[layer_id, req_idx, :target] = new_lru
-                self._observe_kvduo_hot_growth((layer_id, req_idx), current, target)
-                self.kvduo_req_hot_capacity_gpu[layer_id, req_idx] = target
+                if fused_publish:
+                    owner = (layer_id, req_idx)
+                    publish_kvduo_hot_growth(
+                        page_locs,
+                        self.req_device_buffer_tokens[owner],
+                        self.req_device_buffer_token_locs[owner],
+                        self.lru_slots[owner],
+                        entry[8],
+                        self.kvduo_req_hot_capacity_gpu[owner].reshape(1),
+                        self.kvduo_capacity_ema[owner],
+                        self.kvduo_capacity_steps[owner].reshape(1),
+                        self.kvduo_prefill_ema[owner],
+                        self.kvduo_prefill_steps[owner].reshape(1),
+                        current=current,
+                        target=target,
+                        page_size=self.page_size,
+                        storage_layers=self.hot_storage_layers,
+                        layer_stride=layer_stride,
+                        reset_prefill=self._kvduo_growth_resets_prefill(
+                            owner, current, target
+                        ),
+                    )
+                    self._observe_kvduo_hot_growth(
+                        owner, current, target, publish_stats=False
+                    )
+                else:
+                    self.req_device_buffer_token_locs[
+                        layer_id, req_idx, current:target
+                    ] = page_locs
+                    self.req_device_buffer_tokens[layer_id, req_idx, current:target] = (
+                        -1
+                    )
+                    self.lru_slots[layer_id, req_idx, :target] = new_lru
+                    self._observe_kvduo_hot_growth((layer_id, req_idx), current, target)
+                    self.kvduo_req_hot_capacity_gpu[layer_id, req_idx] = target
                 self.kvduo_req_hot_capacity[layer_id, req_idx] = target
                 self._kvduo_req_layer_pages.setdefault((layer_id, req_idx), []).extend(
                     starts
@@ -2590,29 +2627,36 @@ class HiSparseCoordinator:
         self._kvduo_hand_sequence += 1
         self._kvduo_hot_processed[owner] = self._kvduo_hand_sequence
 
-    def _observe_kvduo_hot_growth(self, owner, old_capacity, new_capacity) -> None:
-        if old_capacity == 0:
-            self._reset_kvduo_capacity_stats(owner)
-        else:
-            # Empty slots are prepended at the LRU end. Existing MRU ranks and
-            # segments stay unchanged; miss EMA and maturity remain a prior.
-            first_new_segment = old_capacity // self.hot_page_size
-            end_segment = new_capacity // self.hot_page_size
-            # Seed new tails with the previous LRU-most segment's hit EMA.
-            # This is a prior, not an observed hit in the newly allocated slots.
-            counts = self.kvduo_capacity_ema[owner]
-            counts[first_new_segment:end_segment] = counts[first_new_segment - 1]
+    def _observe_kvduo_hot_growth(
+        self, owner, old_capacity, new_capacity, *, publish_stats=True
+    ) -> None:
+        if publish_stats:
+            if old_capacity == 0:
+                self._reset_kvduo_capacity_stats(owner)
+            else:
+                # Empty slots are prepended at the LRU end. Existing MRU ranks and
+                # segments stay unchanged; miss EMA and maturity remain a prior.
+                first_new_segment = old_capacity // self.hot_page_size
+                end_segment = new_capacity // self.hot_page_size
+                # Seed new tails with the previous LRU-most segment's hit EMA.
+                # This is a prior, not an observed hit in the newly allocated slots.
+                counts = self.kvduo_capacity_ema[owner]
+                counts[first_new_segment:end_segment] = counts[first_new_segment - 1]
+        if self._kvduo_growth_resets_prefill(owner, old_capacity, new_capacity):
+            if publish_stats:
+                self.kvduo_prefill_ema[owner] = 0
+                self.kvduo_prefill_steps[owner] = 0
+            self._kvduo_prefill_budget_reference.pop(self._kvduo_owner_key(owner), None)
+
+    def _kvduo_growth_resets_prefill(self, owner, old_capacity, new_capacity) -> bool:
         base = self._kvduo_hot_base_pages.get(owner)
-        if (
+        return bool(
             base
             and self._kvduo_hot_base_generation[owner]
             == self._kvduo_request_generation[owner[1]]
             and old_capacity == len(base) * self.hot_page_size
             and new_capacity > old_capacity
-        ):
-            self.kvduo_prefill_ema[owner] = 0
-            self.kvduo_prefill_steps[owner] = 0
-            self._kvduo_prefill_budget_reference.pop(self._kvduo_owner_key(owner), None)
+        )
 
     def _reset_kvduo_capacity_stats(self, owner) -> None:
         self.kvduo_capacity_ema[owner] = 0
@@ -4054,6 +4098,8 @@ class HiSparseCoordinator:
         compressed_seq_lens: torch.Tensor,
         top_k_result: torch.Tensor,
         layer_id: int,
+        *,
+        touch_clock_advanced: bool = False,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices."""
         if not self.is_dsv4_hisparse:
@@ -4067,7 +4113,7 @@ class HiSparseCoordinator:
             if self.is_dsv4_hisparse
             else load_cache_to_device_buffer_mla
         )
-        if self.enable_mixed_residency:
+        if self.enable_mixed_residency and not touch_clock_advanced:
             self.full_touch_clock.add_(1)
         swap_in_fn(
             top_k_tokens=top_k_result,
@@ -4164,5 +4210,6 @@ class HiSparseCoordinator:
             resolver_scratch=getattr(self, "resolver_scratch", None),
             lru_scratch=getattr(self, "resolver_lru_scratch", None),
             validate_status=self.enable_mixed_residency,
+            full_page_size=self.page_size if self.enable_mixed_residency else 1,
         )
         return top_k_indices

@@ -87,6 +87,7 @@ def _jit_sparse_module(
     use_global_scratch: bool = False,
     use_lru_scratch: bool = False,
     validate_status: bool = False,
+    full_page_size: int = 1,
 ) -> Module:
     template_args = make_cpp_args(
         block_size,
@@ -97,6 +98,7 @@ def _jit_sparse_module(
         use_global_scratch,
         use_lru_scratch,
         validate_status,
+        full_page_size,
     )
     cache_args = make_cpp_args(
         item_size_bytes,
@@ -108,6 +110,7 @@ def _jit_sparse_module(
         use_global_scratch,
         use_lru_scratch,
         validate_status,
+        full_page_size,
     )
     return load_jit(
         "sparse_cache",
@@ -194,7 +197,10 @@ def _load_cache_to_device_buffer_mla(
     resolver_scratch: torch.Tensor | None = None,
     lru_scratch: torch.Tensor | None = None,
     validate_status: bool = False,
+    full_page_size: int = 1,
 ) -> None:
+    if full_page_size < 1:
+        raise ValueError("FULL physical page size must be positive")
     assert (
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
@@ -226,6 +232,7 @@ def _load_cache_to_device_buffer_mla(
         use_global_scratch=resolver_scratch is not None,
         use_lru_scratch=lru_scratch is not None,
         validate_status=validate_status,
+        full_page_size=full_page_size,
     )
 
     # Pass only scalars through TVM FFI.  Its PyTorch fallback can reject tensor
@@ -401,6 +408,7 @@ def load_cache_to_device_buffer_mla(
     resolver_scratch: torch.Tensor | None = None,
     lru_scratch: torch.Tensor | None = None,
     validate_status: bool = False,
+    full_page_size: int = 1,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
     _load_cache_to_device_buffer_mla(
@@ -441,6 +449,7 @@ def load_cache_to_device_buffer_mla(
         resolver_scratch=resolver_scratch,
         lru_scratch=lru_scratch,
         validate_status=validate_status,
+        full_page_size=full_page_size,
     )
 
 
@@ -481,6 +490,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     resolver_scratch: torch.Tensor | None = None,
     lru_scratch: torch.Tensor | None = None,
     validate_status: bool = False,
+    full_page_size: int = 1,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -521,6 +531,7 @@ def load_cache_to_device_buffer_dsv4_mla(
         resolver_scratch=resolver_scratch,
         lru_scratch=lru_scratch,
         validate_status=validate_status,
+        full_page_size=full_page_size,
     )
 
 
