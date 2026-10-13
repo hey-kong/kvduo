@@ -2581,6 +2581,8 @@ class HiSparseCoordinator:
         if not self.enable_mixed_residency or num_tokens <= 0:
             return 0
         self._wait_kvduo_hot_merge_boundary()
+        if self.kvduo_capacity_ema.is_cuda:
+            return self._reclaim_kvduo_hot_pages_gpu(num_tokens)
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         target = allocator.available_size() + num_tokens
         layers = self.mem_pool_device.layer_num
@@ -2620,6 +2622,69 @@ class HiSparseCoordinator:
         # same costs or immature reset stats, so it cannot release more pages.
         return reclaimed
 
+    def _reclaim_kvduo_hot_pages_gpu(self, num_tokens: int) -> int:
+        from sglang.kernels.ops.kvcache.kvduo_hand_plan import (
+            allocate_kvduo_hand_workspace,
+            prepare_kvduo_hand,
+        )
+
+        workspace = getattr(self, "_kvduo_hand_workspace", None)
+        if workspace is None:
+            workspace = self._kvduo_hand_workspace = allocate_kvduo_hand_workspace(
+                self.kvduo_capacity_ema
+            )
+        pages_host = workspace.pages_host.numpy()
+        pages_host.fill(0)
+        bindings = {}
+        for owner, pages in self._kvduo_req_layer_pages.items():
+            if self._kvduo_can_merge(owner):
+                pages_host[owner] = len(pages)
+                bindings[owner] = self._kvduo_request_generation[owner[1]]
+
+        start_hand = self._kvduo_hand
+        snapshot = prepare_kvduo_hand(
+            self.kvduo_capacity_ema,
+            self.kvduo_capacity_steps,
+            workspace,
+            hand=start_hand,
+            minimum=self.min_hot_pages,
+            rho=self.kvduo_prefill_policy.max_relative_miss_increase,
+        )
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        target = allocator.available_size() + num_tokens
+        layers, requests = self.kvduo_capacity_steps.shape
+        objects = layers * requests
+        cursor, reclaimed = 0, 0
+        while cursor < objects and allocator.available_size() < target:
+            needed = (
+                target - allocator.available_size() + self.page_size - 1
+            ) // self.page_size
+            rows = snapshot.next(cursor, needed)
+            plans = []
+            for offset, flat_owner, pages, target_pages in rows:
+                owner = divmod(flat_owner, requests)
+                if (
+                    bindings.get(owner) == self._kvduo_request_generation[owner[1]]
+                    and self._kvduo_hot_generation.get(owner) == bindings[owner]
+                    and len(self._kvduo_req_layer_pages.get(owner, ())) == pages
+                    and self._kvduo_can_merge(owner)
+                ):
+                    plans.append((offset, owner, pages, target_pages))
+            if not self._kvduo_consensus(tuple(plans)):
+                return reclaimed
+            for offset, (layer, req), _, target_pages in plans:
+                self._kvduo_hand = (start_hand + offset + 1) % objects
+                reclaimed += self._merge_kvduo_hot_pages(layer, req, target_pages)
+                if allocator.available_size() >= target:
+                    return reclaimed
+            if not rows:
+                break
+            # Failed or newly protected merges do not consume their estimated
+            # release. Continue the same observation snapshot after this prefix.
+            cursor = rows[-1][0] + 1
+        self._kvduo_hand = start_hand
+        return reclaimed
+
     def _kvduo_can_merge(self, owner) -> bool:
         layer, req = owner
         request = self._active_kvduo_reqs.get(req)
@@ -2646,6 +2711,14 @@ class HiSparseCoordinator:
         self.kvduo_capacity_steps = torch.zeros(
             shape, dtype=torch.int64, device=self.device
         )
+        if self.kvduo_capacity_ema.is_cuda:
+            from sglang.kernels.ops.kvcache.kvduo_hand_plan import (
+                allocate_kvduo_hand_workspace,
+            )
+
+            self._kvduo_hand_workspace = allocate_kvduo_hand_workspace(
+                self.kvduo_capacity_ema
+            )
         self.kvduo_hot_page_limit = torch.full(
             shape, 8, dtype=torch.int32, device="cpu"
         )

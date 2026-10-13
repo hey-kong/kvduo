@@ -9,13 +9,13 @@
  * DarkSharpness never took a detailed look at these 2 implementation, but his claude code did.
  * So we add credit to the reference implementations.
  */
+#include <sgl_kernel/kvduo_cache_observation.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
 
 #include <sgl_kernel/deepseek_v4/topk_impl.cuh>
-#include <sgl_kernel/kvduo_cache_observation.h>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -133,7 +133,8 @@ SGL_DEVICE void resolve_full(const TopKLaunchParams& params, uint32_t row) {
   const auto full = params.full;
   int32_t* output = full.output + row * static_cast<int64_t>(params.topk);
   if (row >= static_cast<uint32_t>(full.real_requests[0])) {
-    for (uint32_t i = threadIdx.x; i < params.topk; i += kBlockSize) output[i] = -1;
+    for (uint32_t i = threadIdx.x; i < params.topk; i += kBlockSize)
+      output[i] = -1;
     return;
   }
   const int64_t rid = full.requests[row];
@@ -162,14 +163,16 @@ SGL_DEVICE void resolve_full(const TopKLaunchParams& params, uint32_t row) {
       atomicExch(full.status + rid, 1);
       continue;
     }
-    const unsigned peers = __match_any_sync(__activemask(), static_cast<unsigned long long>(location >> full.page_bits));
+    const unsigned peers =
+        __match_any_sync(__activemask(), static_cast<unsigned long long>(location >> full.page_bits));
     if (threadIdx.x % 32 == __ffs(peers) - 1) {
       atomicMax(reinterpret_cast<unsigned long long*>(full.touches + logical), stamp);
     }
     output[i] = static_cast<int32_t>(location + full.location_base);
     ++local_hits;
   }
-  for (int offset = 16; offset > 0; offset /= 2) local_hits += __shfl_down_sync(0xffffffffu, local_hits, offset);
+  for (int offset = 16; offset > 0; offset /= 2)
+    local_hits += __shfl_down_sync(0xffffffffu, local_hits, offset);
   if (threadIdx.x % 32 == 0) atomicAdd(&hits, local_hits);
   __syncthreads();
   if (full.status[rid] != 0) {
@@ -178,7 +181,8 @@ SGL_DEVICE void resolve_full(const TopKLaunchParams& params, uint32_t row) {
   }
   if (threadIdx.x == 0) {
     atomicAdd(full.stats + rid * 2 + 1, hits);
-    if (full.observe[0]) sglang::kvduo_update_prefill_ema(0, 0, hits, full.prefill_ema + rid * 2, full.prefill_steps[rid]);
+    if (full.observe[0])
+      sglang::kvduo_update_prefill_ema(0, 0, hits, full.prefill_ema + rid * 2, full.prefill_steps[rid]);
   }
 }
 
@@ -607,22 +611,42 @@ struct TopKKernel {
     }
   }
   static void transform(
-      tvm::ffi::TensorView scores, tvm::ffi::TensorView seq_lens, tvm::ffi::TensorView page_table,
-      tvm::ffi::TensorView page_indices, uint32_t page_size, tvm::ffi::TensorView metadata,
-      tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices, bool raw_only,
+      tvm::ffi::TensorView scores,
+      tvm::ffi::TensorView seq_lens,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView page_indices,
+      uint32_t page_size,
+      tvm::ffi::TensorView metadata,
+      tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
+      bool raw_only,
       tvm::ffi::Optional<tvm::ffi::TensorView> clock) {
     transform_impl(scores, seq_lens, page_table, page_indices, page_size, metadata, raw_indices, raw_only, clock);
   }
 
   static void transform_full(
-      tvm::ffi::TensorView scores, tvm::ffi::TensorView seq_lens, tvm::ffi::TensorView page_table,
-      tvm::ffi::TensorView page_indices, uint32_t page_size, tvm::ffi::TensorView metadata,
-      tvm::ffi::TensorView raw_indices, tvm::ffi::TensorView output,
-      tvm::ffi::TensorView requests, tvm::ffi::TensorView lookup, tvm::ffi::TensorView mapping,
-      tvm::ffi::TensorView touches, tvm::ffi::TensorView status, tvm::ffi::TensorView stats,
-      tvm::ffi::TensorView growth, tvm::ffi::TensorView observe, tvm::ffi::TensorView real_requests,
-      tvm::ffi::TensorView clock_base, tvm::ffi::TensorView prefill_ema, tvm::ffi::TensorView prefill_steps,
-      int64_t layer, int64_t layer_stride, int64_t full_page_size) {
+      tvm::ffi::TensorView scores,
+      tvm::ffi::TensorView seq_lens,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView page_indices,
+      uint32_t page_size,
+      tvm::ffi::TensorView metadata,
+      tvm::ffi::TensorView raw_indices,
+      tvm::ffi::TensorView output,
+      tvm::ffi::TensorView requests,
+      tvm::ffi::TensorView lookup,
+      tvm::ffi::TensorView mapping,
+      tvm::ffi::TensorView touches,
+      tvm::ffi::TensorView status,
+      tvm::ffi::TensorView stats,
+      tvm::ffi::TensorView growth,
+      tvm::ffi::TensorView observe,
+      tvm::ffi::TensorView real_requests,
+      tvm::ffi::TensorView clock_base,
+      tvm::ffi::TensorView prefill_ema,
+      tvm::ffi::TensorView prefill_steps,
+      int64_t layer,
+      int64_t layer_stride,
+      int64_t full_page_size) {
     using namespace host;
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
@@ -642,12 +666,14 @@ struct TopKKernel {
     TensorMatcher({R}).with_dtype<int64_t>().with_device(device).verify(prefill_steps);
     TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(observe).verify(real_requests);
     TensorMatcher({1}).with_dtype<int64_t>().with_device(device).verify(clock_base);
-    RuntimeCheck(full_page_size > 0 && std::has_single_bit(static_cast<uint64_t>(full_page_size)), "Invalid FULL page size");
+    RuntimeCheck(
+        full_page_size > 0 && std::has_single_bit(static_cast<uint64_t>(full_page_size)), "Invalid FULL page size");
     RuntimeCheck(layer >= 0 && layer_stride >= 0, "Invalid FULL layer geometry");
     const auto raw_begin = reinterpret_cast<uintptr_t>(raw_indices.data_ptr());
     const auto out_begin = reinterpret_cast<uintptr_t>(output.data_ptr());
     const auto bytes = B.unwrap() * K.unwrap() * sizeof(int32_t);
-    RuntimeCheck(raw_begin >= out_begin + bytes || out_begin >= raw_begin + bytes, "FULL output must not alias raw selection");
+    RuntimeCheck(
+        raw_begin >= out_begin + bytes || out_begin >= raw_begin + bytes, "FULL output must not alias raw selection");
     KVDuoFullParams full{
         .output = static_cast<int32_t*>(output.data_ptr()),
         .requests = static_cast<const int64_t*>(requests.data_ptr()),
@@ -662,13 +688,17 @@ struct TopKKernel {
         .clock_base = static_cast<const int64_t*>(clock_base.data_ptr()),
         .prefill_ema = static_cast<float*>(prefill_ema.data_ptr()),
         .prefill_steps = static_cast<int64_t*>(prefill_steps.data_ptr()),
-        .lookup_stride = S.unwrap(), .context = C.unwrap(), .request_count = R.unwrap(),
-        .logical_size = N.unwrap(), .location_base = layer * layer_stride, .layer = layer,
+        .lookup_stride = S.unwrap(),
+        .context = C.unwrap(),
+        .request_count = R.unwrap(),
+        .logical_size = N.unwrap(),
+        .location_base = layer * layer_stride,
+        .layer = layer,
         .page_bits = static_cast<int>(std::countr_zero(static_cast<uint64_t>(full_page_size))),
     };
-    transform_impl(scores, seq_lens, page_table, page_indices, page_size, metadata, raw_indices, true, std::nullopt, full);
+    transform_impl(
+        scores, seq_lens, page_table, page_indices, page_size, metadata, raw_indices, true, std::nullopt, full);
   }
-
 };
 
 }  // namespace
