@@ -184,6 +184,113 @@ void kvduo_full_page_select(
       charge_minimum);
 }
 
+template <int BLOCK_SIZE>
+__global__ void kvduo_full_request_select_kernel(
+    const int32_t* valid,
+    const int64_t* owners,
+    const int64_t* costs,
+    const int64_t* admission,
+    int32_t* workspace,
+    int64_t* packet,
+    int pages,
+    int owner_count,
+    int bound,
+    int64_t needed,
+    bool release_all) {
+  using Scan = full_cub::BlockScan<int, BLOCK_SIZE>;
+  __shared__ typename Scan::TempStorage storage;
+  __shared__ int selected_pages;
+  const int tid = threadIdx.x;
+  int* counts = workspace;
+  int* chosen = counts + owner_count;
+  for (int owner = tid; owner < owner_count; owner += BLOCK_SIZE) {
+    counts[owner] = chosen[owner] = 0;
+  }
+  if (tid == 0) selected_pages = 0;
+  __syncthreads();
+  for (int page = tid; page < pages; page += BLOCK_SIZE) {
+    if (valid[page]) atomicAdd(counts + owners[page], 1);
+  }
+  __syncthreads();
+  if (tid == 0) {
+    if (release_all) {
+      for (int owner = 0; owner < owner_count; ++owner)
+        chosen[owner] = counts[owner] > costs[owner];
+    } else {
+      int64_t net = 0;
+      while (net < needed) {
+        int best = -1;
+        int64_t best_gain = 0;
+        for (int owner = 0; owner < owner_count; ++owner) {
+          const int64_t gain = counts[owner] - costs[owner];
+          if (chosen[owner] || gain <= 0) continue;
+          if (best < 0 || gain > best_gain || (gain == best_gain && admission[owner] < admission[best])) {
+            best = owner;
+            best_gain = gain;
+          }
+        }
+        if (best < 0) break;
+        chosen[best] = 1;
+        net += best_gain;
+      }
+    }
+  }
+  __syncthreads();
+  for (int base = 0; base < pages; base += BLOCK_SIZE) {
+    const int page = base + tid;
+    const int keep = page < pages && valid[page] && chosen[owners[page]];
+    int offset, total;
+    Scan(storage).ExclusiveSum(keep, offset, total);
+    offset += selected_pages;
+    __syncthreads();
+    if (keep && offset < bound) packet[1 + offset] = page;
+    if (tid == 0) selected_pages += total;
+    __syncthreads();
+  }
+  if (tid == 0) packet[0] = selected_pages;
+}
+
+template <int BLOCK_SIZE>
+void kvduo_full_request_select(
+    tvm::ffi::TensorView valid,
+    tvm::ffi::TensorView owners,
+    tvm::ffi::TensorView costs,
+    tvm::ffi::TensorView admission,
+    tvm::ffi::TensorView workspace,
+    tvm::ffi::TensorView packet,
+    int64_t needed,
+    bool release_all) {
+  using namespace host;
+  auto pages = SymbolicSize{"pages"};
+  auto owner_count = SymbolicSize{"owners"};
+  auto words = SymbolicSize{"words"};
+  auto packet_size = SymbolicSize{"packet"};
+  auto device = SymbolicDevice{};
+  device.set_options<kDLCUDA, kDLROCM>();
+  TensorMatcher({pages}).with_dtype<int64_t>().with_device(device).verify(owners);
+  TensorMatcher({pages}).with_dtype<int32_t>().with_device(device).verify(valid);
+  TensorMatcher({owner_count}).with_dtype<int64_t>().with_device(device).verify(costs).verify(admission);
+  TensorMatcher({words}).with_dtype<int32_t>().with_device(device).verify(workspace);
+  TensorMatcher({packet_size}).with_dtype<int64_t>().with_device(device).verify(packet);
+  RuntimeCheck(pages.unwrap() > 0 && pages.unwrap() <= INT32_MAX && owner_count.unwrap() > 0, "Invalid FULL plan size");
+  RuntimeCheck(
+      words.unwrap() >= 2 * owner_count.unwrap() && packet_size.unwrap() > 1, "Insufficient FULL plan workspace");
+  RuntimeCheck(needed > 0, "FULL plan requires a positive shortage");
+  LaunchKernel(1, BLOCK_SIZE, device.unwrap())(
+      kvduo_full_request_select_kernel<BLOCK_SIZE>,
+      static_cast<const int32_t*>(valid.data_ptr()),
+      static_cast<const int64_t*>(owners.data_ptr()),
+      static_cast<const int64_t*>(costs.data_ptr()),
+      static_cast<const int64_t*>(admission.data_ptr()),
+      static_cast<int32_t*>(workspace.data_ptr()),
+      static_cast<int64_t*>(packet.data_ptr()),
+      static_cast<int>(pages.unwrap()),
+      static_cast<int>(owner_count.unwrap()),
+      static_cast<int>(packet_size.unwrap() - 1),
+      needed,
+      release_all);
+}
+
 template <int BLOCK_SIZE, typename LogicalT>
 void kvduo_full_page_summary(
     tvm::ffi::TensorView logical_pages,

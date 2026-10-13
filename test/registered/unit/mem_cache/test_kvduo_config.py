@@ -9,6 +9,26 @@ class TestKVDuoConfig(unittest.TestCase):
         config = parse_kvduo_config(SimpleNamespace(kvduo_config=None))
         self.assertEqual(config, KVDuoConfig())
         self.assertEqual(config.tail_protected_pages, 2)
+        self.assertEqual(config.full_reclaim_policy, "request")
+
+    def test_full_reclaim_policy_values(self):
+        for policy in ("request", "page"):
+            with self.subTest(policy=policy):
+                config = parse_kvduo_config(
+                    SimpleNamespace(
+                        kvduo_config=f'{{"full_reclaim_policy": "{policy}"}}'
+                    )
+                )
+                self.assertEqual(config.full_reclaim_policy, policy)
+
+    def test_rejects_invalid_full_reclaim_policy(self):
+        for value in ('"batch"', '"PAGE"', "true", "1", "null", "[]", "{}"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "full_reclaim_policy"
+            ):
+                parse_kvduo_config(
+                    SimpleNamespace(kvduo_config=f'{{"full_reclaim_policy": {value}}}')
+                )
 
     def test_tail_protected_pages_and_values(self):
         config = parse_kvduo_config(
