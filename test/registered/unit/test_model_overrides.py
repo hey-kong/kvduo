@@ -827,6 +827,28 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 "swa_full_tokens_ratio": 0.1,
             },
         )
+        for mode in (
+            {"enable_kvduo": True},
+            {"enable_kvduo": True, "enable_hisparse": True},
+        ):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    _deepseek_v4_overrides(_args(**mode), hf)["swa_full_tokens_ratio"],
+                    0.05,
+                )
+                for ratio in (0.05, 0.1, 0.2):
+                    self.assertNotIn(
+                        "swa_full_tokens_ratio",
+                        _deepseek_v4_overrides(
+                            _args(**mode, swa_full_tokens_ratio=ratio), hf
+                        ),
+                    )
+        for mode in ({"enable_hisparse": True}, {"enable_hierarchical_cache": True}):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    _deepseek_v4_overrides(_args(**mode), hf)["swa_full_tokens_ratio"],
+                    0.1,
+                )
         # NPU pool geometry
         self.assertEqual(
             _deepseek_v4_overrides(_args(device="npu"), hf)["page_size"], 128

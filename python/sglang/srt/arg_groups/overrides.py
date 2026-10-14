@@ -1105,8 +1105,9 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     )
 
     if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
-        overrides["swa_full_tokens_ratio"] = 0.1
-        logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
+        ratio = 0.05 if getattr(server_args, "enable_kvduo", False) else 0.1
+        overrides["swa_full_tokens_ratio"] = ratio
+        logger.info(f"Setting swa_full_tokens_ratio to {ratio} for {model_arch}.")
 
     # nvidia/DeepSeek-V4-Pro-NVFP4 uses flashinfer_trtllm_routed MoE runner backend.
     if (
