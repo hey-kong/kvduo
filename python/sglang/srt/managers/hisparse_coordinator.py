@@ -183,7 +183,7 @@ class HiSparseCoordinator:
         swap_in_block_size: int = 960,
         tail_protected_pages: int = 0,
         prefill_policy: KVDuoPrefillPolicy | None = None,
-        full_reclaim_policy: str = "request",
+        full_reclaim_policy: str = "page",
         decode_emergency_reclaim: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool

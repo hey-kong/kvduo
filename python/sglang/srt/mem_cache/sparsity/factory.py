@@ -178,7 +178,7 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
     )
 
     policy = KVDuoPrefillPolicy(values.get("max_relative_miss_increase", 0.10))
-    full_reclaim_policy = values.get("full_reclaim_policy", "request")
+    full_reclaim_policy = values.get("full_reclaim_policy", "page")
     if not isinstance(full_reclaim_policy, str) or full_reclaim_policy not in (
         "request",
         "page",

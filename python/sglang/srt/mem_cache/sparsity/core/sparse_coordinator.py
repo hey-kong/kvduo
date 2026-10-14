@@ -77,7 +77,7 @@ class KVDuoConfig:
     swap_in_block_size: int = 960
     tail_protected_pages: int = 2
     max_relative_miss_increase: float = 0.10
-    full_reclaim_policy: str = "request"
+    full_reclaim_policy: str = "page"
     decode_emergency_reclaim: bool = False
 
 
