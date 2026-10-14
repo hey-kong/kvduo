@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -20,6 +21,15 @@ class KVDuoPrefillStatePlan:
     window: tuple
     owner: tuple
     swa_tokens: int
+
+
+@dataclass
+class _HostPublication:
+    cache: KVDuoHostPrefixCache
+    record: HostPrefixRecord
+    metadata: torch.Tensor | None = None
+    offset: int = 0
+    valid: torch.Tensor | None = None
 
 
 class _HostStateGroup:
@@ -161,8 +171,28 @@ class KVDuoPrefillHostCache:
             if event is not None and not event.query():
                 remaining.append((event, publish, unpin))
                 continue
-            for cache, record in publish:
+            for publication in publish:
+                cache, record = publication.cache, publication.record
                 if cache.records.get(record.identity) is record:
+                    if publication.valid is not None and not bool(
+                        publication.valid.item()
+                    ):
+                        cache.remove(record.identity)
+                        self.window.anchor.free(
+                            torch.tensor(
+                                record.host_locations["swa"], dtype=torch.int64
+                            )
+                        )
+                        continue
+                    if publication.metadata is not None:
+                        start = publication.offset
+                        end = start + len(record.host_locations["main_kv"])
+                        record.data_versions["main_kv"] = tuple(
+                            publication.metadata[0, start:end].tolist()
+                        )
+                        record.model_touches["main_kv"] = tuple(
+                            publication.metadata[1, start:end].tolist()
+                        )
                     record.host_versions = dict(record.data_versions)
             for record in unpin:
                 record.dma_pins -= 1
@@ -242,33 +272,35 @@ class KVDuoPrefillHostCache:
             else full[:0]
         )
         compressed = c.mem_pool_device.translate_loc_from_full_to_compressed(main_full)
-        versions, touches = (
-            torch.stack(
-                (c.full_data_version[compressed], c.full_last_touch[compressed])
+        main_metadata = (
+            torch.empty(
+                (2, slots), dtype=torch.int64, device="cpu", pin_memory=full.is_cuda
             )
-            .cpu()
-            .tolist()
+            if slots
+            else None
         )
-        for ordinal, rows, version, touch in zip(
-            missing,
-            main_host.split(c.page_size),
-            [versions[i : i + c.page_size] for i in range(0, slots, c.page_size)],
-            [touches[i : i + c.page_size] for i in range(0, slots, c.page_size)],
+        main_clock = c.host_prefix_cache.next_clock()
+        for index, (ordinal, rows) in enumerate(
+            zip(missing, main_host.split(c.page_size))
         ):
             record = HostPrefixRecord(
                 identity=keys[ordinal],
                 domains=("main_kv",),
                 host_locations={"main_kv": tuple(rows.tolist())},
-                data_versions={"main_kv": tuple(version)},
+                data_versions={"main_kv": ()},
                 host_versions={},
-                model_touches={"main_kv": tuple(touch)},
+                model_touches={"main_kv": ()},
                 cache_reference=True,
                 dma_pins=1,
-                last_access=self.clock,
+                last_access=main_clock,
                 tie_break_key=(ordinal, keys[ordinal].stable_sort_digest),
             )
             c.host_prefix_cache.insert(record)
-            publish.append((c.host_prefix_cache, record))
+            publish.append(
+                _HostPublication(
+                    c.host_prefix_cache, record, main_metadata, index * c.page_size
+                )
+            )
             unpin.append(record)
         reservation = c._kvduo_prefill_host_reservations.get(prefill_key)
         if reservation is not None:
@@ -281,63 +313,119 @@ class KVDuoPrefillHostCache:
         history = self.history.reserve(keys, self.clock)
         if history is not None:
             self._hold_source(req, self.history.cache, keys)
-        # Only live windows can be snapshotted. Earlier chunks may already have
-        # returned their SWA pages; never copy the sentinel as valid KV/state.
-        swa = c.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(full)
-        live = torch.all(swa.reshape(-1, self.page_size) > 0, dim=1).cpu().tolist()
-        window_keys = tuple(key for key, valid in zip(keys, live) if valid)
-        # Keep only the newest windows if a single chunk exceeds Host capacity.
-        max_pages = self.window.anchor.size // self.page_size
-        window_keys = window_keys[-max_pages:] if max_pages else ()
+        # Keep the two newest resumable boundaries, rather than all historical
+        # SWA in this chunk. The preceding boundary also covers an exact-length
+        # repeat, whose final input token must be recomputed for sampling.
+        window_pages = min(
+            len(keys),
+            self.window.anchor.size // self.page_size,
+            self.window_tokens // self.page_size + 1,
+        )
+        window_start = len(keys) - window_pages
+        window_keys = keys[window_start:] if window_pages else ()
+        swa = c.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+            full[window_start * self.page_size :]
+        )
+        window_metadata = torch.empty(
+            (window_pages,), dtype=torch.int8, device="cpu", pin_memory=full.is_cuda
+        )
         window = self.window.reserve(window_keys, self.clock)
+        if full.is_cuda:
+            source_ready = torch.cuda.Event()
+            source_ready.record(torch.cuda.current_stream(c.device))
+            context = torch.cuda.stream(c.write_staging_stream)
+        else:
+            context = nullcontext()
+        done = None
         try:
-            if slots:
-                c.mem_pool_host.backup_from_device_all_layer(
-                    c.mem_pool_device,
-                    main_host.to(c.device),
-                    c.mem_pool_device.translate_loc_from_full_to_hisparse_device(
-                        main_full
-                    ),
-                    "kernel",
-                )
-                c.full_host_version[compressed] = c.full_data_version[compressed]
-            for group, records, source in (
-                (self.history, history, full),
-                (self.window, window, swa),
-            ):
-                if not records:
-                    continue
-                ordinal_by_key = {key: i for i, key in enumerate(keys)}
-                device_locs = torch.cat(
-                    [
-                        source[
-                            ordinal_by_key[r.identity]
-                            * self.page_size : (ordinal_by_key[r.identity] + 1)
-                            * self.page_size
+            with context:
+                if full.is_cuda:
+                    c.write_staging_stream.wait_event(source_ready)
+                    for tensor in (full, main_full, compressed, swa):
+                        tensor.record_stream(c.write_staging_stream)
+                try:
+                    if slots:
+                        main_metadata.copy_(
+                            torch.stack(
+                                (
+                                    c.full_data_version[compressed],
+                                    c.full_last_touch[compressed],
+                                )
+                            ),
+                            non_blocking=True,
+                        )
+                        c.mem_pool_host.backup_from_device_all_layer(
+                            c.mem_pool_device,
+                            main_host.to(c.device),
+                            c.mem_pool_device.translate_loc_from_full_to_hisparse_device(
+                                main_full
+                            ),
+                            "kernel",
+                        )
+                        c.full_host_version[compressed] = c.full_data_version[
+                            compressed
                         ]
-                        for r in records
-                    ]
-                )
-                host_locs = self._locations(
-                    group, [r.identity for r in records], c.device
-                )
-                for pool in group.pools.values():
-                    pool.backup_from_device_all_layer(
-                        None, host_locs, device_locs, "kernel"
+                    if window:
+                        window_metadata.copy_(
+                            torch.all(swa.reshape(-1, self.page_size) > 0, dim=1).to(
+                                torch.int8
+                            ),
+                            non_blocking=True,
+                        )
+                    for group, records, source, source_keys in (
+                        (self.history, history, full, keys),
+                        (self.window, window, swa.clamp_min(0), window_keys),
+                    ):
+                        if not records:
+                            continue
+                        ordinal_by_key = {key: i for i, key in enumerate(source_keys)}
+                        device_locs = torch.cat(
+                            [
+                                source[
+                                    ordinal_by_key[r.identity]
+                                    * self.page_size : (ordinal_by_key[r.identity] + 1)
+                                    * self.page_size
+                                ]
+                                for r in records
+                            ]
+                        )
+                        host_locs = self._locations(
+                            group, [r.identity for r in records], c.device
+                        )
+                        for pool in group.pools.values():
+                            pool.backup_from_device_all_layer(
+                                None, host_locs, device_locs, "kernel"
+                            )
+                        publish.extend(
+                            _HostPublication(
+                                group.cache,
+                                r,
+                                valid=(
+                                    window_metadata[ordinal_by_key[r.identity]]
+                                    if group is self.window
+                                    else None
+                                ),
+                            )
+                            for r in records
+                        )
+                        unpin.extend(records)
+                        for record in records:
+                            record.last_access = self.clock
+                except Exception:
+                    unpin = list(
+                        {
+                            id(r): r for r in unpin + (history or []) + (window or [])
+                        }.values()
                     )
-                publish.extend((group.cache, r) for r in records)
-                unpin.extend(records)
-                for record in records:
-                    record.last_access = self.clock
-        except Exception:
-            # Keep all allocated sources pinned through any DMA already queued;
-            # incomplete groups must never become reusable checkpoints.
-            unpin = list(
-                {id(r): r for r in unpin + (history or []) + (window or [])}.values()
-            )
-            self.pending.append((self._event(), (), unpin))
-            raise
-        self.pending.append((self._event(), publish, unpin))
+                    done = self._event()
+                    self.pending.append((done, (), unpin))
+                    raise
+                done = self._event()
+                self.pending.append((done, publish, unpin))
+        finally:
+            # GPU consumers and frees follow even a partially queued snapshot.
+            if full.is_cuda and done is not None:
+                torch.cuda.current_stream(c.device).wait_event(done)
         self.poll()
 
     def release_match(self, req):
@@ -518,9 +606,9 @@ class KVDuoPrefillHostCache:
                 event.synchronize()
         self.poll()
         for group in (self.history, self.window):
-            group.cache.records.clear()
+            group.cache.clear()
             group.anchor.clear()
-        self.coordinator.host_prefix_cache.records.clear()
+        self.coordinator.host_prefix_cache.clear()
         self.coordinator.mem_pool_host.clear()
 
     def destroy(self):

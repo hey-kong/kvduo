@@ -74,17 +74,36 @@ class KVDuoHostPrefixCache:
             raise ValueError("Host prefix capacity cannot be negative")
         self.capacity_slots = capacity_slots
         self.records: Dict[Hashable, HostPrefixRecord] = {}
+        self._used_slots = 0
+        self._access_clock = 0
+
+    def next_clock(self) -> int:
+        self._access_clock += 1
+        return self._access_clock
 
     @property
     def used_slots(self) -> int:
-        return sum(record.physical_slots for record in self.records.values())
+        return self._used_slots
 
     def insert(self, record: HostPrefixRecord) -> None:
         if record.identity in self.records:
             raise ValueError(f"Duplicate host prefix identity: {record.identity!r}")
-        if self.used_slots + record.physical_slots > self.capacity_slots:
+        slots = record.physical_slots
+        if self.used_slots + slots > self.capacity_slots:
             raise MemoryError("Host prefix record exceeds the admitted cache capacity")
         self.records[record.identity] = record
+        self._used_slots += slots
+        self._access_clock = max(self._access_clock, record.last_access)
+
+    def remove(self, identity: Hashable) -> HostPrefixRecord:
+        record = self.records.pop(identity)
+        self._used_slots -= record.physical_slots
+        return record
+
+    def clear(self) -> None:
+        self.records.clear()
+        self._used_slots = 0
+        self._access_clock = 0
 
     def acquire(
         self, identity: Hashable, request_id: Hashable, clock: int
@@ -92,6 +111,7 @@ class KVDuoHostPrefixCache:
         record = self.records[identity]
         record.request_references.add(request_id)
         record.last_access = max(record.last_access, clock)
+        self._access_clock = max(self._access_clock, record.last_access)
         return record
 
     def release(self, identity: Hashable, request_id: Hashable) -> None:
@@ -117,7 +137,7 @@ class KVDuoHostPrefixCache:
             record.cache_reference = False
             victims.append(record)
             released += record.physical_slots
-            del self.records[record.identity]
+            self.remove(record.identity)
             if released >= required_slots:
                 break
         return tuple(victims)

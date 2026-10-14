@@ -57,6 +57,7 @@ def free_swa_out_of_window_slots(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     is_chunk_cache: bool = False,
     cache_protected_len: int | None = None,
+    kvduo_live_swa_from: int | None = None,
 ) -> None:
     if req.kv is None:
         return
@@ -68,6 +69,8 @@ def free_swa_out_of_window_slots(
         cache_protected_len % page_size == 0
     ), "cache_protected_len must be page aligned"
     evict_floor = max(cache_protected_len, getattr(req, "swa_evict_floor", 0))
+    if kvduo_live_swa_from is not None:
+        evict_floor = max(evict_floor, kvduo_live_swa_from)
     if page_size > 1 and evict_floor > cache_protected_len:
         evict_floor = -(-evict_floor // page_size) * page_size
     req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, evict_floor)
@@ -94,7 +97,12 @@ def free_swa_out_of_window_slots(
         free_slots = req_to_token_pool.req_to_token[
             req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
-        token_to_kv_pool_allocator.free_swa(free_slots)
+        if kvduo_live_swa_from is not None:
+            token_to_kv_pool_allocator.free_kvduo_live_swa_segment(
+                free_slots, start_pos=req.kv.swa_evicted_seqlen
+            )
+        else:
+            token_to_kv_pool_allocator.free_swa(free_slots)
         maybe_evict_dsv4_state_on_swa(
             token_to_kv_pool_allocator, req_to_token_pool, req, new_swa_evicted_seqlen
         )

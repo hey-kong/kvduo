@@ -431,6 +431,17 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_swa(self, free_indices: torch.Tensor):
         self.logical_attn_allocator.free_swa(free_indices)
 
+    def free_kvduo_live_swa_segment(self, indices: torch.Tensor, *, start_pos: int):
+        """Release an aligned, request-owned range known to have live SWA."""
+        if not indices.numel():
+            return
+        assert start_pos % self.page_size == 0
+        assert indices.numel() % self.page_size == 0
+        logical = self.logical_attn_allocator
+        swa = logical.translate_loc_from_full_to_swa(indices)
+        logical.swa_attn_allocator.free_segment(swa, start_pos=start_pos)
+        logical.full_to_swa_index_mapping[indices.to(torch.int64)] = 0
+
     def available_size(self) -> int:
         return min(
             self.logical_attn_allocator.available_size(),

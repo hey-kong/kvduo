@@ -2,6 +2,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 MODULE_PATH = (
     Path(__file__).parents[4]
     / "python/sglang/srt/mem_cache/sparsity/core/kvduo_prefix_cache.py"
@@ -35,6 +37,43 @@ def record(identity, location, *, version=1, host_version=1, clock=0):
         last_access=clock,
         tie_break_key=(identity,),
     )
+
+
+def test_capacity_accounting_survives_failed_insert_eviction_and_clear():
+    cache = KVDuoHostPrefixCache(2)
+    cache.insert(record("a", 1))
+    cache.insert(record("b", 2))
+    with pytest.raises(MemoryError):
+        cache.insert(record("c", 3))
+    assert cache.used_slots == 2
+    cache.acquire("a", "active", 0)
+    assert cache.evict_lru(1)[0].identity == "b"
+    assert cache.used_slots == 1
+    cache.insert(record("c", 3))
+    cache.remove("c")
+    assert cache.used_slots == 1
+    cache.clear()
+    assert cache.used_slots == 0
+    cache.insert(record("a", 4))
+    assert cache.used_slots == 1
+
+
+def test_capacity_checks_do_not_rescan_existing_records():
+    reads = []
+
+    class CountedRecord(HostPrefixRecord):
+        @property
+        def physical_slots(self):
+            reads.append(self.identity)
+            return super().physical_slots
+
+    cache = KVDuoHostPrefixCache(1000)
+    for i in range(1000):
+        cache.insert(
+            CountedRecord(i, ("main",), {"main": (i,)}, {"main": 1}, {"main": 1})
+        )
+    assert cache.used_slots == 1000
+    assert reads == list(range(1000))
 
 
 def test_request_slot_reuse_does_not_change_prefix_identity():
