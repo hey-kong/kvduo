@@ -479,7 +479,7 @@ def test_mixed_batch_does_not_mark_decode_swa_as_fresh_prefill(monkeypatch):
     batch.release_kvduo_prefill_swa()
     assert req.kvduo_swa_live_from == 0
     assert not hasattr(decode, "kvduo_swa_live_from")
-    state.backup.assert_called_once_with(req, 1536)
+    state.backup_batch.assert_called_once_with([(req, 1536)])
 
 
 def host_match(c, req):
@@ -909,5 +909,156 @@ def test_finished_decode_saves_latest_window_without_duplicate_main_allocation(
     assert host_match(c, target).host_hit_length == 1536
     c.end_kvduo_prefill(target)
     state.clear()
+    state.destroy()
+    c.mem_pool_host.destroy()
+
+
+def test_incremental_backup_rescans_after_eviction_and_clears_generation(monkeypatch):
+    c = stack(monkeypatch)
+    req = request(c)
+    prefill(c, req)
+    state = c.kvduo_prefill_host_cache
+    translate = MagicMock(
+        wraps=c.token_to_kv_pool_allocator.translate_loc_from_full_to_swa
+    )
+    monkeypatch.setattr(
+        c.token_to_kv_pool_allocator, "translate_loc_from_full_to_swa", translate
+    )
+    state.backup(req, 1024)
+    state.backup(req, 1536)
+    assert [call.args[0].numel() for call in translate.call_args_list] == [1024, 512]
+    state.backup(req, 1536)
+    assert translate.call_count == 2
+    key = c._host_prefix_identity(req, 0)
+    record = state.window.cache.remove(key)
+    state.window.anchor.free(torch.tensor(record.host_locations["swa"]))
+    state.backup(req, 1536)
+    assert translate.call_args.args[0].numel() == 1536
+    assert state.ready(req, 0, 256)
+    c.end_kvduo_prefill(req)
+    assert id(req) not in state.progress
+    state.destroy()
+    c.mem_pool_host.destroy()
+
+
+def test_upload_buffer_is_reused_only_after_copy_completion(monkeypatch):
+    c = stack(monkeypatch)
+    req = request(c)
+    prefill(c, req)
+    state = c.kvduo_prefill_host_cache
+    event = SimpleNamespace(query=lambda: False)
+    monkeypatch.setattr(state, "_event", lambda: event)
+    state.backup(req, 1024)
+    first = state._upload_pending[0][1]
+    snapshot = first.clone()
+    state.backup(req, 1536)
+    second = state._upload_pending[1][1]
+    assert first.data_ptr() != second.data_ptr()
+    assert torch.equal(first, snapshot)
+    event.query = lambda: True
+    state.poll()
+    assert not state._upload_pending
+    buffer, sizes = state._prepare_upload(torch.arange(10), [], [], False)
+    assert sizes == [10, 0, 0]
+    assert buffer.data_ptr() == first.data_ptr()
+    assert buffer[:10].tolist() == list(range(10))
+    state.destroy()
+    c.mem_pool_host.destroy()
+
+
+def batch_sources(c):
+    first = request(c)
+    full = prefill(c, first)
+    second = request(c, "shared")
+    c.req_to_token_pool.req_to_token[second.req_pool_idx, :1536] = full
+    assert c._reserve_kvduo_prefill_host(second, c._kvduo_prefill_key(second))
+    return first, second
+
+
+@pytest.mark.parametrize("covered", [True, False])
+def test_batch_budget_preserves_fallback_admission(monkeypatch, covered):
+    c = stack(monkeypatch)
+    first, second = batch_sources(c)
+    if not covered:
+        c._release_kvduo_prefill_host(c._kvduo_prefill_key(second))
+    common = MagicMock(wraps=c._kvduo_host_capacity_ready)
+    monkeypatch.setattr(c, "_kvduo_host_capacity_ready", common)
+    state = c.kvduo_prefill_host_cache
+    state.backup_batch([(first, 1536), (second, 1536)])
+    assert common.call_count == (1 if covered else 2)
+    assert state.ready(first, 0, 1536)
+    assert state.ready(second, 0, 1536)
+    assert c.mem_pool_host.available_size() == c.mem_pool_host.size - 384
+    state.destroy()
+    c.mem_pool_host.destroy()
+
+
+def _batch_budget_tp_worker(rank, path):
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo",
+        init_method="file://" + path,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        for covered in (True, False):
+            with pytest.MonkeyPatch.context() as patch:
+                c = stack(patch)
+                c.tp_world_size = 2
+                c.tp_group = dist.group.WORLD
+                first, second = batch_sources(c)
+                if not covered and rank == 1:
+                    c._release_kvduo_prefill_host(c._kvduo_prefill_key(second))
+                common = MagicMock(wraps=c._kvduo_host_capacity_ready)
+                patch.setattr(c, "_kvduo_host_capacity_ready", common)
+                state = c.kvduo_prefill_host_cache
+                state.backup_batch([(first, 1536), (second, 1536)])
+                assert common.call_count == (1 if covered else 2)
+                assert state.ready(first, 0, 1536) and state.ready(second, 0, 1536)
+                state.destroy()
+                c.mem_pool_host.destroy()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_batch_budget_fast_path_and_fallback_agree_across_ranks(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.start_processes(
+        _batch_budget_tp_worker,
+        args=(str(tmp_path / "batch-budget"),),
+        nprocs=2,
+        join=True,
+        start_method="spawn",
+    )
+
+
+def test_eviction_during_backup_invalidates_incremental_progress(monkeypatch):
+    c = stack(monkeypatch)
+    req = request(c)
+    prefill(c, req)
+    state = c.kvduo_prefill_host_cache
+    state.backup(req, 1024)
+    key = c._host_prefix_identity(req, 0)
+    pool = state.window.pools["swa"]
+    copy = pool.backup_from_device_all_layer
+    evicted = False
+
+    def copy_and_evict(*args):
+        nonlocal evicted
+        copy(*args)
+        if not evicted:
+            record = state.window.cache.remove(key)
+            state.window.anchor.free(torch.tensor(record.host_locations["swa"]))
+            evicted = True
+
+    monkeypatch.setattr(pool, "backup_from_device_all_layer", copy_and_evict)
+    state.backup(req, 1536)
+    assert not state.ready(req, 0, 256)
+    state.backup(req, 1536)
+    assert state.ready(req, 0, 256)
     state.destroy()
     c.mem_pool_host.destroy()

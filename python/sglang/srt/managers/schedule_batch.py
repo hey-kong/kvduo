@@ -3287,8 +3287,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req, "kvduo_swa_live_from"
                     ):
                         req.kvduo_swa_live_from = prefix_len
-            for req, completed_len in frontiers:
-                state_cache.backup(req, completed_len)
+            state_cache.backup_batch(frontiers)
         self.tree_cache.maintain_kvduo_swa(frontiers)
 
     def maybe_evict_swa(self):

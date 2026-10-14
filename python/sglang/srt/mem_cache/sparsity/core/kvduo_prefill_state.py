@@ -91,6 +91,9 @@ class KVDuoPrefillHostCache:
         self.sources = {}
         self.matches = {}
         self.clock = 0
+        self.progress = {}
+        self._upload_pending = []
+        self._upload_free = None
 
     @classmethod
     def create(cls, coordinator, ratio):
@@ -197,6 +200,15 @@ class KVDuoPrefillHostCache:
             for record in unpin:
                 record.dma_pins -= 1
         self.pending = remaining
+        pending = []
+        for event, buffer in self._upload_pending:
+            if event is not None and not event.query():
+                pending.append((event, buffer))
+            elif (
+                self._upload_free is None or buffer.numel() > self._upload_free.numel()
+            ):
+                self._upload_free = buffer
+        self._upload_pending = pending
 
     def _owner(self, req, kind):
         return (kind, self.coordinator._kvduo_prefill_key(req))
@@ -230,7 +242,89 @@ class KVDuoPrefillHostCache:
         self.backup(req, end, main_ready=True)
         return retained
 
-    def backup(self, req, completed_len, *, main_ready=False):
+    def _epochs(self):
+        return (
+            self.coordinator.host_prefix_cache.removal_epoch,
+            self.history.cache.removal_epoch,
+            self.window.cache.removal_epoch,
+        )
+
+    def backup_batch(self, frontiers):
+        c = self.coordinator
+        frame = None
+        if len(frontiers) > 1:
+            reservations = c._kvduo_prefill_host_reservations
+            covered = c.mem_pool_host.available_size() >= sum(
+                item[1] for item in reservations.values()
+            )
+            for req, end in frontiers:
+                key = c._kvduo_prefill_key(req)
+                reservation = reservations.get(key)
+                keys = (
+                    c._host_prefix_identities(req, end // self.page_size - 1)
+                    if end >= self.page_size
+                    else ()
+                )
+                missing = (
+                    sum(
+                        identity not in c.host_prefix_cache.records
+                        for identity in keys[: end // self.page_size]
+                    )
+                    * c.page_size
+                )
+                covered = (
+                    covered
+                    and reservation is not None
+                    and reservation[0] is req
+                    and reservation[1] >= missing
+                )
+            # Piggyback the proof on the first ordinary admission collective;
+            # failed proofs do not add a collective to the fallback path.
+            frame = {"local_covered": covered, "covered": False}
+        first = True
+        for req, end in frontiers:
+            self.backup(
+                req,
+                end,
+                _capacity_reserved=bool(frame and frame["covered"]),
+                _batch_capacity=frame if first else None,
+            )
+            if end >= self.page_size:
+                first = False
+
+    def _prepare_upload(self, main_host, history, window, cuda):
+        parts = [main_host]
+        for group, records in ((self.history, history), (self.window, window)):
+            name = next(iter(group.pools))
+            parts.append(
+                torch.tensor(
+                    [slot for r in (records or []) for slot in r.host_locations[name]],
+                    dtype=torch.int64,
+                )
+            )
+        sizes = [part.numel() for part in parts]
+        count = sum(sizes)
+        buffer = self._upload_free
+        self._upload_free = None
+        if buffer is None or buffer.numel() < count:
+            buffer = torch.empty(
+                count, dtype=torch.int64, device="cpu", pin_memory=cuda
+            )
+        offset = 0
+        for part, size in zip(parts, sizes):
+            buffer[offset : offset + size].copy_(part)
+            offset += size
+        return buffer, sizes
+
+    def backup(
+        self,
+        req,
+        completed_len,
+        *,
+        main_ready=False,
+        _capacity_reserved=False,
+        _batch_capacity=None,
+    ):
         """Snapshot closed KV pages before their SWA slots are recycled."""
         self.poll()
         c = self.coordinator
@@ -240,9 +334,24 @@ class KVDuoPrefillHostCache:
         self.clock += 1
         keys = c._host_prefix_identities(req, end // self.page_size - 1)
         keys = tuple(keys[: end // self.page_size])
-        full = c.req_to_token_pool.req_to_token[req.req_pool_idx, :end].to(
-            dtype=torch.int64, copy=True
-        )
+        owner = self._owner(req, "source")
+        progress = self.progress.get(id(req))
+        planned_epochs = self._epochs()
+        start = 0
+        if progress is not None:
+            saved_owner, saved_pages, saved_key, epochs = progress
+            if (
+                saved_owner == owner
+                and epochs == planned_epochs
+                and saved_pages <= len(keys)
+                and saved_pages
+                and keys[saved_pages - 1] == saved_key
+            ):
+                start = saved_pages
+        keys = keys[start:]
+        full = c.req_to_token_pool.req_to_token[
+            req.req_pool_idx, start * self.page_size : end
+        ].to(dtype=torch.int64, copy=True)
         missing = [
             i for i, key in enumerate(keys) if key not in c.host_prefix_cache.records
         ]
@@ -255,9 +364,17 @@ class KVDuoPrefillHostCache:
         prefill_key = c._kvduo_prefill_key(req)
         if main_ready and missing:
             raise RuntimeError("Finished KVDuo checkpoint has incomplete main backing")
-        if not main_ready and not c._kvduo_host_capacity_ready(
-            slots, prefill_key=prefill_key
-        ):
+        if not main_ready and not _capacity_reserved:
+            kwargs = (
+                {"_batch_capacity": _batch_capacity}
+                if _batch_capacity is not None
+                else {}
+            )
+            if not c._kvduo_host_capacity_ready(
+                slots, prefill_key=prefill_key, **kwargs
+            ):
+                return
+        if not keys:
             return
         main_host = c.mem_pool_host.alloc(slots)
         if main_host is None:
@@ -293,7 +410,7 @@ class KVDuoPrefillHostCache:
                 cache_reference=True,
                 dma_pins=1,
                 last_access=main_clock,
-                tie_break_key=(ordinal, keys[ordinal].stable_sort_digest),
+                tie_break_key=(start + ordinal, keys[ordinal].stable_sort_digest),
             )
             c.host_prefix_cache.insert(record)
             publish.append(
@@ -325,6 +442,9 @@ class KVDuoPrefillHostCache:
             (window_pages,), dtype=torch.int8, device="cpu", pin_memory=full.is_cuda
         )
         window = self.window.reserve(window_keys, self.clock)
+        upload, upload_sizes = self._prepare_upload(
+            main_host, history, window, full.is_cuda
+        )
         if full.is_cuda:
             source_ready = torch.cuda.Event()
             source_ready.record(torch.cuda.current_stream(c.device))
@@ -334,11 +454,16 @@ class KVDuoPrefillHostCache:
         done = None
         try:
             with context:
-                if full.is_cuda:
-                    c.write_staging_stream.wait_event(source_ready)
-                    for tensor in (full, main_full, compressed, swa):
-                        tensor.record_stream(c.write_staging_stream)
                 try:
+                    main_indices, history_indices, window_indices = (
+                        upload[: sum(upload_sizes)]
+                        .to(c.device, non_blocking=True)
+                        .split(upload_sizes)
+                    )
+                    if full.is_cuda:
+                        c.write_staging_stream.wait_event(source_ready)
+                        for tensor in (full, main_full, compressed, swa):
+                            tensor.record_stream(c.write_staging_stream)
                     if slots:
                         main_metadata.copy_(
                             torch.stack(
@@ -351,7 +476,7 @@ class KVDuoPrefillHostCache:
                         )
                         c.mem_pool_host.backup_from_device_all_layer(
                             c.mem_pool_device,
-                            main_host.to(c.device),
+                            main_indices,
                             c.mem_pool_device.translate_loc_from_full_to_hisparse_device(
                                 main_full
                             ),
@@ -384,8 +509,8 @@ class KVDuoPrefillHostCache:
                                 for r in records
                             ]
                         )
-                        host_locs = self._locations(
-                            group, [r.identity for r in records], c.device
+                        host_locs = (
+                            history_indices if group is self.history else window_indices
                         )
                         for pool in group.pools.values():
                             pool.backup_from_device_all_layer(
@@ -419,8 +544,16 @@ class KVDuoPrefillHostCache:
                 self.pending.append((done, publish, unpin))
         finally:
             # GPU consumers and frees follow even a partially queued snapshot.
+            self._upload_pending.append((done, upload))
             if full.is_cuda and done is not None:
                 torch.cuda.current_stream(c.device).wait_event(done)
+        if history is not None and window is not None:
+            self.progress[id(req)] = (
+                owner,
+                end // self.page_size,
+                keys[-1],
+                planned_epochs,
+            )
         self.poll()
 
     def release_match(self, req):
@@ -433,6 +566,7 @@ class KVDuoPrefillHostCache:
         req.kvduo_prefill_state_plan = None
 
     def end_request(self, req):
+        self.progress.pop(id(req), None)
         self.release_match(req)
         entry = self.sources.pop(id(req), None)
         if entry is not None:
@@ -605,12 +739,16 @@ class KVDuoPrefillHostCache:
             group.anchor.clear()
         self.coordinator.host_prefix_cache.clear()
         self.coordinator.mem_pool_host.clear()
+        self.progress.clear()
+        self._upload_free = None
 
     def destroy(self):
         for event, _, _ in self.pending:
             if event is not None:
                 event.synchronize()
         self.poll()
+        self.progress.clear()
+        self._upload_free = None
         for group in (self.history, self.window):
             for pool in group.pools.values():
                 pool.destroy()
