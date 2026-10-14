@@ -467,3 +467,93 @@ def test_host_prefix_retention_downloads_once_and_keeps_versions_touches(monkeyp
         )
         assert record.model_touches["main_kv"] == (30 + start, 31 + start)
         assert record.last_access == 77
+
+
+def local_pressure_coordinator(counts, *, ratio=1):
+    from types import MethodType
+
+    c, physical, width = make_request_reclaim_coordinator(
+        counts, ratio=ratio, policy="page"
+    )
+    c._reclaim_for_physical_allocation = MethodType(
+        HiSparseCoordinator._reclaim_for_physical_allocation, c
+    )
+    c._kvduo_decode_host_slots = lambda requests: 0
+    for req in c._active_kvduo_reqs.values():
+        req.kv_committed_len = req.kv.kv_allocated_len + (ratio - 1)
+    return c, physical, width
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_decode_prefers_own_lru_pages_over_colder_other_request(ratio, mixed):
+    c, physical, width = local_pressure_coordinator([5, 5], ratio=ratio)
+    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
+    original = mapping.clone()
+    c.full_last_touch[:width] = 0
+    for page, clock in enumerate([500, 100, 400, 300, 200]):
+        c.full_last_touch[
+            width + page * c.page_size : width + (page + 1) * c.page_size
+        ] = clock
+    if mixed:
+        c._mixed_slots[1] = True
+        c.kvduo_req_hot_capacity[:, 1] = c.hot_page_size
+    result = c.ensure_kvduo_decode_capacity([c._active_kvduo_reqs[1]])
+    assert result.action.name == "SUCCESS"
+    assert torch.equal(mapping[:width], original[:width])
+    expected = [1] if mixed else [1, 4]
+    for page in range(7):
+        slots = slice(width + page * c.page_size, width + (page + 1) * c.page_size)
+        assert torch.equal(
+            mapping[slots],
+            torch.zeros_like(mapping[slots]) if page in expected else original[slots],
+        )
+    assert physical.free_pages == len(expected)
+
+
+@pytest.mark.parametrize("blocked", ["minimum", "host", "prefix"])
+def test_decode_local_shortage_falls_back_to_global_lru(blocked):
+    c, physical, width = local_pressure_coordinator(
+        [5, 1 if blocked == "minimum" else 5]
+    )
+    req = c._active_kvduo_reqs[1]
+    if blocked == "host":
+        c.full_host_version[width:] = 0
+    elif blocked == "prefix":
+        req.cache_protected_len = req.kv.kv_allocated_len
+    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
+    original = mapping.clone()
+    result = c.ensure_kvduo_decode_capacity([req])
+    assert result.action.name == "SUCCESS"
+    assert torch.equal(mapping[width:], original[width:])
+    assert torch.all(mapping[: 2 * c.page_size] == 0)
+    assert physical.free_pages == 2
+
+
+def test_partial_local_release_recomputes_global_shortfall_with_hot_minima():
+    c, physical, width = local_pressure_coordinator([5, 2])
+    result = c._reclaim_for_physical_allocation(
+        2 * c.page_size,
+        reserve_hot_minimum=True,
+        preferred_full_requests=((1, 2 * c.page_size),),
+    )
+    assert result.action.name == "SUCCESS"
+    assert physical.free_pages == 4
+    assert c._kvduo_mandatory_hot_pages() == 2
+    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
+    assert torch.all(mapping[: 2 * c.page_size] == 0)
+    assert torch.all(mapping[width : width + 2 * c.page_size] == 0)
+
+
+def test_decode_batch_assigns_local_reclaim_only_to_allocation_owners():
+    c, physical, width = local_pressure_coordinator([5, 5, 5])
+    c._active_kvduo_reqs[0].kv_committed_len -= 1
+    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
+    original = mapping.clone()
+    result = c.ensure_kvduo_decode_capacity(list(c._active_kvduo_reqs.values()))
+    assert result.action.name == "SUCCESS"
+    assert torch.equal(mapping[:width], original[:width])
+    for owner in (1, 2):
+        assert torch.all(mapping[owner * width : owner * width + 2 * c.page_size] == 0)
+    assert physical.free_pages == 4
+    assert c._kvduo_mandatory_hot_pages() == 2
