@@ -1115,7 +1115,9 @@ class HiSparseCoordinator:
                 torch.tensor(sorted(locations), dtype=torch.int64, device=self.device)
             )
 
-    def _kvduo_host_capacity_ready(self, slots: int, *, prefill_key=None) -> bool:
+    def _kvduo_host_capacity_ready(
+        self, slots: int, *, prefill_key=None, _batch_capacity=None
+    ) -> bool:
         reserved = sum(
             reservation[1]
             for key, reservation in self._kvduo_prefill_host_reservations.items()
@@ -1123,11 +1125,18 @@ class HiSparseCoordinator:
         )
         required = slots + reserved
         self._evict_host_prefix_for_slots(required)
-        return bool(
-            self._kvduo_common_available(
-                int(self.mem_pool_host.available_size() >= required)
-            )
+        ready = int(self.mem_pool_host.available_size() >= required)
+        if _batch_capacity is None:
+            return bool(self._kvduo_common_available(ready))
+        values = torch.tensor(
+            [ready, int(_batch_capacity["local_covered"])], dtype=torch.int64
         )
+        if getattr(self, "tp_world_size", 1) > 1:
+            torch.distributed.all_reduce(
+                values, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+        _batch_capacity["covered"] = bool(values[1].item())
+        return bool(values[0].item())
 
     def _reserve_kvduo_prefill_host(self, req, key) -> bool:
         existing = self._kvduo_prefill_host_reservations.get(key)

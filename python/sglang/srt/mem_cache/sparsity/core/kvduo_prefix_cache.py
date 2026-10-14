@@ -76,6 +76,7 @@ class KVDuoHostPrefixCache:
         self.records: Dict[Hashable, HostPrefixRecord] = {}
         self._used_slots = 0
         self._access_clock = 0
+        self.removal_epoch = 0
 
     def next_clock(self) -> int:
         self._access_clock += 1
@@ -97,11 +98,13 @@ class KVDuoHostPrefixCache:
 
     def remove(self, identity: Hashable) -> HostPrefixRecord:
         record = self.records.pop(identity)
+        self.removal_epoch += 1
         self._used_slots -= record.physical_slots
         return record
 
     def clear(self) -> None:
         self.records.clear()
+        self.removal_epoch += 1
         self._used_slots = 0
         self._access_clock = 0
 
