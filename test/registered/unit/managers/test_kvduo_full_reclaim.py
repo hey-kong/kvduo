@@ -412,7 +412,7 @@ def prefix_coordinator():
     return c, req
 
 
-def test_host_prefix_attachment_batches_locations_and_reads_clock_once():
+def test_host_prefix_attachment_batches_locations_without_reading_gpu_clock():
     c, req = prefix_coordinator()
     identities = []
     for ordinal in range(3):
@@ -431,11 +431,11 @@ def test_host_prefix_attachment_batches_locations_and_reads_clock_once():
     c.full_touch_clock.__getitem__.return_value = torch.tensor(77)
     assert c._attach_cached_host_prefix(req, 8) == 4
     assert c.req_to_host_pool[0].tolist() == [20, 21, 22, 23, -1, -1, -1, -1]
-    c.full_touch_clock.__getitem__.assert_called_once_with(0)
+    c.full_touch_clock.__getitem__.assert_not_called()
     assert c._req_host_prefix_records[0] == set(identities[:2])
     for identity in identities[:2]:
         record = c.host_prefix_cache.records[identity]
-        assert record.last_access == 77
+        assert record.last_access == 1
         assert (req.rid, 0) in record.request_references
 
 

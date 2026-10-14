@@ -684,6 +684,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 cache_protected_len=cached_len,
+                kvduo_live_swa_from=getattr(req, "kvduo_swa_live_from", None),
             )
             if (
                 not req.swa_prefix_lock_released

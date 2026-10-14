@@ -16,6 +16,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
+from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache import memory_pool_host
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -139,6 +140,9 @@ def stack(monkeypatch, device="cpu"):
     c.full_host_version = torch.full_like(c.full_data_version, -1)
     c._init_kvduo_prefill_rollback_state(4)
     c._active_kvduo_reqs = {}
+    c.write_staging_stream = (
+        torch.cuda.Stream(device=device) if device == "cuda" else None
+    )
     c._reclaim_for_physical_allocation = MagicMock(
         return_value=SimpleNamespace(action=KVDuoPressureAction.SUCCESS)
     )
@@ -198,6 +202,284 @@ def complete_backup(c, req):
         if event is not None:
             event.synchronize()
     state.poll()
+
+
+def test_backup_preserves_all_prefix_windows_and_keeps_full_history(monkeypatch):
+    c = stack(monkeypatch)
+    req = request(c)
+    prefill(c, req)
+    state = c.kvduo_prefill_host_cache
+    copies = {}
+    for name, pool in {**state.history.pools, **state.window.pools}.items():
+        copies[name] = MagicMock(wraps=pool.backup_from_device_all_layer)
+        monkeypatch.setattr(pool, "backup_from_device_all_layer", copies[name])
+    complete_backup(c, req)
+    for name in state.window.pools:
+        assert copies[name].call_args.args[2].numel() == 1536
+    for name in state.history.pools:
+        assert copies[name].call_args.args[2].numel() == 1536
+    assert state.ready(req, 0, 1536)
+    assert state.ready(req, 0, 1280)
+    assert len(state.window.cache.records) == 6
+    state.destroy()
+    c.mem_pool_host.destroy()
+
+
+def test_chunks_reuse_host_swa_and_trim_hbm_before_decode_transition(monkeypatch):
+    c = stack(monkeypatch)
+    req = request(c)
+    full = prefill(c, req)
+    state = c.kvduo_prefill_host_cache
+    cache = swa_cache(c)
+    req.last_node = cache.root_node_handle()
+    req.inflight_middle_chunks = 1
+    batch = ScheduleBatch(
+        reqs=[req], tree_cache=cache, prefix_lens=[0], extend_lens=[1024]
+    )
+    batch.copy().release_kvduo_prefill_swa()
+    swa = c.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(full)
+    assert torch.all(swa[:768] == 0)
+    assert torch.all(swa[768:] > 0)
+    assert state.ready(req, 0, 512)
+    assert state.ready(req, 0, 1024)
+    copies = {}
+    for name, pool in state.window.pools.items():
+        copies[name] = MagicMock(wraps=pool.backup_from_device_all_layer)
+        monkeypatch.setattr(pool, "backup_from_device_all_layer", copies[name])
+    req.inflight_middle_chunks = 0
+    batch.prefix_lens = [1024]
+    batch.extend_lens = [512]
+    batch.copy().release_kvduo_prefill_swa()
+    for copy in copies.values():
+        assert copy.call_args.args[2].numel() == 512
+    swa = c.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(full)
+    assert torch.all(swa[:-256] == 0)
+    assert torch.all(swa[-256:] > 0)
+    assert all(state.ready(req, 0, end) for end in range(256, 1537, 256))
+    target = request(c, "shorter")
+    target.origin_input_ids = array("q", range(1025))
+    target._refresh_fill_ids()
+    target.set_extend_range(0, 1025)
+    assert host_match(c, target).host_hit_length == 1024
+    state.destroy()
+    c.mem_pool_host.destroy()
+
+
+def test_prompt_larger_than_swa_pool_completes_chunked_prefill(monkeypatch):
+    c = stack(monkeypatch)
+    req = request(c)
+    req.origin_input_ids = array("q", range(4096))
+    req._refresh_fill_ids()
+    req.set_extend_range(0, 4096)
+    req.kv_committed_len = req.kv.kv_allocated_len = 0
+    cache = swa_cache(c)
+    req.last_node = cache.root_node_handle()
+    allocator = c.token_to_kv_pool_allocator
+    logical = allocator.logical_attn_allocator
+    state = c.kvduo_prefill_host_cache
+    assert c._reserve_kvduo_prefill_host(req, c._kvduo_prefill_key(req))
+    assert allocator.swa_available_size() == 2048
+    for start in range(0, 4096, 512):
+        req.prefix_indices = c.req_to_token_pool.req_to_token[req.req_pool_idx, :start]
+        # Exercise actual scheduler budgets and allocator sizes. No HOT/FULL
+        # pressure is involved; the independent SWA pool must make progress.
+        adder = PrefillAdder(256, cache, allocator, None, 1, 8192, 512)
+        adder.add_chunked_req(req)
+        assert adder.can_run_list == [req], f"SWA admission stalled at {start}"
+        assert req.extend_range.length == 512
+        full = logical.full_attn_allocator.alloc(512)
+        swa = logical.swa_attn_allocator.alloc(512)
+        assert full is not None and swa is not None
+        logical.set_full_to_swa_mapping(full, swa)
+        compressed = c.mem_pool_device.translate_loc_from_full_to_compressed(full)
+        physical = allocator.hisparse_attn_allocator.alloc(len(compressed))
+        assert physical is not None
+        allocator.full_to_hisparse_device_index_mapping[compressed] = physical
+        c.full_data_version[compressed] = 1
+        c.req_to_token_pool.req_to_token[req.req_pool_idx, start : start + 512] = full
+        req.kv_committed_len = req.kv.kv_allocated_len = start + 512
+        req.inflight_middle_chunks = int(start + 512 < 4096)
+        batch = ScheduleBatch(
+            reqs=[req], tree_cache=cache, prefix_lens=[start], extend_lens=[512]
+        )
+        batch.copy().release_kvduo_prefill_swa()
+        assert allocator.swa_available_size() == 1792
+        assert state.ready(req, 0, start + 512)
+    assert req.kv.swa_evicted_seqlen == 3840
+    assert all(state.ready(req, 0, end) for end in range(256, 4097, 256))
+    state.destroy()
+    c.mem_pool_host.destroy()
+
+
+def test_backup_does_not_download_synchronous_gpu_metadata(monkeypatch):
+    c = stack(monkeypatch)
+    req = request(c)
+    prefill(c, req)
+    # Any Tensor.cpu() here would serialize scheduler progress on CUDA.
+    with monkeypatch.context() as checks:
+        checks.setattr(
+            torch.Tensor,
+            "cpu",
+            MagicMock(side_effect=AssertionError("blocking metadata download")),
+        )
+        complete_backup(c, req)
+    assert c.kvduo_prefill_host_cache.ready(req, 0, 1536)
+    c.kvduo_prefill_host_cache.destroy()
+    c.mem_pool_host.destroy()
+
+
+def test_aligned_repeat_reuses_previous_checkpoint_boundary(monkeypatch):
+    c = stack(monkeypatch)
+    source = request(c)
+    prefill(c, source)
+    complete_backup(c, source)
+    target = request(c, "target")
+    target.origin_input_ids = array("q", range(1536))
+    target._refresh_fill_ids()
+    target.set_extend_range(0, 1536)
+    assert host_match(c, target).host_hit_length == 1280
+    c.kvduo_prefill_host_cache.destroy()
+    c.mem_pool_host.destroy()
+
+
+def test_invalid_window_is_not_published_and_can_be_backed_up_again(monkeypatch):
+    c = stack(monkeypatch)
+    req = request(c)
+    full = prefill(c, req)
+    allocator = c.token_to_kv_pool_allocator
+    swa = allocator.translate_loc_from_full_to_swa(full[-256:]).clone()
+    allocator.logical_attn_allocator.full_to_swa_index_mapping[full[-256:]] = 0
+    complete_backup(c, req)
+    state = c.kvduo_prefill_host_cache
+    assert not state.ready(req, 0, 1536)
+    assert state.ready(req, 0, 1280)
+    assert state.window.cache.used_slots == 1280 * len(state.window.pools)
+    allocator.logical_attn_allocator.set_full_to_swa_mapping(full[-256:], swa)
+    complete_backup(c, req)
+    assert state.ready(req, 0, 1536)
+    assert state.window.cache.used_slots == 1536 * len(state.window.pools)
+    state.destroy()
+    c.mem_pool_host.destroy()
+
+
+def swa_cache(c):
+    cache = UnifiedRadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=c.req_to_token_pool,
+            token_to_kv_pool_allocator=c.token_to_kv_pool_allocator,
+            page_size=256,
+            sliding_window_size=128,
+            tree_components=(ComponentType.FULL, ComponentType.SWA),
+        )
+    )
+    cache.kvduo_coordinator = c
+    return cache
+
+
+def test_completed_chunk_frees_known_live_pages_without_gpu_unique(monkeypatch):
+    c = stack(monkeypatch)
+    req = request(c)
+    full = prefill(c, req)
+    cache = swa_cache(c)
+    req.last_node = cache.root_node_handle()
+    batch = ScheduleBatch(
+        reqs=[req], tree_cache=cache, prefix_lens=[0], extend_lens=[1536]
+    )
+    with monkeypatch.context() as checks:
+        checks.setattr(
+            torch,
+            "unique",
+            MagicMock(side_effect=AssertionError("GPU unique would synchronize")),
+        )
+        batch.copy().release_kvduo_prefill_swa()
+        cache.maintain_kvduo_swa([(req, 1536)])
+    mapping = c.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(full)
+    assert torch.all(mapping[:-256] == 0)
+    assert torch.all(mapping[-256:] > 0)
+    assert c.token_to_kv_pool_allocator.swa_available_size() == 2048 - 256
+    assert req.kv.swa_evicted_seqlen == 1280
+    assert c.kvduo_prefill_host_cache.ready(req, 0, 1280)
+    assert c.kvduo_prefill_host_cache.ready(req, 0, 1536)
+    c.kvduo_prefill_host_cache.destroy()
+    c.mem_pool_host.destroy()
+
+
+def test_restored_prefix_skips_absent_history_before_fixed_shape_swa_release(
+    monkeypatch,
+):
+    c = stack(monkeypatch)
+    source = request(c)
+    full = prefill(c, source)
+    complete_backup(c, source)
+    c.end_kvduo_prefill(source)
+    c.token_to_kv_pool_allocator.free(full)
+    target = request(c, "target")
+    result = host_match(c, target)
+    target.prefix_indices = result.device_indices
+    target.kvduo_residency_plan = result.kvduo_residency_plan
+    restored = c.init_kvduo_load_back(target, result.host_hit_length)
+    assert target.kvduo_swa_live_from == 1280
+    c.req_to_token_pool.req_to_token[target.req_pool_idx, :1536] = restored
+    cache = swa_cache(c)
+    target.last_node = cache.root_node_handle()
+    with monkeypatch.context() as checks:
+        checks.setattr(
+            torch,
+            "unique",
+            MagicMock(side_effect=AssertionError("GPU unique would synchronize")),
+        )
+        cache.maintain_kvduo_swa([(target, 1536)])
+        assert c.token_to_kv_pool_allocator.swa_available_size() == 1792
+        logical = c.token_to_kv_pool_allocator.logical_attn_allocator
+        fresh = logical.full_attn_allocator.alloc(256)
+        logical.set_full_to_swa_mapping(fresh, logical.swa_attn_allocator.alloc(256))
+        c.req_to_token_pool.req_to_token[target.req_pool_idx, 1536:1792] = fresh
+        cache.maintain_kvduo_swa([(target, 1792)])
+    assert c.token_to_kv_pool_allocator.swa_available_size() == 1792
+    assert torch.all(logical.translate_loc_from_full_to_swa(restored) == 0)
+    assert torch.all(logical.translate_loc_from_full_to_swa(fresh) > 0)
+    c.kvduo_prefill_host_cache.destroy()
+    c.mem_pool_host.destroy()
+
+
+def test_attaching_backed_prefix_does_not_read_gpu_clock(monkeypatch):
+    c = stack(monkeypatch)
+    req = request(c)
+    prefill(c, req)
+    complete_backup(c, req)
+    with monkeypatch.context() as checks:
+        checks.setattr(
+            torch.Tensor,
+            "__int__",
+            MagicMock(side_effect=AssertionError("blocking GPU clock read")),
+        )
+        assert c._attach_cached_host_prefix(req, 384) == 384
+    c.kvduo_prefill_host_cache.destroy()
+    c.mem_pool_host.destroy()
+
+
+def test_mixed_batch_does_not_mark_decode_swa_as_fresh_prefill(monkeypatch):
+    c = stack(monkeypatch)
+    req = request(c)
+    decode = request(c, "decode")
+    state = MagicMock()
+    tree = SimpleNamespace(
+        kvduo_active_swa=True,
+        kvduo_coordinator=SimpleNamespace(kvduo_prefill_host_cache=state),
+        maintain_kvduo_swa=MagicMock(),
+    )
+    batch = ScheduleBatch(
+        reqs=[req, decode],
+        tree_cache=tree,
+        prefix_lens=[0, 1535],
+        extend_lens=[1536, 1],
+        decoding_reqs=[decode],
+    )
+    batch.release_kvduo_prefill_swa()
+    assert req.kvduo_swa_live_from == 0
+    assert not hasattr(decode, "kvduo_swa_live_from")
+    state.backup.assert_called_once_with(req, 1536)
 
 
 def host_match(c, req):
@@ -472,6 +754,7 @@ def _tp_checkpoint_worker(rank, init_file, gpu_divergence):
         c = stack(patches)
         source = request(c)
         full = prefill(c, source)
+        c.kvduo_prefill_host_cache.backup(source, 1024)
         complete_backup(c, source)
         if not gpu_divergence:
             # Rank-local longest hits are 1280 and 1536, but 1280 itself is

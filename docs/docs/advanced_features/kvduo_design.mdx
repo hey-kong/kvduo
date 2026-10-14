@@ -43,9 +43,9 @@ FULL 只能在 Host 副本完整、有效且版本同步后回收。候选页排
 
 共享池之外的 logical、SWA、indexer、压缩状态及 Host 预算仍需检查。请求进入混合驻留时，首次需要 HOT 的 decode 前必须补足最低容量。
 
-KVDuo 的 SWA 只为活跃计算保留数据，不为未来前缀复用长期占用 HBM。已完成 prefill chunk 的窗口外请求自有 SWA 及时释放；decode 准入前再次清理。共享前缀的 SWA 窗口由各请求独立加锁，仍被其他请求或待执行、在途 prefill 使用的数据保持保护。清理按页对齐，保留当前窗口、必要保护区及未完成计算所需的数据。
+KVDuo 的 SWA 只为活跃计算保留数据，不为未来前缀复用长期占用 HBM。每个 prefill chunk 完成后增量备份 Host SWA，并安全释放窗口外请求自有 SWA，避免长 prompt 占满独立池而无法继续。完成 prefill、进入 decode 时同样清理请求头部的过期 SWA，后续 decode 准入前继续清理。共享前缀的 SWA 窗口由各请求独立加锁，仍被其他请求或待执行、在途 prefill 使用的数据保持保护。清理按页对齐，保留当前窗口、必要保护区及未完成计算所需的数据。
 
-请求结束后释放无人使用的 HBM SWA，保留有效的 Host 前缀副本。DeepSeek-V4 在完成 prefill chunk、清理 SWA 前，备份完整页的 C4、indexer、C128 历史，以及 SWA 和相关 C4 压缩状态；decode 结束前也保存最后一个可用边界，复用已有主 KV Host 后备。Host 历史池与窗口池容量有上限，窗口池按 `host_to_device_ratio` 配置，淘汰未被请求或搬运引用的旧记录；因此会增加 Host 内存和备份开销。
+请求结束后释放无人使用的 HBM SWA，保留有效的 Host 前缀副本。DeepSeek-V4 在完成 prefill chunk、清理 SWA 前，备份完整页的 C4、indexer、C128 历史，以及 SWA 和相关 C4 压缩状态；decode 结束前也保存最后一个可用边界，复用已有主 KV Host 后备。Host 历史池与窗口池容量有上限，窗口池按 `host_to_device_ratio` 配置，淘汰未被请求或搬运引用的旧记录；因此会增加 Host 内存和备份开销。Host SWA 和相关状态保留各有效页对齐前缀边界，后续 chunk 复用已有备份，只搬运缺失记录。Host 容量不足时仍按缓存规则淘汰，不能无限保留。备份及有效性元数据异步传回 Host，完成事件确认后才发布，源页释放按 GPU 事件排序。
 
 前缀复用只选择各 TP rank 都具备完整、有效副本的页对齐边界：恢复缺失的历史数据及边界前的 SWA 窗口和压缩状态，然后继续 prefill。只分配恢复窗口所需的 HBM SWA，不恢复整段历史 SWA。C128 请求状态按 HiCache 的页对齐规则重新开始。副本缺失、过期或尚未完成搬运时缩短命中；没有有效边界才从头计算。取消、请求结束和槽位复用释放相关引用，缓存清空同时清理 Host 副本。纯 HiSparse 路径保持原行为。
 

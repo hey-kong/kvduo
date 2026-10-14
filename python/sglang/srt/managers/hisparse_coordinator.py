@@ -75,6 +75,7 @@ from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import (
     finish_kvduo_prefix_restore,
     plan_kvduo_prefix_restore,
 )
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import get_device_module, is_hip
 from sglang.srt.utils.common import get_num_new_pages, is_pin_memory_available
 
@@ -1053,6 +1054,8 @@ class HiSparseCoordinator:
             )
             if state_cache is not None:
                 state_cache.load(req, restored)
+                if get_spec().speculative_algorithm is None:
+                    req.kvduo_swa_live_from = target_len - swa_tail_len
             req.kvduo_shared_prefix_len = prefix_len
             req.kvduo_restored_prefix_len = target_len
             return restored
@@ -1206,7 +1209,7 @@ class HiSparseCoordinator:
             self.req_to_host_pool[req.req_pool_idx, :attached] = torch.tensor(
                 locations, dtype=torch.int64, device=self.device
             )
-            clock = int(self.full_touch_clock[0])
+            clock = self.host_prefix_cache.next_clock()
             for identity in records:
                 self.host_prefix_cache.acquire(identity, owner, clock)
                 self._req_host_prefix_records[req.req_pool_idx].add(identity)

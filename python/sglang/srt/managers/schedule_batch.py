@@ -1628,6 +1628,8 @@ class Req(ReqDllmMixin):
         self.cache_protected_len = 0
         if hasattr(self, "kvduo_shared_prefix_len"):
             del self.kvduo_shared_prefix_len
+        if hasattr(self, "kvduo_swa_live_from"):
+            del self.kvduo_swa_live_from
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
@@ -3278,6 +3280,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.tree_cache.kvduo_coordinator, "kvduo_prefill_host_cache", None
         )
         if state_cache is not None:
+            if get_spec().speculative_algorithm is None:
+                prefill_reqs = {id(req) for req, _ in frontiers}
+                for req, prefix_len in zip(self.reqs, self.prefix_lens):
+                    if id(req) in prefill_reqs and not hasattr(
+                        req, "kvduo_swa_live_from"
+                    ):
+                        req.kvduo_swa_live_from = prefix_len
             for req, completed_len in frontiers:
                 state_cache.backup(req, completed_len)
         self.tree_cache.maintain_kvduo_swa(frontiers)
