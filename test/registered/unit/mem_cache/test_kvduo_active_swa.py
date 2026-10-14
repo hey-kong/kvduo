@@ -316,9 +316,9 @@ def test_result_handler_cleans_completed_prefill_after_copy_done(middle_chunk, o
     SchedulerBatchResultProcessor.process_batch_result_prefill(processor, batch, result)
     result.copy_done.synchronize.assert_called_once()
     if middle_chunk:
-        assert req.kv.swa_evicted_seqlen == 0
-        assert allocator.swa_available_size() == 8
-        assert torch.all(mapped(allocator, slots) > 0)
+        assert req.kv.swa_evicted_seqlen == 20
+        assert allocator.swa_available_size() == 28
+        assert torch.all(mapped(allocator, slots[20:]) > 0)
     else:
         assert req.finished()
         assert req.kv is None

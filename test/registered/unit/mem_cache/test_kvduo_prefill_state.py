@@ -16,6 +16,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
+from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache import memory_pool_host
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -224,7 +225,7 @@ def test_backup_preserves_all_prefix_windows_and_keeps_full_history(monkeypatch)
     c.mem_pool_host.destroy()
 
 
-def test_chunks_reuse_host_swa_and_trim_hbm_only_at_decode_transition(monkeypatch):
+def test_chunks_reuse_host_swa_and_trim_hbm_before_decode_transition(monkeypatch):
     c = stack(monkeypatch)
     req = request(c)
     full = prefill(c, req)
@@ -236,9 +237,9 @@ def test_chunks_reuse_host_swa_and_trim_hbm_only_at_decode_transition(monkeypatc
         reqs=[req], tree_cache=cache, prefix_lens=[0], extend_lens=[1024]
     )
     batch.copy().release_kvduo_prefill_swa()
-    assert torch.all(
-        c.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(full) > 0
-    )
+    swa = c.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(full)
+    assert torch.all(swa[:768] == 0)
+    assert torch.all(swa[768:] > 0)
     assert state.ready(req, 0, 512)
     assert state.ready(req, 0, 1024)
     copies = {}
@@ -260,6 +261,52 @@ def test_chunks_reuse_host_swa_and_trim_hbm_only_at_decode_transition(monkeypatc
     target._refresh_fill_ids()
     target.set_extend_range(0, 1025)
     assert host_match(c, target).host_hit_length == 1024
+    state.destroy()
+    c.mem_pool_host.destroy()
+
+
+def test_prompt_larger_than_swa_pool_completes_chunked_prefill(monkeypatch):
+    c = stack(monkeypatch)
+    req = request(c)
+    req.origin_input_ids = array("q", range(4096))
+    req._refresh_fill_ids()
+    req.set_extend_range(0, 4096)
+    req.kv_committed_len = req.kv.kv_allocated_len = 0
+    cache = swa_cache(c)
+    req.last_node = cache.root_node_handle()
+    allocator = c.token_to_kv_pool_allocator
+    logical = allocator.logical_attn_allocator
+    state = c.kvduo_prefill_host_cache
+    assert c._reserve_kvduo_prefill_host(req, c._kvduo_prefill_key(req))
+    assert allocator.swa_available_size() == 2048
+    for start in range(0, 4096, 512):
+        req.prefix_indices = c.req_to_token_pool.req_to_token[req.req_pool_idx, :start]
+        # Exercise actual scheduler budgets and allocator sizes. No HOT/FULL
+        # pressure is involved; the independent SWA pool must make progress.
+        adder = PrefillAdder(256, cache, allocator, None, 1, 8192, 512)
+        adder.add_chunked_req(req)
+        assert adder.can_run_list == [req], f"SWA admission stalled at {start}"
+        assert req.extend_range.length == 512
+        full = logical.full_attn_allocator.alloc(512)
+        swa = logical.swa_attn_allocator.alloc(512)
+        assert full is not None and swa is not None
+        logical.set_full_to_swa_mapping(full, swa)
+        compressed = c.mem_pool_device.translate_loc_from_full_to_compressed(full)
+        physical = allocator.hisparse_attn_allocator.alloc(len(compressed))
+        assert physical is not None
+        allocator.full_to_hisparse_device_index_mapping[compressed] = physical
+        c.full_data_version[compressed] = 1
+        c.req_to_token_pool.req_to_token[req.req_pool_idx, start : start + 512] = full
+        req.kv_committed_len = req.kv.kv_allocated_len = start + 512
+        req.inflight_middle_chunks = int(start + 512 < 4096)
+        batch = ScheduleBatch(
+            reqs=[req], tree_cache=cache, prefix_lens=[start], extend_lens=[512]
+        )
+        batch.copy().release_kvduo_prefill_swa()
+        assert allocator.swa_available_size() == 1792
+        assert state.ready(req, 0, start + 512)
+    assert req.kv.swa_evicted_seqlen == 3840
+    assert all(state.ready(req, 0, end) for end in range(256, 4097, 256))
     state.destroy()
     c.mem_pool_host.destroy()
 
