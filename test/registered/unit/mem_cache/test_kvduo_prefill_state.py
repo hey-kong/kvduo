@@ -1062,3 +1062,70 @@ def test_eviction_during_backup_invalidates_incremental_progress(monkeypatch):
     assert state.ready(req, 0, 256)
     state.destroy()
     c.mem_pool_host.destroy()
+
+
+def test_detached_prefix_restores_from_host_and_releases_once(monkeypatch):
+    from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+
+    c = stack(monkeypatch)
+    allocator = c.token_to_kv_pool_allocator
+    cache = UnifiedRadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=c.req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=256,
+            sliding_window_size=128,
+            tree_components=(ComponentType.FULL, ComponentType.SWA),
+        )
+    )
+    cache.kvduo_coordinator = c
+    source = request(c)
+    source.last_node = cache.root_node_handle()
+    prefill(c, source)
+    complete_backup(c, source)
+    slots = c.req_to_token_pool.req_to_token[source.req_pool_idx, :1536].long()
+    key = RadixKey(source.get_fill_ids()[:1536])
+    cache.insert(InsertParams(key=key, value=slots))
+    match = cache._match_prefix_without_kvduo(MatchPrefixParams(key=key))
+    source.last_node = match.last_device_node
+    source.prefix_indices = match.device_indices
+    source.cache_protected_len = 1536
+    lock = cache.inc_lock_ref(source.last_node)
+    source.swa_uuid_for_lock = lock.swa_uuid_for_lock
+    source.skip_lock_node_ids = lock.skip_lock_node_ids
+    physical = allocator.hisparse_attn_allocator
+    free = physical.available_size()
+    length = cache.kvduo_reclaimable_prefix(source)
+    assert length == 1536
+    cache.detach_kvduo_prefix(source, length)
+    assert physical.available_size() == free
+    assert source.cache_protected_len == 0
+    target = request(c, "target")
+    target.init_next_round_input(cache)
+    assert len(target.prefix_indices) == 0
+    assert target.host_hit_length == 1536
+    restored = c.init_kvduo_load_back(target, target.host_hit_length)
+    assert not torch.isin(restored, slots).any()
+    c.req_to_token_pool.req_to_token[target.req_pool_idx, :1536] = restored
+    target.prefix_indices = restored
+    target.cache_protected_len = 1536
+    target.last_node = cache.root_node_handle()
+    release_kv_cache(source, cache)
+    assert torch.all(
+        allocator.full_to_hisparse_device_index_mapping[
+            c.mem_pool_device.translate_loc_from_full_to_compressed(restored)
+        ]
+        > 0
+    )
+    release_kv_cache(target, cache)
+    assert physical.available_size() == 1024
+    assert allocator.logical_attn_allocator.full_available_size() == 8192
+    assert allocator.swa_available_size() == 2048
+    c.kvduo_prefill_host_cache.poll()
+    assert c.kvduo_prefill_host_cache.window.cache.records
+    assert all(not r.pinned for r in c.host_prefix_cache.records.values())
+    cache.reset()
+    c.kvduo_prefill_host_cache.destroy()
+    c.mem_pool_host.destroy()

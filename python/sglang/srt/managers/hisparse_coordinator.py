@@ -4532,6 +4532,27 @@ class HiSparseCoordinator:
                 self.decode_producer_stream
             )
         self.wait_for_pending_backup()
+        tree_cache = getattr(self, "kvduo_tree_cache", None)
+        plan_prefix = getattr(tree_cache, "kvduo_reclaimable_prefix", None)
+        if (
+            callable(plan_prefix)
+            and getattr(self, "_kvduo_pressure_protected", None) is None
+        ):
+            transfers = []
+            for req_idx, req in sorted(self._active_kvduo_reqs.items()):
+                if request_indices is not None and req_idx not in request_indices:
+                    continue
+                if getattr(req, "hisparse_staging", False) or (
+                    callable(getattr(req, "finished", None)) and req.finished()
+                ):
+                    continue
+                length = plan_prefix(req)
+                if length:
+                    transfers.append((req_idx, length))
+            if not self._kvduo_consensus(tuple(transfers)):
+                return 0
+            for req_idx, length in transfers:
+                tree_cache.detach_kvduo_prefix(self._active_kvduo_reqs[req_idx], length)
         candidate_pages = []
         candidate_meta = []
         for req_idx, req in sorted(self._active_kvduo_reqs.items()):

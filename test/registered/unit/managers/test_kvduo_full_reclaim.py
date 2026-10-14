@@ -557,3 +557,55 @@ def test_decode_batch_assigns_local_reclaim_only_to_allocation_owners():
         assert torch.all(mapping[owner * width : owner * width + 2 * c.page_size] == 0)
     assert physical.free_pages == 4
     assert c._kvduo_mandatory_hot_pages() == 2
+
+
+@pytest.mark.parametrize("protection", ["none", "shared", "prefill", "tp"])
+def test_full_reclaim_transfers_exclusive_radix_prefix_before_demotion(protection):
+    from array import array
+    from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+
+    c, physical, width = local_pressure_coordinator([5, 5])
+    allocator = c.token_to_kv_pool_allocator
+    allocator.device = "cpu"
+    allocator.free_segment = MagicMock()
+    cache = RadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=c.req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=c.page_size,
+        )
+    )
+    req = c._active_kvduo_reqs[1]
+    values = c.req_to_token_pool.req_to_token[1, : req.kv.kv_allocated_len].long()
+    key = RadixKey(array("q", range(len(values))))
+    cache.insert(InsertParams(key=key, value=values))
+    match = cache.match_prefix(MatchPrefixParams(key=key))
+    req.last_node = match.last_device_node
+    req.prefix_indices = match.device_indices
+    req.cache_protected_len = len(values)
+    cache.inc_lock_ref(req.last_node)
+    if protection == "shared":
+        cache.inc_lock_ref(req.last_node)
+    elif protection == "prefill":
+        c._kvduo_pressure_protected = torch.empty(0, dtype=torch.int64)
+    elif protection == "tp":
+        c._kvduo_consensus = MagicMock(return_value=False)
+    c.kvduo_tree_cache = cache
+    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
+    original = mapping.clone()
+    result = c.ensure_kvduo_decode_capacity([req])
+    assert (result.action.name == "SUCCESS") is (protection != "tp")
+    match = cache.match_prefix(MatchPrefixParams(key=key))
+    if protection != "none":
+        assert torch.equal(mapping[width:], original[width:])
+        assert len(match.device_indices) == len(values)
+        assert req.last_node.lock_ref == (2 if protection == "shared" else 1)
+    else:
+        assert req.cache_protected_len == 0
+        assert len(match.device_indices) == 0
+        assert torch.all(mapping[width : width + 2 * c.page_size] == 0)
+        assert torch.equal(mapping[:width], original[:width])
+        allocator.free_segment.assert_not_called()

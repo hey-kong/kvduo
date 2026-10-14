@@ -811,6 +811,82 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.release_kvduo_cached_swa()
 
+    def kvduo_reclaimable_prefix(self, req):
+        if self.disable or self.cache_controller is not None or req.last_node is None:
+            return 0
+        if any(
+            ct not in (ComponentType.FULL, ComponentType.SWA)
+            for ct in self.tree_components
+        ):
+            return 0
+        node = self.tree_core.node_by_id(req.last_node)
+        child, length = None, 0
+        while node is not self.tree_core.root_node:
+            full = node.component_data[ComponentType.FULL]
+            if (
+                full.lock_ref != 1
+                or node.id in req.skip_lock_node_ids.get(ComponentType.FULL, ())
+                or full.value is None
+                or node.write_through_pending_id is not None
+                or (
+                    ComponentType.SWA in self.tree_components
+                    and node.component_data[ComponentType.SWA].lock_ref > 0
+                    and (
+                        req.swa_prefix_lock_released
+                        or node.id in req.skip_lock_node_ids.get(ComponentType.SWA, ())
+                    )
+                )
+                or list(node.children.values()) != ([] if child is None else [child])
+                or any(
+                    cd.host_value is not None
+                    or cd.host_lock_ref
+                    or cd.session_ref
+                    or cd.lock_ref > 1
+                    for cd in node.component_data
+                )
+            ):
+                break
+            length += len(node.key)
+            child, node = node, node.parent
+        return length
+
+    def detach_kvduo_prefix(self, req, length):
+        if length <= 0 or length != self.kvduo_reclaimable_prefix(req):
+            raise RuntimeError("KVDuo prefix ownership changed")
+        node = self.tree_core.node_by_id(req.last_node)
+        self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+        remaining = length
+        while remaining:
+            parent = node.parent
+            remaining -= len(node.key)
+            result = self.tree_core.evict_device_leaf(node.id, False)
+            # Transfer device allocations to the request instead of freeing them.
+            assert not any(result.host_frees.values()) and result.backup_kv is None
+            result.device_frees.clear()
+            result.host_frees.clear()
+            node = parent
+        lock = self.inc_lock_ref(
+            node.id,
+            skip_lock_components=(
+                (ComponentType.SWA,) if req.swa_prefix_lock_released else ()
+            ),
+        )
+        req.last_node = node.id
+        req.swa_uuid_for_lock = lock.swa_uuid_for_lock
+        req.skip_lock_node_ids = lock.skip_lock_node_ids
+        retained = 0
+        ancestor = node
+        while ancestor is not self.tree_core.root_node:
+            retained += len(ancestor.key)
+            ancestor = ancestor.parent
+        req.cache_protected_len = retained
+        req.last_host_node = req.best_match_node = node.id
+        if hasattr(req, "kvduo_shared_prefix_len"):
+            req.kvduo_shared_prefix_len = min(
+                req.kvduo_shared_prefix_len, req.cache_protected_len
+            )
+        req.prefix_indices = req.prefix_indices[: req.cache_protected_len]
+
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
