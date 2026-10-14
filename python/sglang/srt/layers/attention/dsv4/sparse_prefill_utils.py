@@ -433,6 +433,7 @@ class SparsePrefillChunkCache:
         self,
         page_table: torch.Tensor,
         c4_page_size: int,
+        full_to_device: Optional[torch.Tensor] = None,
     ) -> None:
         """Populate c4-side fields from the per-query page table.
 
@@ -462,7 +463,13 @@ class SparsePrefillChunkCache:
         c4_token_ids_2d = (
             per_req_page_table.index_select(1, block_idx) * c4_page_size + in_page
         ).to(torch.int32)
-        flat_c4_ids = c4_token_ids_2d.reshape(-1).clamp_min(0)
+        if full_to_device is not None:
+            # Padding in shorter requests is not a logical allocation. Mask it
+            # before indexing the mapping, then gather from physical C4 storage.
+            valid = k_arange[None, :] < (self.seq_lens[:, None] // 4)
+            logical_ids = torch.where(valid, c4_token_ids_2d, 0).long()
+            c4_token_ids_2d = torch.where(valid, full_to_device[logical_ids], 0)
+        flat_c4_ids = c4_token_ids_2d.reshape(-1).clamp_min(0).to(torch.int32)
         total_compressed = self.num_reqs * c4_max
         compressed_base = (
             torch.arange(self.num_reqs, dtype=torch.int32, device=device) * c4_max
