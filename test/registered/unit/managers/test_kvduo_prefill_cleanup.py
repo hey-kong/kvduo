@@ -56,6 +56,8 @@ def cleanup_stack(*, rollback=False, ratio=1):
         token_to_kv_pool_allocator=SimpleNamespace(page_size=2 * ratio),
         supports_mamba=lambda: False,
         cache_finished_req=MagicMock(),
+        evictable_size=lambda: 0,
+        evict=MagicMock(),
     )
     return c, pool, cache
 

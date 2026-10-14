@@ -13,7 +13,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from test_kvduo_generic_dsa import make_stack
 from test_kvduo_pressure_admission import make_full_coordinator
 
-
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
@@ -194,3 +193,59 @@ def test_real_allocator_finish_and_radix_release_decode_pages_exactly_once(
     assert not torch.any(
         allocator.full_to_hisparse_device_index_mapping[indices[retained:]]
     )
+
+
+@pytest.mark.parametrize("prefill", [63, 64, 65, 128])
+def test_complete_generic_finish_releases_prefill_and_decode_hbm(monkeypatch, prefill):
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.common import release_kv_cache
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+    c, pool, allocator = make_stack(monkeypatch)
+    c._active_kvduo_reqs.clear()
+    c._mixed_slots = [False, False]
+    physical = allocator.hisparse_attn_allocator
+    logical = allocator.logical_attn_allocator
+    physical.debug_mode = logical.debug_mode = True
+    indices = logical.alloc(192)[:129]
+    locations = physical.alloc(192)[:129]
+    allocator.full_to_hisparse_device_index_mapping[indices] = locations
+    c.req_to_token_pool.req_to_token[0, :129] = indices.to(torch.int32)
+    c.req_to_token_pool.free = MagicMock()
+    req = SimpleNamespace(
+        req_pool_idx=0,
+        cache_protected_len=0,
+        hisparse_staging=False,
+        kv=SimpleNamespace(kv_allocated_len=prefill),
+        extend_range=Range(0, prefill),
+        origin_input_ids=list(range(prefill)),
+        output_ids=list(range(prefill, 129)),
+        extra_key=None,
+        last_node=None,
+        kv_committed_len=129,
+        effective_kv_committed_len=lambda: 129,
+    )
+    c.alloc_device_buffer(req)
+    req.kv.kv_allocated_len = 129
+    c.mem_pool_host.allocated_host_indices = lambda *args: torch.empty(
+        0, dtype=torch.int64
+    )
+    c._retain_request_host_prefix = MagicMock(return_value=set())
+    c._release_host_prefix_refs = MagicMock()
+    c.request_finished(req)
+    cache = RadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=c.req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=pool.page_size,
+        )
+    )
+    cache.kvduo_coordinator = c
+    release_kv_cache(req, cache)
+    assert physical.available_size() == pool.size
+    assert logical.available_size() == logical.size
+    assert cache.evictable_size() == 0
+    assert not torch.any(allocator.full_to_hisparse_device_index_mapping[indices])
+    assert physical.free_pages.unique().numel() == physical.free_pages.numel()

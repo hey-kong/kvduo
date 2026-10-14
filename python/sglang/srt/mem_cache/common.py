@@ -183,6 +183,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         kv_len_to_handle=effective_kv_committed_len,
     )
 
+    if getattr(coordinator, "enable_mixed_residency", False) is True:
+        reclaimable = tree_cache.evictable_size()
+        if reclaimable > 0:
+            tree_cache.evict(EvictParams(num_tokens=reclaimable))
+
     # StreamingSession.cache_finished_req handles speculative tail trim
     # internally, then sets req_pool_idx = None.
     assert (req.req_pool_idx is None) == (req.kv is None)

@@ -829,7 +829,7 @@ def test_finished_prefill_keeps_host_checkpoint_and_frees_hbm_swa(
     release_kv_cache(source, cache)
     assert source.req_pool_idx is None
     assert c.token_to_kv_pool_allocator.swa_available_size() == 2048
-    assert cache.full_evictable_size() == 1536
+    assert cache.full_evictable_size() == 0
     target = request(c, "target")
     target.init_next_round_input(cache)
     assert len(target.prefix_indices) == 0
@@ -843,7 +843,7 @@ def test_finished_prefill_keeps_host_checkpoint_and_frees_hbm_swa(
     assert c.token_to_kv_pool_allocator.swa_available_size() == 2048
     assert (
         c.token_to_kv_pool_allocator.logical_attn_allocator.full_available_size()
-        == 8192 - 1536
+        == 8192
     )
     state = c.kvduo_prefill_host_cache
     state.poll()
