@@ -3289,7 +3289,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.kvduo_swa_live_from = prefix_len
             for req, completed_len in frontiers:
                 state_cache.backup(req, completed_len)
-        self.tree_cache.maintain_kvduo_swa(frontiers)
+        decode_frontiers = [
+            (req, completed_len)
+            for req, completed_len in frontiers
+            if req.inflight_middle_chunks <= 0
+        ]
+        if decode_frontiers:
+            self.tree_cache.maintain_kvduo_swa(decode_frontiers)
 
     def maybe_evict_swa(self):
         if getattr(self.tree_cache, "kvduo_active_swa", False) is True:

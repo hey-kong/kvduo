@@ -203,7 +203,7 @@ def complete_backup(c, req):
     state.poll()
 
 
-def test_backup_copies_only_checkpoint_windows_and_keeps_full_history(monkeypatch):
+def test_backup_preserves_all_prefix_windows_and_keeps_full_history(monkeypatch):
     c = stack(monkeypatch)
     req = request(c)
     prefill(c, req)
@@ -214,12 +214,52 @@ def test_backup_copies_only_checkpoint_windows_and_keeps_full_history(monkeypatc
         monkeypatch.setattr(pool, "backup_from_device_all_layer", copies[name])
     complete_backup(c, req)
     for name in state.window.pools:
-        assert copies[name].call_args.args[2].numel() == 512
+        assert copies[name].call_args.args[2].numel() == 1536
     for name in state.history.pools:
         assert copies[name].call_args.args[2].numel() == 1536
     assert state.ready(req, 0, 1536)
     assert state.ready(req, 0, 1280)
-    assert len(state.window.cache.records) == 2
+    assert len(state.window.cache.records) == 6
+    state.destroy()
+    c.mem_pool_host.destroy()
+
+
+def test_chunks_reuse_host_swa_and_trim_hbm_only_at_decode_transition(monkeypatch):
+    c = stack(monkeypatch)
+    req = request(c)
+    full = prefill(c, req)
+    state = c.kvduo_prefill_host_cache
+    cache = swa_cache(c)
+    req.last_node = cache.root_node_handle()
+    req.inflight_middle_chunks = 1
+    batch = ScheduleBatch(
+        reqs=[req], tree_cache=cache, prefix_lens=[0], extend_lens=[1024]
+    )
+    batch.copy().release_kvduo_prefill_swa()
+    assert torch.all(
+        c.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(full) > 0
+    )
+    assert state.ready(req, 0, 512)
+    assert state.ready(req, 0, 1024)
+    copies = {}
+    for name, pool in state.window.pools.items():
+        copies[name] = MagicMock(wraps=pool.backup_from_device_all_layer)
+        monkeypatch.setattr(pool, "backup_from_device_all_layer", copies[name])
+    req.inflight_middle_chunks = 0
+    batch.prefix_lens = [1024]
+    batch.extend_lens = [512]
+    batch.copy().release_kvduo_prefill_swa()
+    for copy in copies.values():
+        assert copy.call_args.args[2].numel() == 512
+    swa = c.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(full)
+    assert torch.all(swa[:-256] == 0)
+    assert torch.all(swa[-256:] > 0)
+    assert all(state.ready(req, 0, end) for end in range(256, 1537, 256))
+    target = request(c, "shorter")
+    target.origin_input_ids = array("q", range(1025))
+    target._refresh_fill_ids()
+    target.set_extend_range(0, 1025)
+    assert host_match(c, target).host_hit_length == 1024
     state.destroy()
     c.mem_pool_host.destroy()
 
@@ -266,11 +306,11 @@ def test_invalid_window_is_not_published_and_can_be_backed_up_again(monkeypatch)
     state = c.kvduo_prefill_host_cache
     assert not state.ready(req, 0, 1536)
     assert state.ready(req, 0, 1280)
-    assert state.window.cache.used_slots == 256 * len(state.window.pools)
+    assert state.window.cache.used_slots == 1280 * len(state.window.pools)
     allocator.logical_attn_allocator.set_full_to_swa_mapping(full[-256:], swa)
     complete_backup(c, req)
     assert state.ready(req, 0, 1536)
-    assert state.window.cache.used_slots == 512 * len(state.window.pools)
+    assert state.window.cache.used_slots == 1536 * len(state.window.pools)
     state.destroy()
     c.mem_pool_host.destroy()
 
@@ -760,7 +800,7 @@ def test_finished_prefill_keeps_host_checkpoint_and_frees_hbm_swa(
     )
     state = c.kvduo_prefill_host_cache
     state.poll()
-    assert len(state.window.cache.records) == 2
+    assert len(state.window.cache.records) == 6
     assert all(not r.pinned for r in c.host_prefix_cache.records.values())
     assert all(
         not r.pinned

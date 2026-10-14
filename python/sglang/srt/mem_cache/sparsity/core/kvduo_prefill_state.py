@@ -313,14 +313,9 @@ class KVDuoPrefillHostCache:
         history = self.history.reserve(keys, self.clock)
         if history is not None:
             self._hold_source(req, self.history.cache, keys)
-        # Keep the two newest resumable boundaries, rather than all historical
-        # SWA in this chunk. The preceding boundary also covers an exact-length
-        # repeat, whose final input token must be recomputed for sampling.
-        window_pages = min(
-            len(keys),
-            self.window.anchor.size // self.page_size,
-            self.window_tokens // self.page_size + 1,
-        )
+        # Retain every available prefix boundary within the bounded Host pool.
+        # reserve() copies only missing records, so later chunks reuse backups.
+        window_pages = min(len(keys), self.window.anchor.size // self.page_size)
         window_start = len(keys) - window_pages
         window_keys = keys[window_start:] if window_pages else ()
         swa = c.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
