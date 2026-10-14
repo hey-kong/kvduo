@@ -4534,25 +4534,11 @@ class HiSparseCoordinator:
         self.wait_for_pending_backup()
         tree_cache = getattr(self, "kvduo_tree_cache", None)
         plan_prefix = getattr(tree_cache, "kvduo_reclaimable_prefix", None)
-        if (
+        can_transfer = (
             callable(plan_prefix)
             and getattr(self, "_kvduo_pressure_protected", None) is None
-        ):
-            transfers = []
-            for req_idx, req in sorted(self._active_kvduo_reqs.items()):
-                if request_indices is not None and req_idx not in request_indices:
-                    continue
-                if getattr(req, "hisparse_staging", False) or (
-                    callable(getattr(req, "finished", None)) and req.finished()
-                ):
-                    continue
-                length = plan_prefix(req)
-                if length:
-                    transfers.append((req_idx, length))
-            if not self._kvduo_consensus(tuple(transfers)):
-                return 0
-            for req_idx, length in transfers:
-                tree_cache.detach_kvduo_prefix(self._active_kvduo_reqs[req_idx], length)
+        )
+        prefix_transfers = {}
         candidate_pages = []
         candidate_meta = []
         for req_idx, req in sorted(self._active_kvduo_reqs.items()):
@@ -4562,15 +4548,20 @@ class HiSparseCoordinator:
                 callable(getattr(req, "finished", None)) and req.finished()
             ):
                 continue
+            protected_len = req.cache_protected_len
+            if can_transfer:
+                length = plan_prefix(req)
+                if length:
+                    tree_len = tree_cache.kvduo_prefix_length(req)
+                    protected_len = tree_len - length
+                    prefix_transfers[req_idx] = (length, tree_len)
             allocated_len = req.kv.kv_allocated_len
             compressed = self.mem_pool_device.translate_loc_from_full_to_compressed(
                 self.req_to_token_pool.req_to_token[req_idx, :allocated_len]
             )
             prefix_len = len(
                 self.mem_pool_device.translate_loc_from_full_to_compressed(
-                    self.req_to_token_pool.req_to_token[
-                        req_idx, : req.cache_protected_len
-                    ]
+                    self.req_to_token_pool.req_to_token[req_idx, :protected_len]
                 )
             )
             num_pages = (len(compressed) + self.page_size - 1) // self.page_size
@@ -4668,6 +4659,16 @@ class HiSparseCoordinator:
         for i in selected:
             req_idx, start = candidate_meta[i]
             first_holes[req_idx] = min(first_holes.get(req_idx, start), start)
+        transfers = tuple(
+            (req_idx, prefix_transfers[req_idx][0])
+            for req_idx, start in sorted(first_holes.items())
+            if req_idx in prefix_transfers
+            and start * self.compress_ratio < prefix_transfers[req_idx][1]
+        )
+        if can_transfer and not self._kvduo_consensus(transfers):
+            return 0
+        for req_idx, length in transfers:
+            tree_cache.detach_kvduo_prefix(self._active_kvduo_reqs[req_idx], length)
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
             selected_logical.flatten()
         ] = 0

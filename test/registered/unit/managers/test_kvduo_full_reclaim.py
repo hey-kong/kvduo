@@ -609,3 +609,58 @@ def test_full_reclaim_transfers_exclusive_radix_prefix_before_demotion(protectio
         assert torch.all(mapping[width : width + 2 * c.page_size] == 0)
         assert torch.equal(mapping[:width], original[:width])
         allocator.free_segment.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "blocked", ["tail", "host", "minimum", "unselected", "owned_suffix"]
+)
+def test_full_reclaim_does_not_detach_unused_prefix(blocked):
+    from array import array
+    from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+
+    c, physical, width = local_pressure_coordinator([5, 5])
+    allocator = c.token_to_kv_pool_allocator
+    allocator.device = "cpu"
+    allocator.free_segment = MagicMock()
+    cache = RadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=c.req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=c.page_size,
+        )
+    )
+    req = c._active_kvduo_reqs[1]
+    values = c.req_to_token_pool.req_to_token[1, : req.kv.kv_allocated_len].long()
+    if blocked == "owned_suffix":
+        values = values[: c.page_size]
+    key = RadixKey(array("q", range(len(values))))
+    cache.insert(InsertParams(key=key, value=values))
+    match = cache.match_prefix(MatchPrefixParams(key=key))
+    req.last_node = match.last_device_node
+    req.prefix_indices = match.device_indices
+    req.cache_protected_len = len(values)
+    cache.inc_lock_ref(req.last_node)
+    c.kvduo_tree_cache = cache
+    if blocked == "tail":
+        c.tail_protected_pages = 7
+    elif blocked == "host":
+        c.full_host_version.zero_()
+    elif blocked == "minimum":
+        c.min_hot_pages = 8
+    elif blocked == "owned_suffix":
+        c.full_last_touch[width : width + c.page_size] = 999999
+    reclaimed = c.reclaim_kvduo_full_pages(
+        c.page_size,
+        reserve_hot_minimum=True,
+        request_indices=None if blocked == "unselected" else {1},
+    )
+    assert (reclaimed > 0) == (blocked in ("unselected", "owned_suffix"))
+    match = cache.match_prefix(MatchPrefixParams(key=key))
+    assert len(match.device_indices) == len(values)
+    assert req.cache_protected_len == (
+        c.page_size if blocked == "owned_suffix" else len(values)
+    )
+    allocator.free_segment.assert_not_called()

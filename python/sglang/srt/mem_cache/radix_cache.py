@@ -519,6 +519,14 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             child, node = node, node.parent
         return length
 
+    def kvduo_prefix_length(self, req):
+        node = req.last_node
+        length = 0
+        while node is not self.root_node:
+            length += len(node.key)
+            node = node.parent
+        return length
+
     def detach_kvduo_prefix(self, req, length):
         if length <= 0 or length != self.kvduo_reclaimable_prefix(req):
             raise RuntimeError("KVDuo prefix ownership changed")

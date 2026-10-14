@@ -850,6 +850,14 @@ class UnifiedRadixCache(BasePrefixCache):
             child, node = node, node.parent
         return length
 
+    def kvduo_prefix_length(self, req):
+        node = self.tree_core.node_by_id(req.last_node)
+        length = 0
+        while node is not self.tree_core.root_node:
+            length += len(node.key)
+            node = node.parent
+        return length
+
     def detach_kvduo_prefix(self, req, length):
         if length <= 0 or length != self.kvduo_reclaimable_prefix(req):
             raise RuntimeError("KVDuo prefix ownership changed")
@@ -879,6 +887,17 @@ class UnifiedRadixCache(BasePrefixCache):
         while ancestor is not self.tree_core.root_node:
             retained += len(ancestor.key)
             ancestor = ancestor.parent
+        if req.kv is not None and self.is_swa_enabled:
+            # Transferred tree slots and previously trimmed ranges may have holes.
+            req.kvduo_swa_sparse_until = max(
+                getattr(req, "kvduo_swa_sparse_until", 0),
+                req.kv.swa_evicted_seqlen,
+                getattr(req, "kvduo_swa_live_from", None) or 0,
+                retained + length,
+            )
+            req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, retained)
+            if getattr(req, "kvduo_swa_live_from", None) is not None:
+                req.kvduo_swa_live_from = min(req.kvduo_swa_live_from, retained)
         req.cache_protected_len = retained
         req.last_host_node = req.best_match_node = node.id
         if hasattr(req, "kvduo_shared_prefix_len"):
