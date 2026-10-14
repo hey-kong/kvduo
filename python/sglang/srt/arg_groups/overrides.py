@@ -297,6 +297,18 @@ def collect_model_override_declarations(
             declared = _invoke_provider(fn, server_args, hf_config)
             if declared:
                 declarations.append((fn.__qualname__, dict(declared)))
+    if getattr(server_args, "enable_kvduo", False):
+        from sglang.srt.server_args import ServerArgs
+
+        if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+            ratio = ServerArgs.swa_full_tokens_ratio
+            for _, declared in declarations:
+                ratio = declared.get("swa_full_tokens_ratio", ratio)
+            ratio *= 0.5
+            declarations.append(("kvduo_swa_default", {"swa_full_tokens_ratio": ratio}))
+            logger.info(
+                f"Setting KVDuo swa_full_tokens_ratio to {ratio} for {architecture}."
+            )
     return declarations
 
 
