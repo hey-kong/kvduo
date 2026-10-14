@@ -27,9 +27,9 @@ Prefill 生成 FULL KV，支持前缀复用。Decode 依次查找 FULL/tail、�
 
 FULL 只能在 Host 副本完整、有效且版本同步后回收。候选页排除 Radix 前缀及共享引用保护、最新 tail、未写满页，以及使用、分配或传输中的页。Tail 默认保护最新 2 页。
 
-默认按请求批量回收：优先选择合格 FULL 页数减去尚需新增最低 HOT 页数后净收益最大的请求，同分优先最早进入 decode 的请求，再按请求槽位排序。一次释放选中请求的全部合格页，净空间够用即停止；GPU 汇总和选择，不按页访问时间排序。
+设置 `full_reclaim_policy="request"` 可按请求批量回收：优先选择合格 FULL 页数减去尚需新增最低 HOT 页数后净收益最大的请求，同分优先最早进入 decode 的请求，再按请求槽位排序。一次释放选中请求的全部合格页，净空间够用即停止；GPU 汇总和选择，不按页访问时间排序。
 
-设置 `full_reclaim_policy="page"` 可使用逐页策略：跨活跃请求按 FULL 页内最近条目访问时间排序，最久未访问的页优先；同分按请求槽位、页偏移排序，空间够用即停止。两种策略均保留上述保护，只清除 GPU 完整映射，被驱逐页中的热点不主动搬入 HOT。
+默认使用 `full_reclaim_policy="page"` 逐页策略：跨活跃请求按 FULL 页内最近条目访问时间排序，最久未访问的页优先；同分按请求槽位、页偏移排序，空间够用即停止。两种策略均保留上述保护，只清除 GPU 完整映射，被驱逐页中的热点不主动搬入 HOT。
 
 该配置控制常规 FULL 压力回收；设计点 3 指定请求的驻留转换仍释放其全部合格页。
 
@@ -188,7 +188,7 @@ python3 -m sglang.launch_server \
 | `host_to_device_ratio` | `2` | Host pool 相对 device pool 的容量比例 |
 | `swap_in_block_size` | `960` | Resolver CUDA block 线程数，须为 32 的倍数且不超过设备上限，通常为 32–1024 |
 | `tail_protected_pages` | `2` | 每请求保护的最新 FULL 页数 |
-| `full_reclaim_policy` | `"request"` | `"request"` 按请求批量释放全部合格 FULL 页；`"page"` 按页 LRU 回收 |
+| `full_reclaim_policy` | `"page"` | `"request"` 按请求批量释放全部合格 FULL 页；`"page"` 按页 LRU 回收 |
 | `max_relative_miss_increase` | `0.10` | 普通缩容、对象回退及累计预算共用的预计 miss 相对增幅容忍比例 |
 | `decode_emergency_reclaim` | `false` | 开启后，必需 decode 的普通回收失败时允许 HOT 应急缩至最低容量，优先避免整请求回退 |
 

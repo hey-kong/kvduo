@@ -9,7 +9,7 @@ class TestKVDuoConfig(unittest.TestCase):
         config = parse_kvduo_config(SimpleNamespace(kvduo_config=None))
         self.assertEqual(config, KVDuoConfig())
         self.assertEqual(config.tail_protected_pages, 2)
-        self.assertEqual(config.full_reclaim_policy, "request")
+        self.assertEqual(config.full_reclaim_policy, "page")
         self.assertFalse(config.decode_emergency_reclaim)
 
     def test_decode_emergency_reclaim_requires_boolean(self):
