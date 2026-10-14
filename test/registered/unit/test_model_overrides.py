@@ -827,28 +827,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 "swa_full_tokens_ratio": 0.1,
             },
         )
-        for mode in (
-            {"enable_kvduo": True},
-            {"enable_kvduo": True, "enable_hisparse": True},
-        ):
-            with self.subTest(mode=mode):
-                self.assertEqual(
-                    _deepseek_v4_overrides(_args(**mode), hf)["swa_full_tokens_ratio"],
-                    0.05,
-                )
-                for ratio in (0.05, 0.1, 0.2):
-                    self.assertNotIn(
-                        "swa_full_tokens_ratio",
-                        _deepseek_v4_overrides(
-                            _args(**mode, swa_full_tokens_ratio=ratio), hf
-                        ),
-                    )
-        for mode in ({"enable_hisparse": True}, {"enable_hierarchical_cache": True}):
-            with self.subTest(mode=mode):
-                self.assertEqual(
-                    _deepseek_v4_overrides(_args(**mode), hf)["swa_full_tokens_ratio"],
-                    0.1,
-                )
         # NPU pool geometry
         self.assertEqual(
             _deepseek_v4_overrides(_args(device="npu"), hf)["page_size"], 128
@@ -868,6 +846,49 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )["moe_runner_backend"],
             "flashinfer_trtllm_routed",
         )
+
+    def test_kvduo_halves_effective_model_swa_default(self):
+        from sglang.srt.server_args import ServerArgs
+
+        for arch, baseline in (("NoSuchArch", 0.8), ("DeepseekV4ForCausalLM", 0.1)):
+            hf = SimpleNamespace(architectures=[arch])
+            for kvduo, hisparse in (
+                (False, False),
+                (False, True),
+                (True, False),
+                (True, True),
+            ):
+                for supplied in (ServerArgs.swa_full_tokens_ratio, 0.1, 0.2):
+                    with self.subTest(
+                        arch=arch, kvduo=kvduo, hisparse=hisparse, supplied=supplied
+                    ):
+                        args = SimpleNamespace(
+                            device="cuda",
+                            swa_full_tokens_ratio=supplied,
+                            enable_kvduo=kvduo,
+                            enable_hisparse=hisparse,
+                            moe_runner_backend="auto",
+                            get_model_config=lambda: SimpleNamespace(
+                                nvfp4_moe_meta=None
+                            ),
+                        )
+                        declarations = collect_model_override_declarations(
+                            arch, args, hf
+                        )
+                        effective = supplied
+                        for _, declared in declarations:
+                            effective = declared.get("swa_full_tokens_ratio", effective)
+                        expected = (
+                            baseline * (0.5 if kvduo else 1)
+                            if supplied == ServerArgs.swa_full_tokens_ratio
+                            else supplied
+                        )
+                        self.assertEqual(effective, expected)
+                        self.assertEqual(args.swa_full_tokens_ratio, supplied)
+                        self.assertEqual(
+                            collect_model_override_declarations(arch, args, hf),
+                            declarations,
+                        )
 
     def test_deepseek_v4_sm120_moe_pass(self):
         from sglang.srt.arg_groups.overrides import (
