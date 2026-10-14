@@ -558,3 +558,119 @@ def test_finish_releases_idle_hbm_and_preserves_active_prefix(kvduo, shared):
         allocator.full_attn_allocator.free_pages.unique().numel()
         == allocator.full_attn_allocator.free_pages.numel()
     )
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_transfer_radix_prefix_keeps_allocations_and_shared_locks(shared):
+    cache, allocator, _ = make_cache()
+    slots = alloc(allocator, 12)
+    match = insert(cache, slots, range(12))
+    req = make_req(cache, range(12), slots=slots, match=match)
+    other = (
+        make_req(cache, range(12), slots=slots, match=match, rid="other")
+        if shared
+        else None
+    )
+    free = allocator.available_size()
+    length = cache.kvduo_reclaimable_prefix(req)
+    if shared:
+        assert length == 0
+        return
+    assert length == 12
+    cache.detach_kvduo_prefix(req, length)
+    assert req.cache_protected_len == 0
+    assert allocator.available_size() == free
+    assert torch.all(mapped(allocator, slots) > 0)
+    match = cache._match_prefix_without_kvduo(
+        MatchPrefixParams(key=RadixKey(array("q", range(12))))
+    )
+    assert len(match.device_indices) == 0
+    assert cache.full_evictable_size() == 0
+    cache.cache_finished_req(req, kv_len_to_handle=12, is_insert=False)
+    assert allocator.full_attn_allocator.available_size() == 64
+    assert allocator.swa_attn_allocator.available_size() == 32
+
+
+def test_transfer_stops_at_shared_radix_ancestor():
+    cache, allocator, _ = make_cache()
+    slots = alloc(allocator, 12)
+    insert(cache, slots, range(12))
+    short = cache._match_prefix_without_kvduo(
+        MatchPrefixParams(key=RadixKey(array("q", range(4))))
+    )
+    other = make_req(cache, range(4), slots=slots[:4], match=short, rid="other")
+    match = cache._match_prefix_without_kvduo(
+        MatchPrefixParams(key=RadixKey(array("q", range(12))))
+    )
+    req = make_req(cache, range(12), slots=slots, match=match)
+    length = cache.kvduo_reclaimable_prefix(req)
+    assert length == 8
+    cache.detach_kvduo_prefix(req, length)
+    assert req.cache_protected_len == 4
+    assert (
+        cache.tree_core.node_by_id(other.last_node)
+        .component_data[ComponentType.FULL]
+        .lock_ref
+        == 2
+    )
+    match = cache._match_prefix_without_kvduo(
+        MatchPrefixParams(key=RadixKey(array("q", range(12))))
+    )
+    assert len(match.device_indices) == 4
+    cache.cache_finished_req(req, kv_len_to_handle=12, is_insert=False)
+    assert allocator.full_attn_allocator.available_size() == 60
+    assert torch.all(mapped(allocator, slots[:4]) > 0)
+
+
+@pytest.mark.parametrize("live_from", [None, 12])
+@pytest.mark.parametrize("trimmed_suffix", [False, True])
+def test_detach_rewinds_swa_cleanup_across_empty_mappings(live_from, trimmed_suffix):
+    from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+
+    cache, allocator, pool = make_cache()
+    slots = alloc(allocator, 20)
+    match = insert(cache, slots[:12], range(12))
+    req = make_req(cache, range(20), slots=slots, match=match)
+    allocator.free_swa(slots[:8])
+    req.kv.swa_evicted_seqlen = 16 if trimmed_suffix else 12
+    if trimmed_suffix:
+        allocator.free_swa(slots[12:16])
+    if live_from is not None:
+        req.kvduo_swa_live_from = live_from
+
+    def free_live(indices, *, start_pos):
+        assert torch.all(mapped(allocator, indices) > 0)
+        allocator.free_swa(indices)
+
+    allocator.free_kvduo_live_swa_segment = MagicMock(side_effect=free_live)
+    cache.detach_kvduo_prefix(req, cache.kvduo_reclaimable_prefix(req))
+    assert req.kv.swa_evicted_seqlen == 0
+    free_swa_out_of_window_slots(
+        req,
+        16,
+        sliding_window_size=4,
+        page_size=4,
+        req_to_token_pool=pool,
+        token_to_kv_pool_allocator=allocator,
+        kvduo_live_swa_from=getattr(req, "kvduo_swa_live_from", None),
+    )
+    free_swa_out_of_window_slots(
+        req,
+        20,
+        sliding_window_size=4,
+        page_size=4,
+        req_to_token_pool=pool,
+        token_to_kv_pool_allocator=allocator,
+        kvduo_live_swa_from=getattr(req, "kvduo_swa_live_from", None),
+    )
+    assert torch.all(mapped(allocator, slots[:16]) == 0)
+    assert torch.all(mapped(allocator, slots[16:]) > 0)
+    assert allocator.swa_available_size() == 28
+    assert (
+        allocator.swa_attn_allocator.free_pages.unique().numel()
+        == allocator.swa_attn_allocator.free_pages.numel()
+    )
+    assert allocator.free_kvduo_live_swa_segment.call_count == int(
+        live_from is not None and not trimmed_suffix
+    )
+    assert req.kv.swa_evicted_seqlen == 16

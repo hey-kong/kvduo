@@ -504,6 +504,51 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
+    def kvduo_reclaimable_prefix(self, req):
+        if self.disable or req.last_node is None:
+            return 0
+        node, child, length = req.last_node, None, 0
+        while node is not self.root_node:
+            if (
+                node.lock_ref != 1
+                or node.evicted
+                or list(node.children.values()) != ([] if child is None else [child])
+            ):
+                break
+            length += len(node.key)
+            child, node = node, node.parent
+        return length
+
+    def kvduo_prefix_length(self, req):
+        node = req.last_node
+        length = 0
+        while node is not self.root_node:
+            length += len(node.key)
+            node = node.parent
+        return length
+
+    def detach_kvduo_prefix(self, req, length):
+        if length <= 0 or length != self.kvduo_reclaimable_prefix(req):
+            raise RuntimeError("KVDuo prefix ownership changed")
+        node, remaining = req.last_node, length
+        self.dec_lock_ref(node)
+        while remaining:
+            parent = node.parent
+            remaining -= len(node.key)
+            self._record_remove_event(node)
+            self._delete_leaf(node)
+            node = parent
+        self.inc_lock_ref(node)
+        req.last_node = node
+        retained = 0
+        ancestor = node
+        while ancestor is not self.root_node:
+            retained += len(ancestor.key)
+            ancestor = ancestor.parent
+        req.cache_protected_len = retained
+        req.last_host_node = req.best_match_node = node
+        req.prefix_indices = req.prefix_indices[: req.cache_protected_len]
+
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:

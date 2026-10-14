@@ -1457,6 +1457,7 @@ class HiSparseCoordinator:
         allow_hot_reclaim: bool = True,
         hot_minimum_credit: int = 0,
         allow_emergency_hot_reclaim: bool = False,
+        preferred_full_requests=(),
     ) -> KVDuoPressureResult:
         """Reclaim physical KV pages while protecting pending allocations.
 
@@ -1561,10 +1562,25 @@ class HiSparseCoordinator:
                 shortfall_bytes + self._physical_page_bytes() - 1
             ) // self._physical_page_bytes()
             if reserve_hot_minimum:
-                reclaimed_slots = self.reclaim_kvduo_full_pages(
-                    pages * self.page_size, reserve_hot_minimum=True
-                )
+                reclaimed_slots = 0
                 remaining = max(0, need_size + minimum_slots - available_slots())
+                if self.full_reclaim_policy == "page":
+                    for req_idx, demand in preferred_full_requests:
+                        if remaining <= 0:
+                            break
+                        reclaimed_slots += self.reclaim_kvduo_full_pages(
+                            min(remaining, demand),
+                            reserve_hot_minimum=True,
+                            request_indices={req_idx},
+                        )
+                        remaining = max(
+                            0, need_size + minimum_slots - available_slots()
+                        )
+                if remaining > 0:
+                    reclaimed_slots += self.reclaim_kvduo_full_pages(
+                        remaining, reserve_hot_minimum=True
+                    )
+                    remaining = max(0, need_size + minimum_slots - available_slots())
             else:
                 reclaimed_slots = self.reclaim_kvduo_full_pages(pages * self.page_size)
                 remaining = pages * self.page_size - reclaimed_slots
@@ -1653,6 +1669,7 @@ class HiSparseCoordinator:
         if not self.enable_mixed_residency:
             return self._reclaim_for_physical_allocation(0)
         pages = 0
+        preferred = {}
         if self.is_dsv4_hisparse:
             page = self.page_size
             for req in requests:
@@ -1660,12 +1677,31 @@ class HiSparseCoordinator:
                 if next_len % self.compress_ratio != 0:
                     continue
                 compressed_len = next_len // self.compress_ratio
-                pages += int((compressed_len - 1) % page == 0)
+                if (compressed_len - 1) % page == 0:
+                    pages += 1
+                    preferred[req.req_pool_idx] = self.page_size
         else:
             logical_page = self.token_to_kv_pool_allocator.page_size
-            pages = sum(
-                int(req.kv_committed_len % logical_page == 0) for req in requests
+            for req in requests:
+                if req.kv_committed_len % logical_page == 0:
+                    pages += 1
+                    preferred[req.req_pool_idx] = self.page_size
+        for req_idx in sorted(self._kvduo_pending_hot_minimum):
+            if req_idx not in self._active_kvduo_reqs:
+                continue
+            missing = sum(
+                max(
+                    0,
+                    self.min_hot_pages
+                    - int(self.kvduo_req_hot_capacity[layer, req_idx])
+                    // self.hot_page_size,
+                )
+                for layer in range(self.mem_pool_device.layer_num)
             )
+            if missing:
+                preferred[req_idx] = (
+                    preferred.get(req_idx, 0) + missing * self.page_size
+                )
         host_slots = self._kvduo_decode_host_slots(requests)
         required_host_slots = host_slots + sum(
             reservation[1]
@@ -1699,6 +1735,7 @@ class HiSparseCoordinator:
         return self._reclaim_for_physical_allocation(
             pages * self.page_size,
             reserve_hot_minimum=True,
+            preferred_full_requests=tuple(sorted(preferred.items())),
             allow_emergency_hot_reclaim=(
                 self.decode_emergency_reclaim and pages + minimum_pages > 0
             ),
@@ -4495,6 +4532,13 @@ class HiSparseCoordinator:
                 self.decode_producer_stream
             )
         self.wait_for_pending_backup()
+        tree_cache = getattr(self, "kvduo_tree_cache", None)
+        plan_prefix = getattr(tree_cache, "kvduo_reclaimable_prefix", None)
+        can_transfer = (
+            callable(plan_prefix)
+            and getattr(self, "_kvduo_pressure_protected", None) is None
+        )
+        prefix_transfers = {}
         candidate_pages = []
         candidate_meta = []
         for req_idx, req in sorted(self._active_kvduo_reqs.items()):
@@ -4504,15 +4548,20 @@ class HiSparseCoordinator:
                 callable(getattr(req, "finished", None)) and req.finished()
             ):
                 continue
+            protected_len = req.cache_protected_len
+            if can_transfer:
+                length = plan_prefix(req)
+                if length:
+                    tree_len = tree_cache.kvduo_prefix_length(req)
+                    protected_len = tree_len - length
+                    prefix_transfers[req_idx] = (length, tree_len)
             allocated_len = req.kv.kv_allocated_len
             compressed = self.mem_pool_device.translate_loc_from_full_to_compressed(
                 self.req_to_token_pool.req_to_token[req_idx, :allocated_len]
             )
             prefix_len = len(
                 self.mem_pool_device.translate_loc_from_full_to_compressed(
-                    self.req_to_token_pool.req_to_token[
-                        req_idx, : req.cache_protected_len
-                    ]
+                    self.req_to_token_pool.req_to_token[req_idx, :protected_len]
                 )
             )
             num_pages = (len(compressed) + self.page_size - 1) // self.page_size
@@ -4610,6 +4659,16 @@ class HiSparseCoordinator:
         for i in selected:
             req_idx, start = candidate_meta[i]
             first_holes[req_idx] = min(first_holes.get(req_idx, start), start)
+        transfers = tuple(
+            (req_idx, prefix_transfers[req_idx][0])
+            for req_idx, start in sorted(first_holes.items())
+            if req_idx in prefix_transfers
+            and start * self.compress_ratio < prefix_transfers[req_idx][1]
+        )
+        if can_transfer and not self._kvduo_consensus(transfers):
+            return 0
+        for req_idx, length in transfers:
+            tree_cache.detach_kvduo_prefix(self._active_kvduo_reqs[req_idx], length)
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
             selected_logical.flatten()
         ] = 0

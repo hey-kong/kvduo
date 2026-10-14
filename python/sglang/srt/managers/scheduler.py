@@ -1115,6 +1115,7 @@ class Scheduler(
             # host residency matching and synchronous prefill restore through
             # its existing match/init_load_back extension points.
             self.tree_cache.kvduo_coordinator = self.hisparse_coordinator
+            self.hisparse_coordinator.kvduo_tree_cache = self.tree_cache
 
     def init_running_status(self):
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
