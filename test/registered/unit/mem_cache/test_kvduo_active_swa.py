@@ -523,3 +523,38 @@ def test_non_kvduo_retains_original_swa_policy():
     cache.release_kvduo_cached_swa()
     assert allocator.swa_available_size() == 16
     assert torch.all(mapped(allocator, slots) > 0)
+
+
+@pytest.mark.parametrize("kvduo", [False, True])
+@pytest.mark.parametrize("shared", [False, True])
+def test_finish_releases_idle_hbm_and_preserves_active_prefix(kvduo, shared):
+    from sglang.srt.mem_cache.common import release_kv_cache
+
+    cache, allocator, _ = make_cache(kvduo=kvduo)
+    cache.kvduo_coordinator.end_kvduo_prefill = MagicMock()
+    full_before = allocator.full_attn_allocator.available_size()
+    swa_before = allocator.swa_attn_allocator.available_size()
+    slots = alloc(allocator, 8)
+    match = insert(cache, slots, range(8))
+    req = make_req(cache, range(8), slots=slots, match=match)
+    other = (
+        make_req(cache, range(8), slots=slots, match=match, rid="other")
+        if shared
+        else None
+    )
+    release_kv_cache(req, cache)
+    retained = 8 if shared or not kvduo else 0
+    assert allocator.full_attn_allocator.available_size() == full_before - retained
+    assert allocator.swa_attn_allocator.available_size() == swa_before - (
+        4 if kvduo and shared else retained
+    )
+    if other is not None:
+        assert torch.all(mapped(allocator, slots[-4:]) > 0)
+        release_kv_cache(other, cache)
+        retained = 0 if kvduo else 8
+        assert allocator.full_attn_allocator.available_size() == full_before - retained
+        assert allocator.swa_attn_allocator.available_size() == swa_before - retained
+    assert (
+        allocator.full_attn_allocator.free_pages.unique().numel()
+        == allocator.full_attn_allocator.free_pages.numel()
+    )
