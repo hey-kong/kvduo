@@ -558,6 +558,20 @@ class HiSparseCoordinator:
                     self.req_device_buffer_tokens[0, 0], self.lru_slots[0, 0]
                 )
 
+    def warmup_reclamation(self) -> None:
+        if not self.enable_mixed_residency or not self.req_device_buffer_tokens.is_cuda:
+            return
+        from sglang.kernels.ops.kvcache.kvduo_warmup import warmup_kvduo_reclaim
+
+        warmup_kvduo_reclaim(
+            backing=self.mem_pool_device.get_flat_key_buffer(),
+            page_size=self.page_size,
+            storage_layers=self.hot_storage_layers,
+            maximum=self.device_buffer_size,
+            padded=self.req_device_buffer_tokens.size(-1),
+            paged=self.is_dsv4_hisparse,
+        )
+
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
