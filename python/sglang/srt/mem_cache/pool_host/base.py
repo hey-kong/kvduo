@@ -96,6 +96,7 @@ class HostKVCache(abc.ABC):
         dcp_rank: int = 0,
         *,
         pool_label: str = "kv",
+        num_host_pages: Optional[int] = None,
     ):
         self.device_pool = device_pool
         self.pool_label = pool_label
@@ -123,7 +124,13 @@ class HostKVCache(abc.ABC):
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align up the host memory pool size to the page size
-        self.page_num = self.size // self.page_size + 1
+        self.page_num = (
+            self.size // self.page_size + 1
+            if num_host_pages is None
+            else num_host_pages
+        )
+        if self.page_num <= 0:
+            raise ValueError("Host pool must contain at least one page")
         self.size = self.page_num * self.page_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer

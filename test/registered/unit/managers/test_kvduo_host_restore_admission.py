@@ -39,8 +39,8 @@ def restore_setup(*, dsv4, requests=1, cache_type=RadixCache, extra=2):
     for name in ("full_generation", "full_data_version", "full_last_touch"):
         setattr(c, name, torch.zeros(2048, dtype=torch.int64))
     c.full_host_version = torch.full((2048,), -1, dtype=torch.int64)
-    c.host_prefix_cache = KVDuoHostPrefixCache(8)
-    c.mem_pool_host = make_host_pool(8, c.page_size)
+    c.host_prefix_cache = KVDuoHostPrefixCache(16)
+    c.mem_pool_host = make_host_pool(16, c.page_size)
     c.mem_pool_host.load_to_device_per_layer = MagicMock()
     cached_locations = tuple(c.mem_pool_host.alloc(c.page_size).tolist())
     c.mem_pool_device.translate_loc_from_full_to_compressed = (

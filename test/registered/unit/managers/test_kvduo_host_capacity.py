@@ -387,3 +387,74 @@ def test_host_readiness_and_zero_private_slots_reach_consensus_across_tp_ranks(
         join=True,
         start_method="spawn",
     )
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_single_prompt_larger_than_host_aborts_without_reservation_or_eviction(ratio):
+    c, physical = ready_coordinator()
+    c.compress_ratio = ratio
+    c.is_dsv4_hisparse = ratio == 4
+    physical.size = 16 * c.page_size
+    physical.free_pages = 16
+    host_inventory(c, 4 * c.page_size)
+    req = prompt(8 * c.page_size * ratio)
+    req.set_finish_with_abort = MagicMock()
+    c._host_prefix_identities = MagicMock()
+    c._kvduo_host_capacity_ready = MagicMock()
+    assert c.reserve_kvduo_prefill(1, prefill_req=req) is None
+    req.set_finish_with_abort.assert_called_once()
+    assert "total Host main-KV capacity" in req.set_finish_with_abort.call_args.args[0]
+    c._host_prefix_identities.assert_not_called()
+    c._kvduo_host_capacity_ready.assert_not_called()
+    assert not c._kvduo_prefill_reservations
+    assert not c._kvduo_prefill_host_reservations
+    assert not c._kvduo_prefill_future_pages
+
+
+def test_temporary_host_occupancy_waits_then_admits():
+    c, physical = ready_coordinator()
+    physical.free_pages = 16
+    pool = host_inventory(c, 8 * c.page_size)
+    occupied = pool.alloc(6 * c.page_size)
+    req = prompt(4 * c.page_size)
+    req.set_finish_with_abort = MagicMock()
+    assert c.reserve_kvduo_prefill(1, prefill_req=req) is None
+    req.set_finish_with_abort.assert_not_called()
+    pool.free(occupied)
+    token = c.reserve_kvduo_prefill(1, prefill_req=req)
+    assert token is not None
+    req.set_finish_with_abort.assert_not_called()
+    c.finish_kvduo_prefill_reservation(token, cancelled=True)
+
+
+def test_host_oversized_request_retries_as_abort_stub():
+    from array import array
+    from unittest.mock import patch
+    from sglang.srt.managers.schedule_batch import Req, FINISH_ABORT
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    c, physical = ready_coordinator()
+    physical.size = 16 * c.page_size
+    physical.free_pages = 16
+    host_inventory(c, 4 * c.page_size)
+    req = Req(
+        "host-oversized",
+        "",
+        array("q", range(8 * c.page_size)),
+        SamplingParams(max_new_tokens=1),
+        vocab_size=128,
+    )
+    req._refresh_fill_ids()
+    with patch(
+        "sglang.srt.managers.schedule_batch.get_parallel",
+        return_value=SimpleNamespace(tp_rank=0),
+    ):
+        assert c.reserve_kvduo_prefill(1, prefill_req=req) is None
+    assert isinstance(req.to_finish, FINISH_ABORT)
+    req._refresh_fill_ids()
+    assert len(req.full_untruncated_fill_ids) == 1
+    token = c.reserve_kvduo_prefill(1, prefill_req=req)
+    assert token is not None
+    c.finish_kvduo_prefill_reservation(token, cancelled=True)
+    assert not c._kvduo_prefill_host_reservations
+    assert not c._kvduo_prefill_future_pages

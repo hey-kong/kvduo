@@ -175,6 +175,7 @@ class HiSparseCoordinator:
         max_relative_miss_increase: float = 0.10,
         full_reclaim_policy: str = "request",
         decode_emergency_reclaim: bool = False,
+        kvduo_host_size: float | None = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -203,6 +204,9 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
+        host_budget = None
+        if self.enable_mixed_residency and kvduo_host_size is None:
+            kvduo_host_size = 0
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
@@ -211,6 +215,15 @@ class HiSparseCoordinator:
                 + page_size
                 - 1
             ) // page_size
+            if self.enable_mixed_residency:
+                from sglang.srt.mem_cache.sparsity.core.kvduo_host_budget import (
+                    plan_dsv4_host_budget,
+                )
+
+                host_budget = plan_dsv4_host_budget(
+                    token_to_kv_pool_allocator, kvduo_host_size
+                )
+                num_host_pages = host_budget.full_pages
             self.mem_pool_host = DeepSeekV4PagedHostPool(
                 pool_name="dsv4_hisparse_c4",
                 device_buffers=self.mem_pool_device.kv_buffer,
@@ -230,6 +243,26 @@ class HiSparseCoordinator:
             self.mem_pool_device: HiSparseDSATokenToKVPool = (
                 self.token_to_kv_pool_allocator.get_kvcache()
             )
+            host_kwargs = {}
+            if self.enable_mixed_residency:
+                from sglang.srt.mem_cache.sparsity.core.kvduo_host_budget import (
+                    plan_host_budget,
+                )
+
+                pool = self.mem_pool_device
+                host_budget = plan_host_budget(
+                    kvduo_host_size,
+                    pool.size // pool.page_size,
+                    0,
+                    {
+                        "kv": pool.page_size
+                        * pool.kv_cache_dim
+                        * pool.store_dtype.itemsize
+                        * pool.layer_num
+                    },
+                    {},
+                )
+                host_kwargs["num_host_pages"] = host_budget.full_pages
             self.mem_pool_host = MLATokenToKVPoolHost(
                 device_pool=self.mem_pool_device,
                 host_to_device_ratio=host_to_device_ratio,
@@ -237,8 +270,20 @@ class HiSparseCoordinator:
                 page_size=self.mem_pool_device.page_size,
                 layout="layer_first",
                 override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+                **host_kwargs,
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
+        if host_budget is not None:
+            logger.info(
+                "KVDuo Host KV payload per rank: host_size=%s GB, budget_bytes=%d, "
+                "allocated_bytes=%d, full_pages=%d, swa_pages=%d, pools=%s",
+                kvduo_host_size,
+                host_budget.budget_bytes,
+                host_budget.allocated_bytes,
+                host_budget.full_pages,
+                host_budget.swa_pages,
+                host_budget.pool_bytes,
+            )
         self.page_size = self.mem_pool_device.page_size
         if self.enable_mixed_residency:
             # A KVDuo physical page is the same page number across every KV
@@ -497,7 +542,7 @@ class HiSparseCoordinator:
                 )
 
                 self.kvduo_prefill_host_cache = KVDuoPrefillHostCache.create(
-                    self, host_to_device_ratio
+                    self, num_swa_pages=host_budget.swa_pages
                 )
             # Decode allocation is owned by the token allocator, but pressure
             # policy belongs here.  The callback runs immediately before a
@@ -1138,6 +1183,13 @@ class HiSparseCoordinator:
         fill_ids = req.full_untruncated_fill_ids
         length = len(fill_ids) // self.compress_ratio
         capacity = (length + self.page_size - 1) // self.page_size * self.page_size
+        if capacity > self.mem_pool_host.size:
+            req.set_finish_with_abort(
+                "KVDuo prompt exceeds total Host main-KV capacity "
+                f"(required={capacity}, capacity={self.mem_pool_host.size} slots); "
+                "reduce the prompt length or increase kvduo host_size"
+            )
+            return False
         records = []
         owner = ("kvduo-prefill", key)
         try:

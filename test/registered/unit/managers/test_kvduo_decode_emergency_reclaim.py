@@ -54,7 +54,7 @@ def pressure_batch(enabled, *, pages=4):
         (None, False),
         ("{}", False),
         (
-            '{"top_k":512,"host_to_device_ratio":2,"swap_in_block_size":960}',
+            '{"top_k":512,"host_size":0,"swap_in_block_size":960}',
             False,
         ),
         ('{"decode_emergency_reclaim":false}', False),

@@ -52,7 +52,7 @@ Prefill 生成 FULL KV，支持前缀复用。Decode 依次查找 FULL/tail、�
 
 KVDuo 的 SWA 只为活跃计算保留数据，不为未来前缀复用长期占用 HBM。每个 prefill chunk 完成后增量备份 Host SWA，并安全释放窗口外请求自有 SWA，避免长 prompt 占满独立池而无法继续。完成 prefill、进入 decode 时同样清理请求头部的过期 SWA，后续 decode 准入前继续清理。共享前缀的 SWA 窗口由各请求独立加锁，仍被其他请求或待执行、在途 prefill 使用的数据保持保护。清理按页对齐，保留当前窗口、必要保护区及未完成计算所需的数据。
 
-请求结束后释放无人使用的 HBM SWA，保留有效的 Host 前缀副本。DeepSeek-V4 在完成 prefill chunk、清理 SWA 前，备份完整页的 C4、indexer、C128 历史，以及 SWA 和相关 C4 压缩状态；decode 结束前也保存最后一个可用边界，复用已有主 KV Host 后备。Host 历史池与窗口池容量有上限，窗口池按 `host_to_device_ratio` 配置，淘汰未被请求或搬运引用的旧记录；因此会增加 Host 内存和备份开销。Host SWA 和相关状态保留各有效页对齐前缀边界，后续 chunk 复用已有备份，只搬运缺失记录。Host 容量不足时仍按缓存规则淘汰，不能无限保留。备份及有效性元数据异步传回 Host，完成事件确认后才发布，源页释放按 GPU 事件排序。
+请求结束后释放无人使用的 HBM SWA，保留有效的 Host 前缀副本。DeepSeek-V4 在完成 prefill chunk、清理 SWA 前，备份完整页的 C4、indexer、C128 历史，以及 SWA 和相关 C4 压缩状态；decode 结束前也保存最后一个可用边界，复用已有主 KV Host 后备。Host 历史池与窗口池容量有上限，全部 Host KV 后备池由 `host_size` 统一配置，淘汰未被请求或搬运引用的旧记录；因此会增加 Host 内存和备份开销。Host SWA 和相关状态保留各有效页对齐前缀边界，后续 chunk 复用已有备份，只搬运缺失记录。Host 容量不足时仍按缓存规则淘汰，不能无限保留。备份及有效性元数据异步传回 Host，完成事件确认后才发布，源页释放按 GPU 事件排序。
 
 前缀复用只选择各 TP rank 都具备完整、有效副本的页对齐边界：恢复缺失的历史数据及边界前的 SWA 窗口和压缩状态，然后继续 prefill。只分配恢复窗口所需的 HBM SWA，不恢复整段历史 SWA。C128 请求状态按 HiCache 的页对齐规则重新开始。副本缺失、过期或尚未完成搬运时缩短命中；没有有效边界才从头计算。取消、请求结束和槽位复用释放相关引用，缓存清空同时清理 Host 副本。纯 HiSparse 路径保持原行为。
 
@@ -147,21 +147,24 @@ python3 -m sglang.launch_server \
     --model-path MODEL_PATH \
     --tp-size 8 \
     --enable-kvduo \
-    --kvduo-config='{"top_k": 2048, "host_to_device_ratio": 2, "swap_in_block_size": 960, "tail_protected_pages": 2}'
+    --kvduo-config='{"top_k": 2048, "host_size": 0, "swap_in_block_size": 960, "tail_protected_pages": 2}'
 ```
 
 | 参数 | 默认值 | 作用 |
 | --- | ---: | --- |
 | `top_k` | `2048` | 每层选择宽度；最低 HOT 页数为 `ceil(top_k / K)` |
-| `host_to_device_ratio` | `2` | Host pool 相对 device pool 的容量比例 |
+| `host_size` | `0` | 每个 rank 的 Host KV 总预算，单位 GB（10^9 字节）；0 按设备池布局的 2 倍自动估算 |
+| `logical_capacity_ratio` | `2` | logical 槽位相对主 KV 物理槽位的超配倍数，并规划配套 indexer 容量；独立于 Host 预算 |
 | `swap_in_block_size` | `960` | Resolver CUDA block 线程数，须为 32 的倍数且不超过设备上限，通常为 32–1024 |
 | `tail_protected_pages` | `2` | 每请求保护的最新 FULL 页数 |
 | `full_reclaim_policy` | `"request"` | `"request"` 按请求批量释放全部合格 FULL 页；`"page"` 按页 LRU 回收 |
 | `max_relative_miss_increase` | `0.10` | 设计点 2 普通 HOT 缩容的预计 miss 相对增幅容忍比例 |
 | `decode_emergency_reclaim` | `false` | 开启后，必需 decode 的普通回收失败时允许 HOT 应急缩至最低容量，优先避免整请求回退 |
 
-前四项须为正整数，回收策略只接受 `"request"` 或 `"page"`，miss 容忍比例须为有限非负数，应急开关须为布尔值；未知字段报错。`--kvduo-config` 必须配合 `--enable-kvduo`。默认 10% 是实验初值。
+`top_k`、`logical_capacity_ratio`、`swap_in_block_size` 和 `tail_protected_pages` 须为正整数，`host_size` 须为有限非负数，回收策略只接受 `"request"` 或 `"page"`，miss 容忍比例须为有限非负数，应急开关须为布尔值；未知字段报错。`--kvduo-config` 必须配合 `--enable-kvduo`。默认 10% 是实验初值。
 
 KVDuo 要求 RadixTree，不能与 HiSparse、HiCache 或 speculative decoding 同时启用；支持 chunked prefill，不改其分块设置。通用 DSA 和 DeepSeek-V4 均按实际存储层数计算 HOT 页容量；`flashmla_kv` 要求 FP8 KV 存储，BF16 使用受支持的其他稀疏 backend。
 
 KVDuo 的 `--swa-full-tokens-ratio` 默认值沿用对应模型，不再减半；DeepSeek-V4 为 `0.1`。显式设置仍优先。
+
+`host_size` 覆盖主 KV、indexer、C128、SWA 和前缀恢复所需压缩状态的 Host 数据池；固定预算按页向下对齐，不包括控制元数据和临时搬运缓冲区。它不改变 HBM 分池或 logical 容量；后两者由独立的 `logical_capacity_ratio` 规划，其额外 indexer 开销计入 HBM 总预算。单请求所需主 KV 后备超过 Host 主池总容量时明确拒绝；仅因临时占用不足时等待。启动日志报告各 Host 池实际分配字节数。KVDuo 不再接受 `host_to_device_ratio`，旧命令需删除该字段并改用 `host_size`；HiSparse 的配置保持不变。
