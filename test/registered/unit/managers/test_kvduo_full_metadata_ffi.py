@@ -29,8 +29,6 @@ def full_case():
         torch.ones(1, dtype=torch.int32),
         torch.full((1,), 2, dtype=torch.int32),
         torch.zeros(1, dtype=torch.int64),
-        torch.zeros((2, 2), dtype=torch.float32),
-        torch.zeros(2, dtype=torch.int64),
         1,
         512,
         64,
@@ -67,10 +65,10 @@ def test_real_ffi_transports_full_metadata_as_pointers_and_retains_lookup_stride
         with torch.inference_mode():
             launch(scores, raw, spec)
         args = observed[-1]
-        assert len(args) == 27
+        assert len(args) == 25
         assert all(isinstance(args[i], tvm_ffi.Tensor) for i in (0, 1, 2, 3, 5, 6))
         assert all(isinstance(arg, int) for arg in args[7:])
-        assert args[7:20] == tuple(
+        assert args[7:18] == tuple(
             getattr(spec, field).data_ptr()
             for field in (
                 "output",
@@ -84,11 +82,9 @@ def test_real_ffi_transports_full_metadata_as_pointers_and_retains_lookup_stride
                 "observe",
                 "real_requests",
                 "clock_base",
-                "prefill_ema",
-                "prefill_steps",
             )
         )
-        assert args[20:] == (2, 128, 136, 256, 1, 512, 64)
+        assert args[18:] == (2, 128, 136, 256, 1, 512, 64)
 
 
 @pytest.mark.parametrize(
@@ -102,8 +98,6 @@ def test_real_ffi_transports_full_metadata_as_pointers_and_retains_lookup_stride
         ("growth", lambda s: torch.empty(2, dtype=torch.int32, device="meta")),
         ("observe", lambda s: torch.ones(1, dtype=torch.int64)),
         ("clock_base", lambda s: torch.ones(2, dtype=torch.int64)),
-        ("prefill_ema", lambda s: s.prefill_ema.double()),
-        ("prefill_steps", lambda s: s.prefill_steps.int()),
         ("lookup", lambda s: torch.zeros((2, 256), dtype=torch.int64)[:, ::2]),
     ],
 )

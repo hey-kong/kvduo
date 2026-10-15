@@ -21,10 +21,7 @@ pytestmark = pytest.mark.skipif(
     "P,L,current_pages,new_pages",
     [(2, 2, 0, 2), (2, 2, 1, 3), (64, 78, 0, 1), (64, 78, 7, 8)],
 )
-@pytest.mark.parametrize("reset_prefill", [False, True])
-def test_growth_preserves_lru_prior_and_padding(
-    P, L, current_pages, new_pages, reset_prefill
-):
+def test_growth_preserves_lru_prior_and_padding(P, L, current_pages, new_pages):
     K = P * L
     maximum, current, target = 8 * K, current_pages * K, new_pages * K
     slot_dtype = torch.int32 if maximum > 32767 else torch.int16
@@ -46,9 +43,7 @@ def test_growth_preserves_lru_prior_and_padding(
         torch.arange(9, dtype=torch.float32, device="cuda").expand(2, 3, 9).clone() + 2
     )
     steps = torch.full((2, 3), 65, dtype=torch.int64, device="cuda")
-    prefill = torch.full((2, 3, 2), 7.0, device="cuda")
-    prefill_steps = steps.clone()
-    banks = (tokens, locations, lru, capacity, ema, steps, prefill, prefill_steps)
+    banks = (tokens, locations, lru, capacity, ema, steps)
     before = [bank.clone() for bank in banks]
     addresses = [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
     pages = torch.empty(
@@ -67,14 +62,11 @@ def test_growth_preserves_lru_prior_and_padding(
         capacity[1, 2].reshape(1),
         ema[1, 2],
         steps[1, 2].reshape(1),
-        prefill[1, 2],
-        prefill_steps[1, 2].reshape(1),
         current=current,
         target=target,
         page_size=P,
         storage_layers=L,
         layer_stride=1_000_000,
-        reset_prefill=reset_prefill,
     )
     torch.cuda.synchronize()
     for bank, saved in zip(banks, before):
@@ -104,8 +96,6 @@ def test_growth_preserves_lru_prior_and_padding(
         assert torch.equal(ema[1, 2], expected_ema) and steps[1, 2].item() == 65
     else:
         assert not ema[1, 2].any() and steps[1, 2].item() == 0
-    assert prefill_steps[1, 2].item() == (0 if reset_prefill else 65)
-    assert torch.all(prefill[1, 2] == (0 if reset_prefill else 7))
     assert addresses == [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
 
 
@@ -124,8 +114,6 @@ def test_coordinator_growth_transaction_and_failure_restore(monkeypatch, fail):
         "kvduo_req_hot_capacity_gpu",
         "kvduo_capacity_ema",
         "kvduo_capacity_steps",
-        "kvduo_prefill_ema",
-        "kvduo_prefill_steps",
     )
     for name in names:
         setattr(c, name, getattr(c, name).cuda())
@@ -133,20 +121,14 @@ def test_coordinator_growth_transaction_and_failure_restore(monkeypatch, fail):
     allocate = allocator.alloc.side_effect
     allocator.alloc.side_effect = lambda slots: allocate(slots).cuda()
     c._ensure_kvduo_hot_capacity_targets_batch({(0, 0): 4, (1, 1): 4})
-    for owner in ((0, 0), (1, 1)):
-        c._establish_kvduo_hot_base(owner, c._kvduo_req_layer_pages[owner])
-        c._kvduo_prefill_budget_reference[c._kvduo_owner_key(owner)] = 2.0
     c.kvduo_capacity_ema.fill_(3)
     c.kvduo_capacity_steps.fill_(65)
-    c.kvduo_prefill_ema.fill_(7)
-    c.kvduo_prefill_steps.fill_(66)
     c.lru_slots[0, 0, :4] = torch.tensor(
         [2, 0, 3, 1], device="cuda", dtype=c.lru_slots.dtype
     )
     banks = [getattr(c, name) for name in names] + [c.kvduo_req_hot_capacity]
     before = [bank.clone() for bank in banks]
     pages = dict(c._kvduo_hot_page_owners)
-    references = dict(c._kvduo_prefill_budget_reference)
     free = allocator.free_pages
     publish = module.publish_kvduo_hot_growth
     count = 0
@@ -167,13 +149,10 @@ def test_coordinator_growth_transaction_and_failure_restore(monkeypatch, fail):
         torch.cuda.synchronize()
         assert all(torch.equal(bank, saved) for bank, saved in zip(banks, before))
         assert c._kvduo_hot_page_owners == pages and allocator.free_pages == free
-        assert c._kvduo_prefill_budget_reference == references
     else:
         c._ensure_kvduo_hot_capacity_targets_batch({(0, 0): 8, (1, 1): 8})
         torch.cuda.synchronize()
         assert c.lru_slots[0, 0, :8].tolist() == [4, 5, 6, 7, 2, 0, 3, 1]
         assert c.kvduo_capacity_steps[0, 0].item() == 65
         assert c.kvduo_capacity_ema[0, 0, 1].item() == 3
-        assert c.kvduo_prefill_steps[0, 0].item() == 0
-        assert not c._kvduo_prefill_budget_reference
-        assert c._observe_kvduo_hot_growth.call_args.kwargs == {"publish_stats": False}
+        c._observe_kvduo_hot_growth.assert_not_called()

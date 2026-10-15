@@ -35,19 +35,19 @@ from sglang.srt.server_args import (  # noqa: E402
     set_global_server_args_for_scheduler,
 )
 from test_kvduo_host_capacity import cached_page, host_inventory  # noqa: E402
-from test_kvduo_prefill_rollback import ready_coordinator  # noqa: E402
+from test_kvduo_prefill_admission import ready_coordinator  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def cleanup_stack(*, rollback=False, ratio=1):
+def cleanup_stack(*, ratio=1):
     set_global_server_args_for_scheduler(
         ServerArgs(model_path="dummy", enable_kvduo=True, enable_hisparse=True)
     )
     c, physical = ready_coordinator(extra=4, requests=2)
     c.compress_ratio = ratio
     c.is_dsv4_hisparse = ratio > 1
-    physical.free_pages = 1 if rollback else 64
+    physical.free_pages = 64
     pool = host_inventory(c, 8)
     request_pool = ReqToTokenPool(1, 32 * ratio, "cpu", enable_memory_saver=False)
     cache = SimpleNamespace(
@@ -85,7 +85,8 @@ def pending_prefill(c, pool, cache, *, mode="length", rid="incoming", finish=Tru
         record = cached_page(c, pool.alloc(2), identity=identity)
     c.host_prefix_cache.acquire(identity, req.rid, 0)
     req.kvduo_host_prefix_records.add(identity)
-    token = c.reserve_kvduo_prefill(1, [0], prefill_req=req)
+    c.token_to_kv_pool_allocator.hisparse_attn_allocator.free_pages = 8
+    token = c.reserve_kvduo_prefill(1, prefill_req=req)
     assert token is not None
     if finish:
         c.finish_kvduo_prefill_reservation(token, cancelled=False)
@@ -149,10 +150,6 @@ def assert_prefill_released(c, cache, req, key, record):
     assert not c._kvduo_prefill_host_reservations
     assert key not in c._kvduo_prefill_lifecycle
     assert key not in c._kvduo_prefill_future_pages
-    assert all(
-        key not in associations
-        for associations in c._kvduo_prefill_associations.values()
-    )
     assert not record.pinned and not req.kvduo_host_prefix_records
     assert not hasattr(req, "kvduo_prefill_generation")
     assert req.req_pool_idx is None and req.kv is None
@@ -161,12 +158,9 @@ def assert_prefill_released(c, cache, req, key, record):
 
 
 @pytest.mark.parametrize("mode", ["length", "eos"])
-@pytest.mark.parametrize("rollback", [False, True])
 @pytest.mark.parametrize("ratio", [1, 4])
-def test_repeated_first_token_finish_releases_host_hold_and_match_pins(
-    mode, rollback, ratio
-):
-    c, pool, cache = cleanup_stack(rollback=rollback, ratio=ratio)
+def test_repeated_first_token_finish_releases_host_hold_and_match_pins(mode, ratio):
+    c, pool, cache = cleanup_stack(ratio=ratio)
     c.admit_request_into_staging = MagicMock()
     for i in range(3):
         req, key, record, _ = pending_prefill(c, pool, cache, mode=mode, rid=f"req-{i}")
@@ -193,7 +187,7 @@ def test_chunk_abort_releases_host_before_slot_and_late_results_do_not_recreate_
     inflight,
     ratio,
 ):
-    c, pool, cache = cleanup_stack(rollback=True, ratio=ratio)
+    c, pool, cache = cleanup_stack(ratio=ratio)
     req, key, record, _ = pending_prefill(c, pool, cache)
     req.inflight_middle_chunks = inflight
     scheduler = Scheduler.__new__(Scheduler)
@@ -216,14 +210,13 @@ def test_chunk_abort_releases_host_before_slot_and_late_results_do_not_recreate_
 
 
 def test_request_end_cancels_pending_physical_reservation_before_scope_cleanup():
-    c, pool, cache = cleanup_stack(rollback=True)
+    c, pool, cache = cleanup_stack()
     with c.kvduo_prefill_reservation_scope():
         req, key, record, _ = pending_prefill(c, pool, cache, finish=False)
         release_kv_cache(req, cache, is_insert=False)
         assert_prefill_released(c, cache, req, key, record)
         assert not c._kvduo_prefill_reservations
         assert not c._kvduo_prefill_reservation_requests
-    assert not c._kvduo_prefill_block_leases
 
 
 def test_repeated_cleanup_of_old_request_does_not_release_reused_slots_host_hold():

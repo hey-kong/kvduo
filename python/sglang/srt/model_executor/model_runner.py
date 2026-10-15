@@ -410,9 +410,9 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert self.support_pp, (
-                "Pipeline Parallel is not compatible with this model."
-            )
+            assert (
+                self.support_pp
+            ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
         self.init_weight_updater()
@@ -819,23 +819,17 @@ class ModelRunner:
 
         hisparse_cfg = parse_hisparse_config(self.server_args)
         tail_protected_pages = 0
-        prefill_policy = None
+        max_relative_miss_increase = 0.10
         full_reclaim_policy = "page"
         decode_emergency_reclaim = False
         if self.server_args.enable_kvduo:
             from sglang.srt.mem_cache.sparsity import parse_kvduo_config
 
-            from sglang.srt.mem_cache.sparsity.core.kvduo_prefill_rollback import (
-                KVDuoPrefillPolicy,
-            )
-
             kvduo_cfg = parse_kvduo_config(self.server_args)
             tail_protected_pages = kvduo_cfg.tail_protected_pages
             full_reclaim_policy = kvduo_cfg.full_reclaim_policy
             decode_emergency_reclaim = kvduo_cfg.decode_emergency_reclaim
-            prefill_policy = KVDuoPrefillPolicy(
-                kvduo_cfg.max_relative_miss_increase,
-            )
+            max_relative_miss_increase = kvduo_cfg.max_relative_miss_increase
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
@@ -853,7 +847,7 @@ class ModelRunner:
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
             tail_protected_pages=tail_protected_pages,
-            prefill_policy=prefill_policy,
+            max_relative_miss_increase=max_relative_miss_increase,
             full_reclaim_policy=full_reclaim_policy,
             decode_emergency_reclaim=decode_emergency_reclaim,
         )

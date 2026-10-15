@@ -79,14 +79,6 @@ def assert_payloads_match_tokens(coordinator, layer, req):
 
 def prefill_protected_growth_coordinator(*, free_pages, applicant_pages=2):
     c, p = make_merge_coordinator({(0, 0): 2, (0, 1): applicant_pages, (0, 2): 8})
-    key = c._kvduo_owner_key((0, 0))
-    c._establish_kvduo_hot_base((0, 0), c._kvduo_req_layer_pages[0, 0])
-    c._kvduo_prefill_limited_objects.add(key)
-    c._kvduo_prefill_budget_cost[key] = 1.0
-    c.kvduo_hot_page_limit[:, 0] = 2
-    # Keep the lock pending complete-prefill conversion even when pages appear.
-    prefill_key = c._kvduo_prefill_key(SimpleNamespace(rid="prefilling"))
-    c._kvduo_prefill_associations[key] = {prefill_key}
     c._kvduo_next_prefill_pages = 5
     p.free_pages = free_pages
     p.alloc.reset_mock()
@@ -112,8 +104,6 @@ def test_optional_growth_never_merges_to_cover_waiting_prefill(
         c.kvduo_req_hot_capacity_gpu,
         c.kvduo_capacity_ema,
         c.kvduo_capacity_steps,
-        c.kvduo_prefill_ema,
-        c.kvduo_prefill_steps,
     )
     before = [bank.clone() for bank in banks]
     c.kvduo_hot_growth_events[0, 1] = events
@@ -125,8 +115,6 @@ def test_optional_growth_never_merges_to_cover_waiting_prefill(
     c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
     assert all(torch.equal(bank, old) for bank, old in zip(banks, before))
     assert p.free_pages == free_pages and c._kvduo_hand == 0
-    assert c._kvduo_object_limited((0, 0))
-    assert c._kvduo_prefill_budget_cost[c._kvduo_owner_key((0, 0))] == 1.0
     assert not c.kvduo_hot_growth_events.any()
     # A deferred capacity event cannot be replayed when space later appears.
     p.free_pages = 6
@@ -153,8 +141,6 @@ def test_optional_growth_merges_only_for_real_applicants_after_prefill_is_covere
     if merge_needed:
         c.reclaim_kvduo_hot_pages.assert_called_once_with(2)
         # Scanning without shrinking the applicant preserves its event.
-        assert (0, 1) in c._kvduo_hot_processed
-        assert len(c._kvduo_hot_base_pages[0, 1]) == 2
         assert c.kvduo_req_hot_capacity[0, 2] == 8
         assert_payloads_match_tokens(c, 0, 2)
     else:
@@ -165,7 +151,6 @@ def test_optional_growth_merges_only_for_real_applicants_after_prefill_is_covere
     assert live_lru(c, 0, 1) == applicant_lru
     assert p.free_pages == free_pages + (6 if merge_needed else 0) - 1
     assert p.free_pages >= protected_pages
-    assert c._kvduo_object_limited((0, 0))
 
 
 @pytest.mark.parametrize(
@@ -217,7 +202,7 @@ def test_mru_merge_moves_minimum_payload_and_publishes_before_free():
         assert torch.all(bank[0, 0, 8:] == -1)
 
 
-def test_no_release_scan_keeps_contents_lru_and_capacity_cost_but_rebuilds_base():
+def test_no_release_scan_keeps_contents_lru_and_capacity_cost_without_resetting_history():
     c, p = make_merge_coordinator({(0, 0): 4})
     c.kvduo_capacity_ema[0, 0, :4] = 1
     before = [
@@ -242,10 +227,7 @@ def test_no_release_scan_keeps_contents_lru_and_capacity_cost_but_rebuilds_base(
             before,
         )
     )
-    assert c._kvduo_hand_sequence == 1
-    assert len(c._kvduo_hot_base_pages[0, 0]) == 4
     assert c.reclaim_kvduo_hot_pages(2) == 0
-    assert c._kvduo_hand_sequence == 2
 
 
 def test_hand_resumes_request_major_and_never_erases_cost_to_force_progress():
@@ -253,19 +235,20 @@ def test_hand_resumes_request_major_and_never_erases_cost_to_force_progress():
         {(layer, req): 3 for req in range(2) for layer in range(2)}, layers=2
     )
     assert c.reclaim_kvduo_hot_pages(2) == 2
-    assert c._kvduo_hand == 1 and c._kvduo_hot_processed == {(0, 0): 1}
+    assert c._kvduo_hand == 1
     assert c.reclaim_kvduo_hot_pages(2) == 2
-    assert c._kvduo_hand == 2 and c._kvduo_hot_processed[(1, 0)] == 2
+    assert c._kvduo_hand == 2
 
 
-def test_scan_skips_generation_staging_protection_and_fixed_mode():
+def test_scan_skips_generation_staging_protection_():
     c, p = make_merge_coordinator({(0, req): 3 for req in range(5)})
     c._kvduo_request_generation[0] += 1
     c._kvduo_hot_pressure_protected.add((0, 1, 0))
     c._active_kvduo_reqs[2] = SimpleNamespace(hisparse_staging=True)
-    c._kvduo_prefill_limited_objects.add(c._kvduo_owner_key((0, 3)))
     assert c.reclaim_kvduo_hot_pages(2) == 2
-    assert c._kvduo_hot_processed == {(0, 4): 1}
+    assert c.kvduo_req_hot_capacity[0, 3] == 8
+    c._kvduo_request_generation[3] += 1
+    c._kvduo_hot_pressure_protected.add((0, 4, 0))
     c._kvduo_request_generation[4] += 1
     assert c.reclaim_kvduo_hot_pages(2) == 0
 

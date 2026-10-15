@@ -138,7 +138,7 @@ def stack(monkeypatch, device="cpu"):
             c, name, torch.zeros_like(allocator.full_to_hisparse_device_index_mapping)
         )
     c.full_host_version = torch.full_like(c.full_data_version, -1)
-    c._init_kvduo_prefill_rollback_state(4)
+    c._init_kvduo_capacity_state(4)
     c._active_kvduo_reqs = {}
     c.write_staging_stream = (
         torch.cuda.Stream(device=device) if device == "cuda" else None

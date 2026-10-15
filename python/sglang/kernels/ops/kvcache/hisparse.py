@@ -191,9 +191,6 @@ def _load_cache_to_device_buffer_mla(
     full_location_base: int = 0,
     hot_growth_events: torch.Tensor | None = None,
     observe_cache: torch.Tensor | None = None,
-    hot_base_capacities: torch.Tensor | None = None,
-    prefill_ema: torch.Tensor | None = None,
-    prefill_steps: torch.Tensor | None = None,
     resolver_scratch: torch.Tensor | None = None,
     lru_scratch: torch.Tensor | None = None,
     validate_status: bool = False,
@@ -306,20 +303,6 @@ def _load_cache_to_device_buffer_mla(
             observe_cache.is_contiguous()
             and observe_cache.device == top_k_tokens.device
         )
-    if any(t is not None for t in (hot_base_capacities, prefill_ema, prefill_steps)):
-        assert all(
-            t is not None for t in (hot_base_capacities, prefill_ema, prefill_steps)
-        )
-        assert enable_full_lookup and enable_dynamic_hot_view
-        assert hot_base_capacities.dtype == torch.int32
-        assert prefill_ema.dtype == torch.float32
-        assert prefill_steps.dtype == torch.int64
-        requests = device_buffer_tokens.size(0)
-        assert hot_base_capacities.shape == (requests,)
-        assert prefill_steps.shape == (requests,)
-        assert prefill_ema.shape == (requests, 2)
-        for tensor in (hot_base_capacities, prefill_ema, prefill_steps):
-            assert tensor.is_contiguous() and tensor.device == top_k_tokens.device
     module.load_cache_to_device_buffer(
         top_k_tokens.data_ptr(),
         device_buffer_tokens.data_ptr(),
@@ -361,9 +344,6 @@ def _load_cache_to_device_buffer_mla(
         item_size_bytes,
         full_location_base,
         observe_cache.data_ptr() if observe_cache is not None else 0,
-        hot_base_capacities.data_ptr() if hot_base_capacities is not None else 0,
-        prefill_ema.data_ptr() if prefill_ema is not None else 0,
-        prefill_steps.data_ptr() if prefill_steps is not None else 0,
         resolver_scratch.data_ptr() if resolver_scratch is not None else 0,
         resolver_scratch.stride(0) if resolver_scratch is not None else 0,
         lru_scratch.data_ptr() if lru_scratch is not None else 0,
@@ -402,9 +382,6 @@ def load_cache_to_device_buffer_mla(
     full_location_base: int = 0,
     hot_growth_events: torch.Tensor | None = None,
     observe_cache: torch.Tensor | None = None,
-    hot_base_capacities: torch.Tensor | None = None,
-    prefill_ema: torch.Tensor | None = None,
-    prefill_steps: torch.Tensor | None = None,
     resolver_scratch: torch.Tensor | None = None,
     lru_scratch: torch.Tensor | None = None,
     validate_status: bool = False,
@@ -443,9 +420,6 @@ def load_cache_to_device_buffer_mla(
         full_location_base=full_location_base,
         hot_growth_events=hot_growth_events,
         observe_cache=observe_cache,
-        hot_base_capacities=hot_base_capacities,
-        prefill_ema=prefill_ema,
-        prefill_steps=prefill_steps,
         resolver_scratch=resolver_scratch,
         lru_scratch=lru_scratch,
         validate_status=validate_status,
@@ -484,9 +458,6 @@ def load_cache_to_device_buffer_dsv4_mla(
     full_location_base: int = 0,
     hot_growth_events: torch.Tensor | None = None,
     observe_cache: torch.Tensor | None = None,
-    hot_base_capacities: torch.Tensor | None = None,
-    prefill_ema: torch.Tensor | None = None,
-    prefill_steps: torch.Tensor | None = None,
     resolver_scratch: torch.Tensor | None = None,
     lru_scratch: torch.Tensor | None = None,
     validate_status: bool = False,
@@ -525,9 +496,6 @@ def load_cache_to_device_buffer_dsv4_mla(
         full_location_base=full_location_base,
         hot_growth_events=hot_growth_events,
         observe_cache=observe_cache,
-        hot_base_capacities=hot_base_capacities,
-        prefill_ema=prefill_ema,
-        prefill_steps=prefill_steps,
         resolver_scratch=resolver_scratch,
         lru_scratch=lru_scratch,
         validate_status=validate_status,
@@ -596,104 +564,3 @@ def build_kvduo_hot_merge_plan(
         torch.iinfo(torch.int32).max,
     )
     return summary, new_tokens, new_locations, new_lru, sources, destinations
-
-
-@functools.cache
-def _jit_kvduo_rollback_module(capacity: int, block_size: int):
-    args = make_cpp_args(capacity, block_size)
-    return load_jit(
-        "kvduo_prefill_rollback",
-        capacity,
-        block_size,
-        cuda_files=["kvduo_prefill_rollback.cuh"],
-        cuda_wrappers=[("rollback", f"kvduo_prefill_rollback<{args}>")],
-    )
-
-
-def rollback_kvduo_hot_metadata(
-    owners: torch.Tensor,
-    targets: torch.Tensor,
-    tokens: torch.Tensor,
-    locations: torch.Tensor,
-    lru: torch.Tensor,
-    capacities: torch.Tensor,
-    capacity_ema: torch.Tensor | None = None,
-    capacity_steps: torch.Tensor | None = None,
-    growth_events: torch.Tensor | None = None,
-    prefill_ema: torch.Tensor | None = None,
-    prefill_steps: torch.Tensor | None = None,
-) -> None:
-    """Batch metadata compaction and optional statistics reset without moving KV."""
-    if owners.numel() == 0:
-        return
-    statistics = (
-        capacity_ema,
-        capacity_steps,
-        growth_events,
-        prefill_ema,
-        prefill_steps,
-    )
-    reset_stats = any(bank is not None for bank in statistics)
-    if reset_stats:
-        shapes = (
-            (*capacities.shape, 9),
-            capacities.shape,
-            capacities.shape,
-            (*capacities.shape, 2),
-            capacities.shape,
-        )
-        dtypes = (
-            torch.float32,
-            torch.int64,
-            torch.int32,
-            torch.float32,
-            torch.int64,
-        )
-        for bank, shape, dtype in zip(statistics, shapes, dtypes):
-            if (
-                bank is None
-                or bank.shape != shape
-                or bank.dtype != dtype
-                or bank.device != capacities.device
-                or not bank.is_contiguous()
-            ):
-                raise ValueError(
-                    "Rollback statistics must be supplied together with matching "
-                    "shapes, dtypes, devices and contiguous layout"
-                )
-    if not tokens.is_cuda:
-        # CPU reference also exercises publication/free ordering in unit tests.
-        for (layer, req), target in zip(owners.tolist(), targets.tolist()):
-            old = int(capacities[layer, req])
-            order = lru[layer, req, :old].clone()
-            filtered = order[(order >= 0) & (order < target)]
-            lru[layer, req, :target] = filtered
-            lru[layer, req, target:] = -1
-            tokens[layer, req, target:] = -1
-            locations[layer, req, target:] = -1
-            if reset_stats:
-                for bank in statistics:
-                    bank[layer, req] = 0
-            capacities[layer, req] = target
-        return
-    assert owners.dtype == torch.int64 and owners.is_contiguous()
-    assert targets.dtype == torch.int32 and targets.is_contiguous()
-    assert owners.ndim == 2 and owners.size(1) == 2
-    assert targets.numel() == owners.size(0)
-    for tensor in (tokens, locations, lru, capacities):
-        assert tensor.is_contiguous() and tensor.device == owners.device
-    assert lru.dtype == (
-        torch.int32 if lru.size(2) > torch.iinfo(torch.int16).max else torch.int16
-    ), "LRU slot dtype must match the compiled HOT capacity"
-    # The coordinator pads token/location rows by one page, but LRU
-    # contains only HOT slots. Compile the scan for LRU's logical capacity;
-    # the wrapper passes each bank's actual strides and padded width.
-    _jit_kvduo_rollback_module(lru.size(2), 256).rollback(
-        owners,
-        targets,
-        tokens,
-        locations,
-        lru,
-        capacities,
-        *statistics,
-    )

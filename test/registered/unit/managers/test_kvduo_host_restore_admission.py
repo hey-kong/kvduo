@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
 from test_kvduo_hot_growth import make_host_pool
-from test_kvduo_prefill_rollback import adder_and_req, ready_coordinator
+from test_kvduo_prefill_admission import adder_and_req, ready_coordinator
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -111,8 +111,8 @@ def test_generic_prefill_reservation_funds_restore_and_keeps_fresh_tail_quota(
 ):
     c, physical, adder, req = restore_setup(dsv4=False, cache_type=cache_type, extra=3)
     req.sampling_params.max_new_tokens = 2
-    assert physical.free_pages == 0
-    assert adder.token_to_kv_pool_allocator.available_size() == 0
+    physical.free_pages = 3
+    assert adder.token_to_kv_pool_allocator.available_size() > 0
 
     assert adder.add_one_req(req, False, None) is AddReqResult.CONTINUE
 
@@ -121,8 +121,6 @@ def test_generic_prefill_reservation_funds_restore_and_keeps_fresh_tail_quota(
     assert physical.free_pages == 2
     assert c._kvduo_reserved_prefill_pages() == 2
     assert c._kvduo_mandatory_hot_pages() == 0
-    assert c._kvduo_prefill_budget_cost == {(0, 0, 0): 1}
-    assert c._kvduo_object_limited((0, 0))
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_called_once()
     c.mem_pool_host.load_to_device_per_layer.assert_called_once()
     c.reclaim_kvduo_full_pages.assert_not_called()
@@ -156,8 +154,6 @@ def test_waiting_chunk_protects_host_restore_and_fresh_tail(dsv4, blocked_by):
         logical = adder.token_to_kv_pool_allocator.logical_attn_allocator
         logical = logical.full_attn_allocator if dsv4 else logical
         assert logical.alloc(logical.available_size()) is not None
-    else:
-        c.kvduo_prefill_steps.zero_()
 
     result = adder.add_one_req(req, False, None)
 
@@ -170,7 +166,7 @@ def test_waiting_chunk_protects_host_restore_and_fresh_tail(dsv4, blocked_by):
     else:
         assert reserve.call_args.args[0] == 2
     assert physical.free_pages == 0
-    assert not adder.can_run_list and not c._kvduo_prefill_limited_objects
+    assert not adder.can_run_list
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_not_called()
 
 
@@ -213,13 +209,14 @@ def test_swa_limited_plan_updates_protection_before_host_admission():
 @pytest.mark.parametrize("protected", ["fresh_tail", "other_prefill", "hot_minimum"])
 def test_restore_cannot_spend_other_pending_allocations(protected):
     c, physical, adder, req = restore_setup(dsv4=False, requests=2)
-    token = c.reserve_kvduo_prefill(2, [0])
+    physical.free_pages = 2
+    token = c.reserve_kvduo_prefill(2)
     assert token is not None and physical.free_pages == 2
     if protected == "fresh_tail":
         physical.free_pages = 1  # Restore fits alone, but its tail no longer does.
     elif protected == "other_prefill":
         physical.free_pages += 1
-        other = c.reserve_kvduo_prefill(1, [])
+        other = c.reserve_kvduo_prefill(1)
         assert other is not None
         physical.free_pages = 2  # Restore+tail fit, but not the other reservation.
     else:
@@ -247,14 +244,14 @@ def test_restore_shortfall_never_uses_unbudgeted_hand_merge(pass_reservation):
     physical.free_pages = 2
     c._ensure_kvduo_hot_capacity_targets_batch({(0, 1): 12})
     assert physical.free_pages == 0
-    assert c.kvduo_prefill_steps[0, 1].item() == 0
-    token = c.reserve_kvduo_prefill(2, [0])
+    physical.free_pages = 2
+    token = c.reserve_kvduo_prefill(2)
     assert token is not None
     # An unrelated mandatory allocation consumes a page after admission. The
     # unobserved request can be shrunk by Hand, but cannot fund this prefill.
     physical.free_pages -= 1
     tokens_before = c.req_device_buffer_tokens.clone()
-    hand_before = c._kvduo_hand_sequence
+    hand_before = c._kvduo_hand
     c.reclaim_kvduo_hot_pages = MagicMock(wraps=c.reclaim_kvduo_hot_pages)
 
     restored, _ = adder.tree_cache.init_load_back(
@@ -264,8 +261,7 @@ def test_restore_shortfall_never_uses_unbudgeted_hand_merge(pass_reservation):
     assert restored is None and physical.free_pages == 1
     assert c.kvduo_req_hot_capacity[0, 1].item() == 12
     assert torch.equal(c.req_device_buffer_tokens, tokens_before)
-    assert c._kvduo_hand_sequence == hand_before
-    assert c._kvduo_prefill_budget_cost == {(0, 0, 0): 1}
+    assert c._kvduo_hand == hand_before
     c.reclaim_kvduo_hot_pages.assert_not_called()
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_not_called()
 
@@ -273,7 +269,8 @@ def test_restore_shortfall_never_uses_unbudgeted_hand_merge(pass_reservation):
 @pytest.mark.parametrize("invalid", ["cancelled", "insufficient"])
 def test_restore_rejects_invalid_reservation_without_reclaim(invalid):
     c, physical, adder, req = restore_setup(dsv4=False)
-    token = c.reserve_kvduo_prefill(2, [0])
+    physical.free_pages = 2
+    token = c.reserve_kvduo_prefill(2)
     assert token is not None
     if invalid == "cancelled":
         c.finish_kvduo_prefill_reservation(token, cancelled=True)
@@ -290,6 +287,7 @@ def test_restore_rejects_invalid_reservation_without_reclaim(invalid):
 
 def test_failed_restore_cancels_prefill_quota_and_limits_without_spending_pages():
     c, physical, adder, req = restore_setup(dsv4=False, extra=3)
+    physical.free_pages = 3
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.return_value = None
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.side_effect = None
 
@@ -298,8 +296,6 @@ def test_failed_restore_cancels_prefill_quota_and_limits_without_spending_pages(
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_called_once()
     assert physical.free_pages == 3
     assert not c._kvduo_prefill_reservations
-    assert not c._kvduo_prefill_limited_objects
-    assert not c._kvduo_prefill_budget_cost
     assert not adder.can_run_list
     assert len(req.prefix_indices) == adder.page_size
     assert all(

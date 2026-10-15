@@ -731,7 +731,7 @@ def test_prefill_rechecks_only_real_surplus_after_decode_request_reclaim(
     c, p, req = make_full_coordinator(layers=2, full_reclaim_policy="request")
     req.decode_batch_idx = 0
     c.reclaim_kvduo_full_pages = MagicMock(wraps=c.reclaim_kvduo_full_pages)
-    assert c.reserve_kvduo_prefill(prefill_pages, [0]) is None
+    assert c.reserve_kvduo_prefill(prefill_pages) is None
     c.reclaim_kvduo_full_pages.assert_not_called()
     c._reclaim_for_physical_allocation = MethodType(
         HiSparseCoordinator._reclaim_for_physical_allocation, c
@@ -742,7 +742,7 @@ def test_prefill_rechecks_only_real_surplus_after_decode_request_reclaim(
     p.alloc(c.page_size)
     assert c._kvduo_mandatory_hot_pages() == 2
     calls = c.reclaim_kvduo_full_pages.call_count
-    token = c.reserve_kvduo_prefill(prefill_pages, [0])
+    token = c.reserve_kvduo_prefill(prefill_pages)
     assert (token is not None) == admitted
     assert c.reclaim_kvduo_full_pages.call_count == calls
     c.prepare_kvduo_graph_replay(torch.tensor([0]))

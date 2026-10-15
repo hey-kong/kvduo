@@ -121,9 +121,6 @@ def test_workspace_reuse_orders_previous_page_upload_on_the_next_stream(monkeypa
         capacity_ema=c.kvduo_capacity_ema[owner],
         capacity_steps=c.kvduo_capacity_steps[owner],
         growth_events=c.kvduo_hot_growth_events[owner],
-        base_capacity=c.kvduo_hot_base_capacity[owner],
-        prefill_ema=c.kvduo_prefill_ema[owner],
-        prefill_steps=c.kvduo_prefill_steps[owner],
     )
     stream.wait_event.assert_called_once_with(event)
     event.record.assert_called_once_with(stream)

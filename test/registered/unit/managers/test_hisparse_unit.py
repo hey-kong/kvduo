@@ -520,7 +520,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator._mixed_slots = [True]
         coordinator.kvduo_req_hot_capacity = torch.zeros((2, 1), dtype=torch.int64)
         coordinator.kvduo_req_hot_capacity_gpu = torch.zeros((2, 1), dtype=torch.int32)
-        coordinator._init_kvduo_prefill_rollback_state(1)
+        coordinator._init_kvduo_capacity_state(1)
         coordinator.kvduo_hot_growth_events = torch.zeros((2, 1), dtype=torch.int32)
         coordinator._active_kvduo_reqs = {0: object()}
         coordinator.req_device_buffer_token_locs = torch.full(
@@ -573,11 +573,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         self.assertEqual(coordinator._kvduo_req_layer_pages[(1, 0)], [20, 24])
 
-        from sglang.srt.mem_cache.sparsity.core.kvduo_prefill_rollback import (
-            KVDuoPrefillPolicy,
-        )
-
-        coordinator.kvduo_prefill_policy = KVDuoPrefillPolicy()
+        coordinator.kvduo_max_relative_miss_increase = 0.10
         coordinator.kvduo_capacity_steps[1, 0] = 65
         coordinator._merge_kvduo_hot_pages(1, 0)
         self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
@@ -638,7 +634,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             for (layer_id, req_idx), capacity in targets.items():
                 coordinator.kvduo_req_hot_capacity[layer_id, req_idx] = capacity
 
-        coordinator._init_kvduo_prefill_rollback_state(
+        coordinator._init_kvduo_capacity_state(
             coordinator.kvduo_req_hot_capacity.shape[1]
         )
         coordinator._ensure_kvduo_hot_capacity_targets_batch = MagicMock(
@@ -772,7 +768,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             free_hisparse_indices=MagicMock(),
         )
 
-        coordinator._init_kvduo_prefill_rollback_state(
+        coordinator._init_kvduo_capacity_state(
             coordinator.kvduo_req_hot_capacity.shape[1]
         )
         coordinator.prepare_kvduo_graph_replay(torch.tensor([0, 1]))
@@ -809,7 +805,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         coordinator._require_allocation_ready = MagicMock()
 
-        coordinator._init_kvduo_prefill_rollback_state(
+        coordinator._init_kvduo_capacity_state(
             coordinator.kvduo_req_hot_capacity.shape[1]
         )
         with self.assertRaisesRegex(RuntimeError, "whole-page HOT allocation failed"):
@@ -857,7 +853,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             hisparse_attn_allocator=allocator,
             free_hisparse_indices=MagicMock(),
         )
-        coordinator._init_kvduo_prefill_rollback_state(
+        coordinator._init_kvduo_capacity_state(
             coordinator.kvduo_req_hot_capacity.shape[1]
         )
         return coordinator, allocator, physical

@@ -1,5 +1,6 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/utils.cuh>
 
 namespace {
@@ -14,15 +15,12 @@ __global__ void kvduo_publish_hot_growth_kernel(
     int32_t* capacity,
     float* capacity_ema,
     int64_t* capacity_steps,
-    float* prefill_ema,
-    int64_t* prefill_steps,
     int64_t current,
     int64_t target,
     int64_t page_size,
     int64_t K,
     int64_t layer_stride,
-    int64_t page_stride,
-    bool reset_prefill) {
+    int64_t page_stride) {
   const int tid = threadIdx.x;
   const int64_t grow = target - current;
   for (int64_t offset = tid; offset < grow; offset += BLOCK_SIZE) {
@@ -40,10 +38,6 @@ __global__ void kvduo_publish_hot_growth_kernel(
   } else if (tid >= current / K && tid < target / K) {
     capacity_ema[tid] = capacity_ema[current / K - 1];
   }
-  if (reset_prefill) {
-    if (tid < 2) prefill_ema[tid] = 0;
-    if (tid == 0) prefill_steps[0] = 0;
-  }
   __syncthreads();
   if (tid == 0) capacity[0] = target;
 }
@@ -58,14 +52,11 @@ void kvduo_publish_hot_growth(
     tvm::ffi::TensorView capacity,
     tvm::ffi::TensorView capacity_ema,
     tvm::ffi::TensorView capacity_steps,
-    tvm::ffi::TensorView prefill_ema,
-    tvm::ffi::TensorView prefill_steps,
     int64_t current,
     int64_t target,
     int64_t page_size,
     int64_t storage_layers,
-    int64_t layer_stride,
-    bool reset_prefill) {
+    int64_t layer_stride) {
   using namespace host;
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA, kDLROCM>();
@@ -84,8 +75,7 @@ void kvduo_publish_hot_growth(
   TensorMatcher({padded}).with_dtype<int32_t>().with_device(device).verify(tokens).verify(locations);
   TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(capacity);
   TensorMatcher({9}).with_dtype<float>().with_device(device).verify(capacity_ema);
-  TensorMatcher({2}).with_dtype<float>().with_device(device).verify(prefill_ema);
-  TensorMatcher({1}).with_dtype<int64_t>().with_device(device).verify(capacity_steps).verify(prefill_steps);
+  TensorMatcher({1}).with_dtype<int64_t>().with_device(device).verify(capacity_steps);
   auto launch = [&]<typename SlotT>() {
     TensorMatcher({max_capacity}).with_dtype<SlotT>().with_device(device).verify(lru);
     TensorMatcher({previous}).with_dtype<SlotT>().with_device(device).verify(previous_lru);
@@ -103,15 +93,12 @@ void kvduo_publish_hot_growth(
         static_cast<int32_t*>(capacity.data_ptr()),
         static_cast<float*>(capacity_ema.data_ptr()),
         static_cast<int64_t*>(capacity_steps.data_ptr()),
-        static_cast<float*>(prefill_ema.data_ptr()),
-        static_cast<int64_t*>(prefill_steps.data_ptr()),
         current,
         target,
         page_size,
         K,
         layer_stride,
-        page_stride.unwrap(),
-        reset_prefill);
+        page_stride.unwrap());
   };
   if (lru.dtype().code == kDLInt && lru.dtype().bits == 16) {
     launch.template operator()<int16_t>();

@@ -85,9 +85,6 @@ def test_gpu_hand_keeps_zero_release_visits_before_stopping_at_sufficient_space(
         "kvduo_capacity_ema",
         "kvduo_capacity_steps",
         "kvduo_hot_growth_events",
-        "kvduo_hot_base_capacity",
-        "kvduo_prefill_ema",
-        "kvduo_prefill_steps",
     ):
         setattr(c, name, getattr(c, name).cuda())
     backing = c.mem_pool_device.get_flat_key_buffer().cuda()
@@ -100,7 +97,7 @@ def test_gpu_hand_keeps_zero_release_visits_before_stopping_at_sufficient_space(
     assert c._kvduo_hand == 3
     assert c._kvduo_hot_processed == {(1, 2): 1, (1, 0): 2, (0, 1): 3}
     assert int(c.kvduo_capacity_steps[1, 2]) == 20
-    assert len(c._kvduo_hot_base_pages[1, 2]) == 3
+    assert len(c._kvduo_req_layer_pages[1, 2]) == 3
     for layer, req in c._kvduo_req_layer_pages:
         size = int(c.kvduo_req_hot_capacity[layer, req])
         tokens = c.req_device_buffer_tokens[layer, req, :size]

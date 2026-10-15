@@ -198,7 +198,7 @@ def test_generic_merge_moves_payload_across_storage_layers_before_whole_page_fre
         c.req_device_buffer_tokens[owner][c.lru_slots[owner][:k].long()][-4:].tolist()
         == survivors
     )
-    assert c._kvduo_hot_base_pages[owner] == (pages[2],)
+    assert c._kvduo_req_layer_pages[owner] == [pages[2]]
     physical._release_page_ids.assert_called_once()
 
 
@@ -386,28 +386,6 @@ def test_actual_flashmla_kv_uses_fp8_backing_without_quantizing_it(monkeypatch):
         == pool.get_flat_key_buffer().data_ptr()
     )
     quantize.assert_not_called()
-
-
-def test_large_generic_rollback_preserves_int32_lru_and_base_contents(monkeypatch):
-    c, pool, allocator = make_stack(monkeypatch, layers=78, top_k=2048)
-    k = c.hot_page_size
-    owner = (77, 1)
-    c._ensure_kvduo_hot_capacity_targets_batch({owner: k})
-    c._merge_kvduo_hot_pages(*owner)
-    base = c._kvduo_hot_base_pages[owner]
-    c._ensure_kvduo_hot_capacity_targets_batch({owner: 8 * k})
-    c.lru_slots[owner] = torch.arange(8 * k, dtype=torch.int32).flip(0)
-    c.req_device_buffer_tokens[owner] = torch.arange(c.padded_buffer_size)
-    backing = pool.get_flat_key_buffer().clone()
-    before = allocator.hisparse_attn_allocator.available_size()
-    c._rollback_kvduo_hot_batch((owner,))
-    assert c._kvduo_req_layer_pages[owner] == list(base)
-    assert allocator.hisparse_attn_allocator.available_size() == before + 7 * 64
-    assert torch.equal(pool.get_flat_key_buffer(), backing)
-    assert c.lru_slots[owner][:k].tolist() == list(reversed(range(k)))
-    assert torch.all(c.lru_slots[owner][k:] == -1)
-    assert c.req_device_buffer_tokens[owner][:k].tolist() == list(range(k))
-    assert torch.all(c.req_device_buffer_tokens[owner][k:] == -1)
 
 
 @pytest.mark.parametrize("kvduo", [False, True])

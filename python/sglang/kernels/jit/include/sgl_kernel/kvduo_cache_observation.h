@@ -16,24 +16,13 @@ KVDUO_HOST_DEVICE inline int kvduo_lru_segment(int capacity, int position, int k
   return (capacity - 1 - position) / k;
 }
 // Counts are taken at pre-update LRU ranks, from MRU segment 0 to LRU.
-KVDUO_HOST_DEVICE inline void kvduo_update_capacity_ema(
-    const int* hits, int misses, int accesses, int pages, float* counts, int64_t& steps) {
+KVDUO_HOST_DEVICE inline void
+kvduo_update_capacity_ema(const int* hits, int misses, int accesses, int pages, float* counts, int64_t& steps) {
   if (accesses <= 0 || pages <= 0) return;
   constexpr float alpha = 1.0f / 64.0f;
   for (int j = 0; j < 9; ++j) {
     const float value = j == 8 ? static_cast<float>(misses) : (j < pages ? static_cast<float>(hits[j]) : 0.0f);
     counts[j] = steps == 0 ? value : (1.0f - alpha) * counts[j] + alpha * value;
-  }
-  ++steps;
-}
-// Actual extra-page reuse and actual H2D misses, including valid zero/zero steps.
-KVDUO_HOST_DEVICE inline void
-kvduo_update_prefill_ema(int extra_hits, int misses, int accesses, float* counts, int64_t& steps) {
-  if (accesses <= 0) return;
-  constexpr float alpha = 1.0f / 64.0f;
-  const int values[2] = {extra_hits, misses};
-  for (int i = 0; i < 2; ++i) {
-    counts[i] = steps == 0 ? static_cast<float>(values[i]) : (1.0f - alpha) * counts[i] + alpha * values[i];
   }
   ++steps;
 }
