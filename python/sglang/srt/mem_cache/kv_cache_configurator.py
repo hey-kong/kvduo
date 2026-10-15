@@ -169,10 +169,12 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     c128_state_pool_size: int
     c4_state_dtype: Optional[torch.dtype]
     c128_state_dtype: Optional[torch.dtype]
+    kvduo_logical_tokens: Optional[int] = None
 
 
 @dataclass(slots=True, kw_only=True)
 class KVCacheConfigurator:
+    kvduo_extra_budget_bytes: int = 0
     device: str
     gpu_id: int
     ps: ParallelState
@@ -334,6 +336,7 @@ class KVCacheConfigurator:
             c128_state_pool_size=c128_state_pool_size,
             c4_state_dtype=c4_state_dtype,
             c128_state_dtype=c128_state_dtype,
+            kvduo_logical_tokens=config.kvduo_logical_tokens,
         )
 
     def _init_pools(
@@ -899,6 +902,7 @@ class KVCacheConfigurator:
         elif self.use_mla_backend and is_dsa_model:
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
+                logical_size=sizes.kvduo_logical_tokens,
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
@@ -1171,7 +1175,9 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
-    def _build_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+    def _build_dsa_kv_pool(
+        self, *, max_total_num_tokens: int, logical_size=None
+    ) -> KVCache:
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
         (
@@ -1187,6 +1193,8 @@ class KVCacheConfigurator:
                 self.server_args
             ).host_to_device_ratio
             pool_kwargs["enable_kvduo"] = get_memory().enable_kvduo
+            if logical_size is not None:
+                pool_kwargs["logical_size"] = logical_size
         elif dsa_cp_layer_shard_rank is not None:
             # DSA cache layer split: shard KV/indexer layers across CP ranks.
             from sglang.srt.mem_cache.dsa_cache_layer_split import (
@@ -1549,6 +1557,7 @@ class KVCacheConfigurator:
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
                             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                            logical_size=sizes.kvduo_logical_tokens,
                         )
                     elif (
                         get_schedule().page_size == 1 and self.server_args.dcp_size == 1
@@ -1632,6 +1641,23 @@ class KVCacheConfigurator:
                     get_device_memory_capacity(self.device)
                 )
                 / 1024,
+            )
+        self.kvduo_extra_budget_bytes = 0
+        if getattr(self.server_args, "enable_kvduo", False) is True:
+            runtime_mb = (
+                self.server_args.pre_capture_activation_reserve_mb(
+                    get_device_memory_capacity(self.device)
+                )
+                + self.server_args.reserve_for_graph_mb()
+                + self.server_args.reserve_for_deepep_a2a_mb()
+            )
+            self.kvduo_extra_budget_bytes = int(
+                max(0, slack_gb - runtime_mb / 1024) * (1 << 30)
+            )
+            logger.info(
+                "KVDuo additional GPU backing headroom: %.2f GiB; runtime reserve: %.2f GiB",
+                self.kvduo_extra_budget_bytes / (1 << 30),
+                runtime_mb / 1024,
             )
         rest_memory = available_gpu_memory - slack_gb
         if self.mambaish_config is not None:

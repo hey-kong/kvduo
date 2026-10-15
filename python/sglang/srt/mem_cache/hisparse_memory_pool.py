@@ -44,7 +44,14 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         end_layer: Optional[int] = None,
         host_to_device_ratio: int = 2,
         enable_kvduo: bool = False,
+        logical_size: Optional[int] = None,
     ):
+        if logical_size is not None and (
+            logical_size < size or logical_size % page_size
+        ):
+            raise ValueError(
+                "logical_size must be page aligned and cover physical capacity"
+            )
         self.enable_kvduo = enable_kvduo
         super().__init__(
             size=size,
@@ -59,7 +66,9 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             kv_cache_dim=kv_cache_dim,
             start_layer=start_layer,
             end_layer=end_layer,
-            index_buf_size=size * host_to_device_ratio,
+            index_buf_size=(
+                size * host_to_device_ratio if logical_size is None else logical_size
+            ),
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
 

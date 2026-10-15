@@ -167,4 +167,4 @@ KVDuo 要求 RadixTree，不能与 HiSparse、HiCache 或 speculative decoding �
 
 KVDuo 的 `--swa-full-tokens-ratio` 默认值沿用对应模型，不再减半；DeepSeek-V4 为 `0.1`。显式设置仍优先。
 
-`host_size` 覆盖主 KV、indexer、C128、SWA 和前缀恢复所需压缩状态的 Host 数据池；固定预算按页向下对齐，不包括控制元数据和临时搬运缓冲区。它不改变 HBM 分池或 logical 容量；后两者由独立的 `logical_capacity_ratio` 规划，其额外 indexer 开销计入 HBM 总预算。单请求所需主 KV 后备超过 Host 主池总容量时明确拒绝；仅因临时占用不足时等待。启动日志报告各 Host 池实际分配字节数。KVDuo 不再接受 `host_to_device_ratio`，旧命令需删除该字段并改用 `host_size`；HiSparse 的配置保持不变。
+`host_size` 覆盖主 KV、indexer、C128、SWA 和前缀恢复所需压缩状态的 Host 数据池；固定预算按页向下对齐，不包括控制元数据和临时搬运缓冲区。它不决定 HBM 分池或 logical 容量。KVDuo 以普通路径的物理缓存容量为目标，单独核算 `logical_capacity_ratio` 对应的 logical、indexer 和历史状态开销；DeepSeek-V4 的 SWA 按物理容量规划，不随 logical 超配扩大。`mem_fraction_static` 提供基础预算，KVDuo 允许额外使用运行余量中超过现有 activation、CUDA Graph 和 DeepEP 预留估计的部分；余量不足时降低物理容量，保留 logical 超配。启动日志报告预算与容量，不能保证与普通路径容量完全相同。单请求所需主 KV 后备超过 Host 主池总容量时明确拒绝；仅因临时占用不足时等待。启动日志报告各 Host 池实际分配字节数。KVDuo 不再接受 `host_to_device_ratio`，旧命令需删除该字段并改用 `host_size`；HiSparse 的配置保持不变。
