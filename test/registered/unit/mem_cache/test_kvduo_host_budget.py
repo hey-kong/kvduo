@@ -25,7 +25,7 @@ def test_host_size_config_and_independent_hbm_alias(value):
     )
     args._handle_kvduo_aliases()
     assert parse_kvduo_config(args).host_size == value
-    assert parse_hisparse_config(args).host_to_device_ratio == 1
+    assert parse_hisparse_config(args).host_to_device_ratio == 2
 
 
 def test_defaults_match_hicache_auto_semantics():
@@ -176,6 +176,93 @@ def test_dsv4_hbm_layout_is_independent_of_host_size():
             ps=SimpleNamespace(pp_size=1, attn_dp_size=1),
         )
         plan = DSV4PoolConfigurator(kvc)
-        assert plan.c4_shrink_factor == 1
+        assert plan.c4_shrink_factor == 2
         results.append((plan.bytes_per_full_token, plan._compute_dsv4_sizes(8192, 256)))
     assert results[0] == results[1] == results[2]
+    sizes = results[0][1]
+    assert sizes.full_max_total_num_tokens == 2 * 4 * sizes.c4_max_total_num_tokens
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "true", "1.5", '"2"', "null"])
+def test_invalid_logical_capacity_ratio(raw):
+    with pytest.raises(ValueError, match="logical_capacity_ratio"):
+        parse_kvduo_config(
+            SimpleNamespace(kvduo_config='{"logical_capacity_ratio":' + raw + "}")
+        )
+
+
+@pytest.mark.parametrize("host_size", [0, 0.5, 64])
+@pytest.mark.parametrize("logical_ratio", [2, 4])
+def test_generic_logical_slots_survive_physical_offload(host_size, logical_ratio):
+    import torch
+    from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+    from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
+
+    args = ServerArgs(
+        model_path="dummy",
+        enable_kvduo=True,
+        kvduo_config=json.dumps(
+            {"host_size": host_size, "logical_capacity_ratio": logical_ratio}
+        ),
+    )
+    args._handle_kvduo_aliases()
+    ratio = parse_hisparse_config(args).host_to_device_ratio
+    pool = HiSparseDSATokenToKVPool(
+        size=1024,
+        page_size=64,
+        kv_lora_rank=12,
+        dtype=torch.bfloat16,
+        qk_rope_head_dim=4,
+        layer_num=2,
+        device="cpu",
+        index_head_dim=128,
+        enable_memory_saver=False,
+        kv_cache_dim=16,
+        enable_kvduo=True,
+        host_to_device_ratio=ratio,
+    )
+    allocator = HiSparseTokenToKVPoolAllocator(
+        1024, 64, pool.dtype, "cpu", pool, False, host_to_device_ratio=ratio
+    )
+    logical = allocator.logical_attn_allocator
+    physical = allocator.hisparse_attn_allocator
+    occupied = logical.alloc(1024)
+    locations = physical.alloc(1024)
+    allocator.full_to_hisparse_device_index_mapping[occupied] = locations
+    allocator.free_hisparse(occupied[:768])
+    assert physical.available_size() == 768
+    assert logical.available_size() == (logical_ratio - 1) * 1024
+    next_page = logical.alloc(64)
+    assert next_page is not None and int(next_page.min()) > 1024
+    # An offloaded token's indexer remains GPU-resident at its logical address.
+    indexer = pool.index_k_with_scale_buffer[0]
+    assert indexer.shape[0] * pool.page_size >= (logical_ratio * 1024 + 64)
+    assert physical.alloc(64) is not None
+
+
+def test_dsv4_logical_and_indexer_capacity_survive_full_offload(monkeypatch):
+    import torch
+    from test_kvduo_prefill_state import stack
+
+    c = stack(monkeypatch)
+    allocator = c.token_to_kv_pool_allocator
+    logical = allocator.logical_attn_allocator.full_attn_allocator
+    physical = allocator.hisparse_attn_allocator
+    kv = allocator.get_kvcache()
+    assert logical.size == physical.size * 4 * 2
+    full = logical.alloc(physical.size * 4)
+    locations = physical.alloc(physical.size)
+    compressed = torch.arange(int(full[0]) // 4, (int(full[-1]) + 1) // 4)
+    allocator.full_to_hisparse_device_index_mapping[compressed] = locations
+    allocator.free_compressed(compressed[:768])
+    assert physical.available_size() == 768
+    assert logical.available_size() == 4096
+    next_page = logical.alloc(256)
+    assert next_page is not None
+    assert kv.c4_logical_size == logical.size // 4
+    indexer = kv.c4_indexer_kv_pool.index_k_with_scale_buffer[0]
+    assert indexer.shape[0] * 64 >= kv.c4_logical_size
+    assert physical.alloc(64) is not None
+    # Automatic Host sizing uses physical capacity, not logical overcommit.
+    budget = plan_dsv4_host_budget(allocator, 0)
+    assert budget.full_pages == 2 * physical.size // physical.page_size

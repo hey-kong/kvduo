@@ -657,7 +657,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
         if self.c4_shrink_factor > 1:
-            logger.info(f"HiSparse c4 host-to-device ratio = {self.c4_shrink_factor}")
+            if getattr(kvc.server_args, "enable_kvduo", False):
+                logger.info(
+                    "KVDuo logical capacity ratio = %s (independent of host_size)",
+                    self.c4_shrink_factor,
+                )
+            else:
+                logger.info(
+                    f"HiSparse c4 host-to-device ratio = {self.c4_shrink_factor}"
+                )
 
         self.c4_ring_size = get_compress_state_ring_size(4, self.is_speculative)
         self.c128_ring_size = get_compress_state_ring_size(128, self.is_speculative)

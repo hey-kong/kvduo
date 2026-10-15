@@ -7846,7 +7846,8 @@ class ServerArgs:
                 "top_k": kvduo.top_k,
                 # Capture-stable maximum-tier metadata; physical pages remain lazy.
                 "device_buffer_size": 16 * kvduo.top_k,
-                "host_to_device_ratio": 1,
+                # Shared allocator/indexer sizing only; Host uses host_size.
+                "host_to_device_ratio": kvduo.logical_capacity_ratio,
                 "swap_in_block_size": kvduo.swap_in_block_size,
             }
         )

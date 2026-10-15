@@ -26,7 +26,8 @@ def test_waiting_host_prefix_chunk_defers_optional_growth_without_merge(dsv4):
     req.prefix_indices = torch.arange(page, dtype=torch.int64)
     req.host_hit_length = page
     req.full_untruncated_fill_ids = list(range(4 * page))
-    c.mem_pool_host = make_host_pool(0, c.page_size)
+    c.mem_pool_host = make_host_pool(4 * c.page_size, c.page_size)
+    assert c.mem_pool_host.alloc(c.mem_pool_host.size) is not None
     p.free_pages = 1
     before = c.kvduo_req_hot_capacity.clone()
     c.reclaim_kvduo_hot_pages = MagicMock(wraps=c.reclaim_kvduo_hot_pages)

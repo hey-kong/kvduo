@@ -1183,6 +1183,13 @@ class HiSparseCoordinator:
         fill_ids = req.full_untruncated_fill_ids
         length = len(fill_ids) // self.compress_ratio
         capacity = (length + self.page_size - 1) // self.page_size * self.page_size
+        if capacity > self.mem_pool_host.size:
+            req.set_finish_with_abort(
+                "KVDuo prompt exceeds total Host main-KV capacity "
+                f"(required={capacity}, capacity={self.mem_pool_host.size} slots); "
+                "reduce the prompt length or increase kvduo host_size"
+            )
+            return False
         records = []
         owner = ("kvduo-prefill", key)
         try:

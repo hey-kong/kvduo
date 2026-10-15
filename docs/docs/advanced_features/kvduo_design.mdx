@@ -154,16 +154,17 @@ python3 -m sglang.launch_server \
 | --- | ---: | --- |
 | `top_k` | `2048` | 每层选择宽度；最低 HOT 页数为 `ceil(top_k / K)` |
 | `host_size` | `0` | 每个 rank 的 Host KV 总预算，单位 GB（10^9 字节）；0 按设备池布局的 2 倍自动估算 |
+| `logical_capacity_ratio` | `2` | logical 槽位相对主 KV 物理槽位的超配倍数，并规划配套 indexer 容量；独立于 Host 预算 |
 | `swap_in_block_size` | `960` | Resolver CUDA block 线程数，须为 32 的倍数且不超过设备上限，通常为 32–1024 |
 | `tail_protected_pages` | `2` | 每请求保护的最新 FULL 页数 |
 | `full_reclaim_policy` | `"request"` | `"request"` 按请求批量释放全部合格 FULL 页；`"page"` 按页 LRU 回收 |
 | `max_relative_miss_increase` | `0.10` | 设计点 2 普通 HOT 缩容的预计 miss 相对增幅容忍比例 |
 | `decode_emergency_reclaim` | `false` | 开启后，必需 decode 的普通回收失败时允许 HOT 应急缩至最低容量，优先避免整请求回退 |
 
-`top_k`、`swap_in_block_size` 和 `tail_protected_pages` 须为正整数，`host_size` 须为有限非负数，回收策略只接受 `"request"` 或 `"page"`，miss 容忍比例须为有限非负数，应急开关须为布尔值；未知字段报错。`--kvduo-config` 必须配合 `--enable-kvduo`。默认 10% 是实验初值。
+`top_k`、`logical_capacity_ratio`、`swap_in_block_size` 和 `tail_protected_pages` 须为正整数，`host_size` 须为有限非负数，回收策略只接受 `"request"` 或 `"page"`，miss 容忍比例须为有限非负数，应急开关须为布尔值；未知字段报错。`--kvduo-config` 必须配合 `--enable-kvduo`。默认 10% 是实验初值。
 
 KVDuo 要求 RadixTree，不能与 HiSparse、HiCache 或 speculative decoding 同时启用；支持 chunked prefill，不改其分块设置。通用 DSA 和 DeepSeek-V4 均按实际存储层数计算 HOT 页容量；`flashmla_kv` 要求 FP8 KV 存储，BF16 使用受支持的其他稀疏 backend。
 
 KVDuo 的 `--swa-full-tokens-ratio` 默认值沿用对应模型，不再减半；DeepSeek-V4 为 `0.1`。显式设置仍优先。
 
-`host_size` 覆盖主 KV、indexer、C128、SWA 和前缀恢复所需压缩状态的 Host 数据池；固定预算按页向下对齐，不包括控制元数据和临时搬运缓冲区。它不改变 HBM 分池或 logical 容量。启动日志报告各 Host 池实际分配字节数。KVDuo 不再接受 `host_to_device_ratio`，旧命令需删除该字段并改用 `host_size`；HiSparse 的配置保持不变。
+`host_size` 覆盖主 KV、indexer、C128、SWA 和前缀恢复所需压缩状态的 Host 数据池；固定预算按页向下对齐，不包括控制元数据和临时搬运缓冲区。它不改变 HBM 分池或 logical 容量；后两者由独立的 `logical_capacity_ratio` 规划，其额外 indexer 开销计入 HBM 总预算。单请求所需主 KV 后备超过 Host 主池总容量时明确拒绝；仅因临时占用不足时等待。启动日志报告各 Host 池实际分配字节数。KVDuo 不再接受 `host_to_device_ratio`，旧命令需删除该字段并改用 `host_size`；HiSparse 的配置保持不变。

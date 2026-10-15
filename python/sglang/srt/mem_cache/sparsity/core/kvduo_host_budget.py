@@ -65,7 +65,7 @@ def plan_dsv4_host_budget(allocator, host_size):
     if getattr(kv, "_unified_kv", False):
         raise ValueError("KVDuo Host SWA requires the paged DeepSeek-V4 layout")
     main = allocator.hisparse_kvcache
-    full_pages = (allocator.size_full + allocator.page_size - 1) // allocator.page_size
+    full_pages = main.size // main.page_size
     swa_pages = (kv.swa_size + kv.swa_page_size - 1) // kv.swa_page_size
     full_bytes = {"c4": len(main.kv_buffer) * main.bytes_per_page_padded}
     if kv.c4_indexer_kv_pool is not None:

@@ -143,6 +143,7 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
     known = {
         "top_k",
         "host_size",
+        "logical_capacity_ratio",
         "swap_in_block_size",
         "tail_protected_pages",
         "max_relative_miss_increase",
@@ -154,6 +155,7 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         raise ValueError(f"Unknown kvduo_config field(s): {sorted(unknown)}")
 
     top_k = values.get("top_k", DEFAULT_TOP_K)
+    logical_ratio = values.get("logical_capacity_ratio", 2)
     host_size = values.get("host_size", 0)
     if (
         isinstance(host_size, bool)
@@ -165,6 +167,7 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
     block_size = values.get("swap_in_block_size", DEFAULT_SWAP_IN_BLOCK_SIZE)
     tail_pages = values.get("tail_protected_pages", DEFAULT_TAIL_PROTECTED_PAGES)
     fields = {
+        "logical_capacity_ratio": logical_ratio,
         "top_k": top_k,
         "swap_in_block_size": block_size,
         "tail_protected_pages": tail_pages,
@@ -196,6 +199,7 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
     return KVDuoConfig(
         top_k=top_k,
         host_size=host_size,
+        logical_capacity_ratio=logical_ratio,
         swap_in_block_size=block_size,
         tail_protected_pages=tail_pages,
         max_relative_miss_increase=policy.max_relative_miss_increase,
