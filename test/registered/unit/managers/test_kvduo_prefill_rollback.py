@@ -992,7 +992,7 @@ def test_no_new_generation_or_evaluation_phase_can_use_old_round_reference():
     assert c._kvduo_request_generation[1] == 1
 
 
-def test_prefill_completion_keeps_limits_until_real_headroom_and_discards_old_events():
+def test_prefill_completion_unlocks_without_headroom_and_discards_old_events():
     c, p = ready_coordinator()
     token = c.reserve_kvduo_prefill(3, [0])
     c.consume_kvduo_prefill_reservation(token, 3)
@@ -1001,7 +1001,8 @@ def test_prefill_completion_keeps_limits_until_real_headroom_and_discards_old_ev
     c.kvduo_hot_growth_events[0, 0] = 3
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
     assert (
-        c._kvduo_object_limited((0, 0)) and c.kvduo_req_hot_capacity[0, 0].item() == 16
+        not c._kvduo_object_limited((0, 0))
+        and c.kvduo_req_hot_capacity[0, 0].item() == 16
     )
     assert c.kvduo_hot_growth_events[0, 0].item() == 0
     p.free_pages = 1

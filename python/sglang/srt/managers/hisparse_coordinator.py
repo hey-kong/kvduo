@@ -2090,11 +2090,7 @@ class HiSparseCoordinator:
         requests = [
             (layer, req, current, target, grow)
             for layer, req, current, target, grow in requests
-            if grow > 0
-            and (
-                not self._kvduo_object_limited((layer, req))
-                or (layer, req) in self._kvduo_recovering_objects
-            )
+            if grow > 0 and not self._kvduo_object_limited((layer, req))
         ]
         pages_needed = sum(grow // K for _, _, _, _, grow in requests)
         physical_slots = pages_needed * self.page_size
@@ -2103,8 +2099,7 @@ class HiSparseCoordinator:
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         if not allow_reclaim and (
             allocator.available_size()
-            - (self._kvduo_optional_protected_pages() - self._kvduo_recovery_credits)
-            * self.page_size
+            - self._kvduo_optional_protected_pages() * self.page_size
             < physical_slots
         ):
             return
@@ -2629,8 +2624,8 @@ class HiSparseCoordinator:
             for owner, events in growth_events.items()
             if int(self.kvduo_req_hot_capacity[owner]) >= event_capacities[owner]
         }
-        # Optional growth can reclaim any Hand-eligible HOT owner, including
-        # applicants, never FULL pages. Released surplus stays in the free pool.
+        # Decode growth may reclaim eligible FULL, then Hand-eligible HOT.
+        # Prefill protection is covered before any optional reclamation.
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         self._recover_kvduo_objects(growth_events)
         reserved_pages = self._kvduo_optional_protected_pages()
@@ -2656,14 +2651,62 @@ class HiSparseCoordinator:
         # frozen miss budget before releasing active HOT pages.
         if common_free < reserved_pages:
             return
-        shortfall = sum(applicants.values()) - (common_free - reserved_pages)
+
+        def growth_shortfall():
+            return max(
+                0,
+                sum(applicants.values())
+                + self._kvduo_optional_protected_pages()
+                - self._kvduo_common_available(
+                    allocator.available_size() // self.page_size
+                ),
+            )
+
+        shortfall = max(0, sum(applicants.values()) - (common_free - reserved_pages))
         if shortfall > 0:
-            self.reclaim_kvduo_hot_pages(shortfall * self.page_size)
+            if self.full_reclaim_policy == "page":
+                for req_idx in sorted({req for _, req in applicants}):
+                    if shortfall == 0:
+                        break
+                    demand = sum(
+                        pages
+                        for (_, req), pages in applicants.items()
+                        if req == req_idx
+                    )
+                    self.reclaim_kvduo_full_pages(
+                        min(shortfall, demand) * self.page_size,
+                        reserve_hot_minimum=True,
+                        request_indices={req_idx},
+                    )
+                    shortfall = growth_shortfall()
+            if shortfall > 0:
+                self.reclaim_kvduo_full_pages(
+                    shortfall * self.page_size, reserve_hot_minimum=True
+                )
+
+            # A FULL donor can be in this replay batch. Publish every donor's
+            # compulsory HOT minimum before optional growth or graph execution.
+            donors = set(self._kvduo_pending_hot_minimum)
+            minimum_targets = {
+                (layer, req): self.min_hot_pages * self.hot_page_size
+                for req in donors
+                if req in self._active_kvduo_reqs
+                for layer in range(self.mem_pool_device.layer_num)
+                if int(self.kvduo_req_hot_capacity[layer, req])
+                < self.min_hot_pages * self.hot_page_size
+            }
+            if minimum_targets:
+                self._ensure_kvduo_hot_capacity_targets_batch(minimum_targets)
+            self._kvduo_pending_hot_minimum.difference_update(donors)
+            shortfall = growth_shortfall()
+            if shortfall > 0:
+                self.reclaim_kvduo_hot_pages(shortfall * self.page_size)
             applicants = {
                 owner: pages
                 for owner, pages in applicants.items()
                 if int(self.kvduo_req_hot_capacity[owner]) >= event_capacities[owner]
             }
+            reserved_pages = self._kvduo_optional_protected_pages()
             common_free = self._kvduo_common_available(
                 allocator.available_size() // self.page_size
             )
@@ -3064,8 +3107,6 @@ class HiSparseCoordinator:
         )
         self._kvduo_next_prefill_pages = 0
         self._kvduo_next_prefill_key = None
-        self._kvduo_recovery_credits = 0
-        self._kvduo_recovering_objects = set()
         self._kvduo_fixed_queue = {}
         self._kvduo_fixed_sequence = 0
         self._kvduo_prefill_lifecycle = {}
@@ -3119,9 +3160,6 @@ class HiSparseCoordinator:
         ):
             bank[:, req_idx] = 0
         self._kvduo_prefill_limited_objects.difference_update(old_keys)
-        self._kvduo_recovering_objects.difference_update(
-            (layer, req_idx) for layer in range(self.mem_pool_device.layer_num)
-        )
         for key in old_keys:
             self._kvduo_prefill_budget_cost.pop(key, None)
             self._kvduo_prefill_block_leases.pop(key, None)
@@ -3284,7 +3322,7 @@ class HiSparseCoordinator:
         self._kvduo_next_prefill_key = None
 
     def kvduo_complete_prefill(self, req) -> None:
-        """Keep every completed prefill FULL until its first decode."""
+        """Mark associated HOT locks eligible for release at a safe boundary."""
         key = self._kvduo_prefill_key(req)
         self._kvduo_prefill_lifecycle[key][1] = "ready"
 
@@ -3331,7 +3369,6 @@ class HiSparseCoordinator:
             self._kvduo_reserved_prefill_pages()
             + self._kvduo_mandatory_hot_pages()
             + self._kvduo_prefill_plan_uncovered_pages()
-            + self._kvduo_recovery_credits
         )
 
     def _kvduo_recovery_ready(self, key) -> bool:
@@ -3371,7 +3408,6 @@ class HiSparseCoordinator:
         self._prune_kvduo_prefill_budget()
         if not self._kvduo_prefill_limited_objects:
             return
-        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         objects = []
         for key in sorted(self._kvduo_prefill_limited_objects):
             objects.append(
@@ -3381,46 +3417,12 @@ class HiSparseCoordinator:
                     self._kvduo_recovery_ready(key),
                 )
             )
-        available = (
-            self._kvduo_common_available(allocator.available_size() // self.page_size)
-            - self._kvduo_reserved_prefill_pages()
-            - self._kvduo_mandatory_hot_pages()
-        )
-        selected = plan_kvduo_recovery(
-            objects, available, self._kvduo_prefill_plan_uncovered_pages()
-        )
-        targets = {
-            key[:2]: int(self.kvduo_req_hot_capacity[key[:2]]) + self.hot_page_size
-            for key in selected
-            if events.get(key[:2], 0) > 0
-        }
-        if not self._kvduo_consensus((selected, tuple(sorted(targets.items())))):
+        selected = plan_kvduo_recovery(objects)
+        if not self._kvduo_consensus(selected) or not selected:
             return
-        if not selected:
+        ready = all(self._kvduo_recovery_ready(key) for key in selected)
+        if not self._kvduo_consensus(ready) or not ready:
             return
-        quantum = len(selected)
-        redeemable = (
-            allocator.available_size() // self.page_size
-            - self._kvduo_optional_protected_pages()
-            >= quantum
-            and all(self._kvduo_recovery_ready(key) for key in selected)
-        )
-        if not self._kvduo_consensus(redeemable) or not redeemable:
-            return
-        self._kvduo_recovery_credits = quantum
-        self._kvduo_recovering_objects = {key[:2] for key in selected}
-        try:
-            self._ensure_kvduo_hot_capacity_targets_batch(targets, allow_reclaim=False)
-            if any(
-                int(self.kvduo_req_hot_capacity[owner]) != target
-                for owner, target in targets.items()
-            ):
-                raise RuntimeError(
-                    "KVDuo object recovery could not redeem its reserved credits"
-                )
-        finally:
-            self._kvduo_recovery_credits = 0
-            self._kvduo_recovering_objects = set()
         for key in selected:
             events.pop(key[:2], None)
             self._release_kvduo_prefill_hold(key)
@@ -4470,9 +4472,6 @@ class HiSparseCoordinator:
             if getattr(req, "hisparse_staging", False) or (
                 callable(getattr(req, "finished", None)) and req.finished()
             ):
-                continue
-            # A new arrival must reach its first decode with its FULL KV intact.
-            if getattr(req, "decode_batch_idx", 0) == 0:
                 continue
             protected_len = req.cache_protected_len
             if can_transfer:
