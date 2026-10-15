@@ -3134,6 +3134,7 @@ class HiSparseCoordinator:
         self._kvduo_hot_generation = {}
         self._kvduo_request_generation = [0] * requests
         self._kvduo_hot_tail_starts = {}
+        self._kvduo_tail_retry_pages = {}
         self._kvduo_tail_cleanup_pending = {}
         self._kvduo_decode_order = {}
         self._kvduo_decode_sequence = 0
@@ -3147,6 +3148,7 @@ class HiSparseCoordinator:
 
     def _reset_kvduo_prefill_request(self, req_idx: int) -> None:
         self._kvduo_hot_tail_starts.pop(req_idx, None)
+        self._kvduo_tail_retry_pages.pop(req_idx, None)
         self._kvduo_tail_cleanup_pending.pop(req_idx, None)
         if not hasattr(self, "kvduo_prefill_ema"):
             return
@@ -3312,6 +3314,16 @@ class HiSparseCoordinator:
             else KVDuoResidencyMode.FULL_RESIDENT
         )
 
+    def _publish_kvduo_tail_progress(self, progress) -> None:
+        for req_idx, generation, cursor, retry in progress:
+            self._kvduo_hot_tail_starts[req_idx] = (generation, cursor)
+            if retry:
+                self._kvduo_tail_retry_pages[req_idx] = set(retry)
+                self._kvduo_tail_cleanup_pending[req_idx] = generation
+            else:
+                self._kvduo_tail_retry_pages.pop(req_idx, None)
+                self._kvduo_tail_cleanup_pending.pop(req_idx, None)
+
     def _cleanup_kvduo_old_tails(self) -> None:
         if not self.enable_mixed_residency:
             return
@@ -3324,9 +3336,13 @@ class HiSparseCoordinator:
                 is not KVDuoResidencyMode.HOT_RESIDENT
             ):
                 pending.pop(req_idx)
+                record = self._kvduo_hot_tail_starts.get(req_idx)
+                if record is not None and record[0] == generation:
+                    self._kvduo_hot_tail_starts.pop(req_idx, None)
+                    self._kvduo_tail_retry_pages.pop(req_idx, None)
         if not pending:
             return
-        # Poll only page-turnover jobs; all ranks defer an unfinished backup.
+        # Poll queued turnover/retry jobs; all ranks defer an unfinished backup.
         # The reclaimer orders old readers with a stream wait, rather than
         # requiring an idle producer (which overlap scheduling may never offer).
         ready = (
@@ -3342,8 +3358,6 @@ class HiSparseCoordinator:
         self.reclaim_kvduo_full_pages(
             self.page_size, request_indices=owners, release_all=True, tail_cleanup=True
         )
-        for req_idx in owners:
-            pending.pop(req_idx, None)
 
     def begin_kvduo_schedule_boundary(self) -> None:
         state_cache = getattr(self, "kvduo_prefill_host_cache", None)
@@ -4521,6 +4535,7 @@ class HiSparseCoordinator:
             and getattr(self, "_kvduo_pressure_protected", None) is None
         )
         prefix_transfers = {}
+        tail_progress = {}
         candidate_pages = []
         candidate_meta = []
         for req_idx, req in sorted(self._active_kvduo_reqs.items()):
@@ -4555,6 +4570,10 @@ class HiSparseCoordinator:
             tail_first = max(0, num_pages - self.tail_protected_pages)
             first_owned_page = (prefix_len + self.page_size - 1) // self.page_size
             start = first_owned_page * self.page_size
+            host_valid_end = (
+                self._kvduo_host_valid_len[req_idx] // self.page_size * self.page_size
+            )
+            end = min(tail_first * self.page_size, host_valid_end)
             if tail_cleanup:
                 record = self._kvduo_hot_tail_starts.get(req_idx)
                 if (
@@ -4563,28 +4582,62 @@ class HiSparseCoordinator:
                     or not self._mixed_slots[req_idx]
                 ):
                     continue
-                start = max(start, record[1])
-            host_valid_end = (
-                self._kvduo_host_valid_len[req_idx] // self.page_size * self.page_size
-            )
-            end = min(tail_first * self.page_size, host_valid_end)
-            if end <= start:
-                continue
-            if tail_cleanup:
+                # Advance over newly expired pages once, but retain blocked
+                # offsets independently of the high-water mark for later retry.
+                expired_end = min(
+                    tail_first * self.page_size,
+                    compressed_len // self.page_size * self.page_size,
+                )
+                offsets = set(self._kvduo_tail_retry_pages.get(req_idx, ()))
+                offsets.update(range(record[1], expired_end, self.page_size))
+                tail_progress[req_idx] = (
+                    record[0],
+                    max(record[1], expired_end),
+                    offsets,
+                )
+                candidates = sorted(
+                    offset for offset in offsets if start <= offset < end
+                )
+                if not candidates:
+                    continue
+                # Gather only new or deferred pages, never the already released
+                # interval between a deferred page and the current cursor.
+                positions = torch.tensor(
+                    candidates, dtype=torch.int64, device=self.device
+                )
+                token_positions = (
+                    positions[:, None] * self.compress_ratio
+                    + torch.arange(
+                        self.page_size * self.compress_ratio, device=self.device
+                    )
+                ).flatten()
                 pages = self.mem_pool_device.translate_loc_from_full_to_compressed(
-                    self.req_to_token_pool.req_to_token[
-                        req_idx, start * self.compress_ratio : end * self.compress_ratio
-                    ]
+                    self.req_to_token_pool.req_to_token[req_idx, token_positions]
                 ).view(-1, self.page_size)
             else:
+                if end <= start:
+                    continue
+                candidates = range(start, end, self.page_size)
                 pages = compressed[start:end].view(-1, self.page_size)
             candidate_pages.append(pages)
-            candidate_meta.extend(
-                (req_idx, offset) for offset in range(start, end, self.page_size)
+            candidate_meta.extend((req_idx, offset) for offset in candidates)
+
+        def progress_after(discarded):
+            remaining = {req: set(record[2]) for req, record in tail_progress.items()}
+            for req_idx, offset in discarded:
+                remaining[req_idx].discard(offset)
+            return tuple(
+                (req_idx, generation, cursor, tuple(sorted(remaining[req_idx])))
+                for req_idx, (generation, cursor, _) in sorted(tail_progress.items())
             )
 
         if not candidate_pages:
-            self._kvduo_consensus(())
+            if tail_cleanup:
+                progress = progress_after(())
+                if self._kvduo_consensus(((), progress)):
+                    self._publish_kvduo_tail_progress(progress)
+            else:
+                self._kvduo_consensus(())
             return 0
         logical_pages = torch.cat(candidate_pages, dim=0)
         physical_pages, page_touch, valid = summarize_kvduo_full_pages(
@@ -4650,10 +4703,31 @@ class HiSparseCoordinator:
                 release_all=release_all,
             )
 
-        if (
-            not self._kvduo_consensus(tuple(candidate_meta[i] for i in selected))
-            or not selected
-        ):
+        selection = tuple(candidate_meta[i] for i in selected)
+        progress = ()
+        if tail_cleanup:
+            # A pressure reclaim may already have removed a deferred page.
+            # Retire absent mappings too, without counting them as newly freed.
+            absent = (
+                (
+                    (physical_pages == 0).all(dim=1)
+                    & (logical_pages >= 0).all(dim=1)
+                    & (logical_pages < self.full_data_version.numel()).all(dim=1)
+                )
+                .cpu()
+                .tolist()
+            )
+            retired = selection + tuple(
+                meta for meta, missing in zip(candidate_meta, absent) if missing
+            )
+            progress = progress_after(retired)
+            if not self._kvduo_consensus((selection, progress)):
+                return 0
+        elif not self._kvduo_consensus(selection):
+            return 0
+        if not selected:
+            if tail_cleanup:
+                self._publish_kvduo_tail_progress(progress)
             return 0
         selected_gpu = torch.tensor(selected, dtype=torch.int64, device=self.device)
         selected_logical = logical_pages[selected_gpu]
@@ -4699,6 +4773,8 @@ class HiSparseCoordinator:
         self.token_to_kv_pool_allocator.free_hisparse_indices(
             selected_physical.flatten()
         )
+        if tail_cleanup:
+            self._publish_kvduo_tail_progress(progress)
         return len(selected) * self.page_size
 
     def swap_in_selected_pages(
