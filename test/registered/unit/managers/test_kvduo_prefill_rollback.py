@@ -551,6 +551,7 @@ def test_host_restore_and_chunk_share_exact_reservation_and_cancellation_release
     physical.free_pages = 1
     adder, req = adder_and_req(coordinator, host_hit=4)
     req.full_untruncated_fill_ids = list(range(10))
+    req.sampling_params.max_new_tokens = 2
 
     def restore(_):
         assert coordinator._kvduo_reserved_prefill_pages() == 5
@@ -570,6 +571,7 @@ def test_host_restore_and_chunk_share_exact_reservation_and_cancellation_release
     physical.free_pages = 1
     adder, req = adder_and_req(coordinator, host_hit=4)
     req.full_untruncated_fill_ids = list(range(10))
+    req.sampling_params.max_new_tokens = 2
     adder.tree_cache.init_load_back.return_value = (None, None)
     assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
     assert not coordinator._kvduo_prefill_reservations

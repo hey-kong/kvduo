@@ -1657,10 +1657,13 @@ class HiSparseCoordinator:
             if self._kvduo_common_available(evicted.num_tokens_evicted) <= 0:
                 break
 
-    def ensure_kvduo_decode_capacity(self, requests, *, tree_cache=None):
-        # Spend only this batch's first-decode holds; failed admission retains them.
-        requests = list(requests)
+    @contextmanager
+    def kvduo_decode_reservation_scope(self, requests, *, consume=True):
+        # Admission only borrows credit; actual decode allocation consumes it.
         future = getattr(self, "_kvduo_prefill_future_pages", {})
+        if not future:
+            yield
+            return
         released = {}
         for req in requests:
             generation = getattr(req, "kvduo_prefill_generation", None)
@@ -1668,13 +1671,18 @@ class HiSparseCoordinator:
             if key in future:
                 released[key] = future.pop(key)
         try:
-            result = self._ensure_kvduo_decode_capacity(requests, tree_cache=tree_cache)
+            yield
         except Exception:
             future.update(released)
             raise
-        if result.action is not KVDuoPressureAction.SUCCESS:
-            future.update(released)
-        return result
+        else:
+            if not consume:
+                future.update(released)
+
+    def ensure_kvduo_decode_capacity(self, requests, *, tree_cache=None):
+        requests = list(requests)
+        with self.kvduo_decode_reservation_scope(requests, consume=False):
+            return self._ensure_kvduo_decode_capacity(requests, tree_cache=tree_cache)
 
     def _ensure_kvduo_decode_capacity(
         self, requests, *, tree_cache=None
@@ -3599,23 +3607,25 @@ class HiSparseCoordinator:
         )
         total = pages
         if needs_host:
+            remaining_output = getattr(
+                getattr(prefill_req, "sampling_params", None), "max_new_tokens", 2
+            ) - len(getattr(prefill_req, "output_ids", ()))
+            # Prefill itself emits one token, including after request retraction.
+            full_end = len(prefill_req.full_untruncated_fill_ids) + int(
+                remaining_output > 1
+            )
             total = max(
                 pages,
                 self.kvduo_prefill_pages(
                     len(prefill_req.prefix_indices),
-                    len(prefill_req.full_untruncated_fill_ids) + 1,
+                    full_end,
                 ),
             )
             capacity = (
                 self.token_to_kv_pool_allocator.hisparse_attn_allocator.size
                 // self.page_size
             )
-            if (
-                self.kvduo_prefill_pages(
-                    0, len(prefill_req.full_untruncated_fill_ids) + 1
-                )
-                > capacity
-            ):
+            if self.kvduo_prefill_pages(0, full_end) > capacity:
                 prefill_req.set_finish_with_abort(
                     "KVDuo FULL prefill and first decode exceed physical pool capacity; "
                     "reduce the prompt length or increase KV pool capacity"

@@ -110,6 +110,7 @@ def test_generic_prefill_reservation_funds_restore_and_keeps_fresh_tail_quota(
     cache_type,
 ):
     c, physical, adder, req = restore_setup(dsv4=False, cache_type=cache_type, extra=3)
+    req.sampling_params.max_new_tokens = 2
     assert physical.free_pages == 0
     assert adder.token_to_kv_pool_allocator.available_size() == 0
 
