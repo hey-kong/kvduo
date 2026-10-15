@@ -855,6 +855,9 @@ class ModelRunner:
             decode_emergency_reclaim=decode_emergency_reclaim,
         )
 
+        if self.server_args.enable_kvduo:
+            self.hisparse_coordinator.warmup_reclamation()
+
     def post_capture_resize_kv_pool(self):
         resize = compute_post_capture_kv_resize(self)
         self.max_total_num_tokens = resize.max_total_num_tokens
