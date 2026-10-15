@@ -72,8 +72,6 @@ struct KVDuoFullParams {
   const int32_t* observe = nullptr;
   const int32_t* real_requests = nullptr;
   const int64_t* clock_base = nullptr;
-  float* prefill_ema = nullptr;
-  int64_t* prefill_steps = nullptr;
   int64_t lookup_stride = 0;
   int64_t context = 0;
   int64_t request_count = 0;
@@ -88,7 +86,7 @@ struct TopKLaunchParams {
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
-  int32_t* __restrict__ raw_indices;      // optional raw (pre-transform) indices output; nullptr if unused
+  int32_t* __restrict__ raw_indices;  // optional raw (pre-transform) indices output; nullptr if unused
   int64_t* __restrict__ touch_clock;
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
   int64_t score_stride;
@@ -181,8 +179,6 @@ SGL_DEVICE void resolve_full(const TopKLaunchParams& params, uint32_t row) {
   }
   if (threadIdx.x == 0) {
     atomicAdd(full.stats + rid * 2 + 1, hits);
-    if (full.observe[0])
-      sglang::kvduo_update_prefill_ema(0, 0, hits, full.prefill_ema + rid * 2, full.prefill_steps[rid]);
   }
 }
 
@@ -642,8 +638,6 @@ struct TopKKernel {
       uint64_t observe,
       uint64_t real_requests,
       uint64_t clock_base,
-      uint64_t prefill_ema,
-      uint64_t prefill_steps,
       int64_t request_count,
       int64_t context,
       int64_t lookup_stride,
@@ -662,7 +656,7 @@ struct TopKKernel {
         "Invalid FULL metadata geometry");
     RuntimeCheck(
         output && requests && lookup && mapping && touches && status && stats && growth && observe && real_requests &&
-            clock_base && prefill_ema && prefill_steps,
+            clock_base,
         "FULL metadata pointers must be non-null");
     RuntimeCheck(
         full_page_size > 0 && std::has_single_bit(static_cast<uint64_t>(full_page_size)), "Invalid FULL page size");
@@ -683,8 +677,6 @@ struct TopKKernel {
         .observe = reinterpret_cast<const int32_t*>(observe),
         .real_requests = reinterpret_cast<const int32_t*>(real_requests),
         .clock_base = reinterpret_cast<const int64_t*>(clock_base),
-        .prefill_ema = reinterpret_cast<float*>(prefill_ema),
-        .prefill_steps = reinterpret_cast<int64_t*>(prefill_steps),
         .lookup_stride = lookup_stride,
         .context = context,
         .request_count = request_count,

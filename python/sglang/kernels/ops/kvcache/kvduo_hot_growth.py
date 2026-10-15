@@ -25,15 +25,12 @@ def publish_kvduo_hot_growth(
     capacity: torch.Tensor,
     capacity_ema: torch.Tensor,
     capacity_steps: torch.Tensor,
-    prefill_ema: torch.Tensor,
-    prefill_steps: torch.Tensor,
     *,
     current: int,
     target: int,
     page_size: int,
     storage_layers: int,
     layer_stride: int,
-    reset_prefill: bool,
 ) -> None:
     """Publish one prepared HOT growth transaction without allocating KV scratch."""
     K = page_size * storage_layers
@@ -62,8 +59,6 @@ def publish_kvduo_hot_growth(
         (capacity, torch.int32, (1,)),
         (capacity_ema, torch.float32, (9,)),
         (capacity_steps, torch.int64, (1,)),
-        (prefill_ema, torch.float32, (2,)),
-        (prefill_steps, torch.int64, (1,)),
     )
     if lru.dtype not in (torch.int16, torch.int32) or any(
         bank.ndim != 1
@@ -88,7 +83,6 @@ def publish_kvduo_hot_growth(
             page_size,
             storage_layers,
             layer_stride,
-            reset_prefill,
         )
     else:
         offsets = torch.arange(K, dtype=torch.int64)
@@ -111,7 +105,4 @@ def publish_kvduo_hot_growth(
         else:
             first, end = current // K, target // K
             capacity_ema[first:end] = capacity_ema[first - 1]
-        if reset_prefill:
-            prefill_ema.zero_()
-            prefill_steps.zero_()
         capacity.fill_(target)

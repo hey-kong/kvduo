@@ -2,10 +2,11 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
+
 #include <sgl_kernel/deepseek_v4/kvcacheio.cuh>
 
-#include <type_traits>
 #include <algorithm>
+#include <type_traits>
 #ifdef USE_ROCM
 #include <hipcub/hipcub.hpp>
 namespace merge_cub = hipcub;
@@ -273,7 +274,8 @@ __global__ void kvduo_hot_merge_copy_kernel(
         for (int64_t word = lane; word < row_bytes / 8; word += 32)
           reinterpret_cast<uint64_t*>(destination)[word] = reinterpret_cast<const uint64_t*>(source)[word];
       } else {
-        for (int64_t byte = lane; byte < row_bytes; byte += 32) destination[byte] = source[byte];
+        for (int64_t byte = lane; byte < row_bytes; byte += 32)
+          destination[byte] = source[byte];
       }
     }
   }
@@ -292,9 +294,6 @@ __global__ void kvduo_hot_merge_publish_kernel(
     float* capacity_ema,
     int64_t* capacity_steps,
     int32_t* growth,
-    int32_t* base_capacity,
-    float* prefill_ema,
-    int64_t* prefill_steps,
     int64_t padded,
     int target) {
   if (summary[0] != 0) return;
@@ -303,14 +302,13 @@ __global__ void kvduo_hot_merge_publish_kernel(
     tokens[slot] = new_tokens[slot];
     locations[slot] = new_locations[slot];
   }
-  for (int slot = tid; slot < CAPACITY; slot += BLOCK_SIZE) lru[slot] = new_lru[slot];
+  for (int slot = tid; slot < CAPACITY; slot += BLOCK_SIZE)
+    lru[slot] = new_lru[slot];
   if (tid < 9) capacity_ema[tid] = 0;
-  if (tid < 2) prefill_ema[tid] = 0;
   __syncthreads();
   if (tid == 0) {
-    *capacity_steps = *prefill_steps = 0;
+    *capacity_steps = 0;
     *growth = 0;
-    *base_capacity = target;
     *capacity = target;
   }
 }
@@ -337,37 +335,53 @@ void kvduo_hot_merge_execute(
     int64_t capacity_ptr,
     int64_t capacity_ema_ptr,
     int64_t capacity_steps_ptr,
-    int64_t growth_ptr,
-    int64_t base_capacity_ptr,
-    int64_t prefill_ema_ptr,
-    int64_t prefill_steps_ptr) {
+    int64_t growth_ptr) {
   using namespace host;
   RuntimeCheck(backing_ptr && rows > 0 && row_bytes > 0, "Invalid HOT merge backing");
   if constexpr (PAGED) RuntimeCheck(row_bytes == device::hisparse::kPageBytes, "Invalid C4 page layout");
   RuntimeCheck(
-      capacity_ptr && capacity_ema_ptr && capacity_steps_ptr && growth_ptr && base_capacity_ptr && prefill_ema_ptr &&
-          prefill_steps_ptr,
-      "Missing HOT merge publication metadata");
+      capacity_ptr && capacity_ema_ptr && capacity_steps_ptr && growth_ptr, "Missing HOT merge publication metadata");
   kvduo_hot_merge_plan<CAPACITY, BLOCK_SIZE>(
-      tokens, locations, lru, new_tokens, new_locations, new_lru, sources, destinations, workspace, summary,
-      capacity, k, target_pages, hash_size, rows * (PAGED ? device::hisparse::kPageSize : 1));
+      tokens,
+      locations,
+      lru,
+      new_tokens,
+      new_locations,
+      new_lru,
+      sources,
+      destinations,
+      workspace,
+      summary,
+      capacity,
+      k,
+      target_pages,
+      hash_size,
+      rows * (PAGED ? device::hisparse::kPageSize : 1));
   const auto device = tokens.device();
   const int warps = BLOCK_SIZE / 32;
   const int grid = std::min<int64_t>(128, div_ceil(target_pages * k, warps));
   LaunchKernel(grid, BLOCK_SIZE, device)(
-      kvduo_hot_merge_copy_kernel<BLOCK_SIZE, PAGED>, reinterpret_cast<void*>(backing_ptr),
-      static_cast<const int64_t*>(sources.data_ptr()), static_cast<const int64_t*>(destinations.data_ptr()),
-      static_cast<const int32_t*>(summary.data_ptr()), row_bytes);
+      kvduo_hot_merge_copy_kernel<BLOCK_SIZE, PAGED>,
+      reinterpret_cast<void*>(backing_ptr),
+      static_cast<const int64_t*>(sources.data_ptr()),
+      static_cast<const int64_t*>(destinations.data_ptr()),
+      static_cast<const int32_t*>(summary.data_ptr()),
+      row_bytes);
   LaunchKernel(1, BLOCK_SIZE, device)(
       kvduo_hot_merge_publish_kernel<CAPACITY, BLOCK_SIZE>,
-      static_cast<int32_t*>(tokens.data_ptr()), static_cast<int32_t*>(locations.data_ptr()),
-      static_cast<KVDuoMergeSlot<CAPACITY>*>(lru.data_ptr()), static_cast<const int32_t*>(new_tokens.data_ptr()),
+      static_cast<int32_t*>(tokens.data_ptr()),
+      static_cast<int32_t*>(locations.data_ptr()),
+      static_cast<KVDuoMergeSlot<CAPACITY>*>(lru.data_ptr()),
+      static_cast<const int32_t*>(new_tokens.data_ptr()),
       static_cast<const int32_t*>(new_locations.data_ptr()),
-      static_cast<const KVDuoMergeSlot<CAPACITY>*>(new_lru.data_ptr()), static_cast<const int32_t*>(summary.data_ptr()),
-      reinterpret_cast<int32_t*>(capacity_ptr), reinterpret_cast<float*>(capacity_ema_ptr),
-      reinterpret_cast<int64_t*>(capacity_steps_ptr), reinterpret_cast<int32_t*>(growth_ptr),
-      reinterpret_cast<int32_t*>(base_capacity_ptr), reinterpret_cast<float*>(prefill_ema_ptr),
-      reinterpret_cast<int64_t*>(prefill_steps_ptr), tokens.size(0), static_cast<int>(target_pages * k));
+      static_cast<const KVDuoMergeSlot<CAPACITY>*>(new_lru.data_ptr()),
+      static_cast<const int32_t*>(summary.data_ptr()),
+      reinterpret_cast<int32_t*>(capacity_ptr),
+      reinterpret_cast<float*>(capacity_ema_ptr),
+      reinterpret_cast<int64_t*>(capacity_steps_ptr),
+      reinterpret_cast<int32_t*>(growth_ptr),
+      tokens.size(0),
+      static_cast<int>(target_pages * k));
 }
 
 }  // namespace

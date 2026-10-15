@@ -22,9 +22,6 @@ def merge_banks(tokens, locations, lru):
         capacity_ema=torch.ones((*shape, 9), dtype=torch.float32, device="cuda"),
         capacity_steps=torch.full(shape, 65, dtype=torch.int64, device="cuda"),
         growth_events=torch.ones(shape, dtype=torch.int32, device="cuda"),
-        base_capacity=torch.zeros(shape, dtype=torch.int32, device="cuda"),
-        prefill_ema=torch.ones((*shape, 2), dtype=torch.float32, device="cuda"),
-        prefill_steps=torch.full(shape, 65, dtype=torch.int64, device="cuda"),
     )
 
 
@@ -96,10 +93,7 @@ def test_gpu_execution_reuses_fixed_workspace_and_preserves_payload_and_lru(
         ]
         assert all(torch.all(t[owner][m * k :] == -1) for t in (tokens, locations, lru))
         for name, bank in owner_banks.items():
-            assert torch.all(
-                bank
-                == (m * k if name in ("published_capacity", "base_capacity") else 0)
-            )
+            assert torch.all(bank == (m * k if name == "published_capacity" else 0))
         for layer in range(2):
             for req in range(2):
                 if (layer, req) != owner:

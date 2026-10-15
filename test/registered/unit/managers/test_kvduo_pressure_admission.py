@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.sparsity.core.kvduo_state import KVDuoPressureAction
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
 from test_kvduo_hot_growth import make_coordinator
-from test_kvduo_prefill_rollback import (
+from test_kvduo_prefill_admission import (
     actual_budget_adder_and_req,
     budget_allocator,
     ready_coordinator,
@@ -140,10 +140,9 @@ def test_decode_reclaims_radix_against_physical_shortfall_without_logical_overev
 
 
 @pytest.mark.parametrize("path", ["new", "chunk"])
-def test_prefill_evicts_radix_before_rejecting_an_immature_hot_rollback(path):
+def test_prefill_evicts_idle_radix_without_reclaiming_hot(path):
     coordinator, physical = ready_coordinator()
     coordinator.is_dsv4_hisparse = True
-    coordinator.kvduo_prefill_steps.zero_()
     adder, req = actual_budget_adder_and_req(coordinator, path=path)
     pages = 2 if path == "new" else 4
     adder.tree_cache.full_evictable_size.return_value = pages * 8
@@ -161,7 +160,6 @@ def test_prefill_evicts_radix_before_rejecting_an_immature_hot_rollback(path):
     adder.tree_cache.evict.assert_called_once()
     coordinator.reclaim_kvduo_full_pages.assert_not_called()
     assert physical.free_pages == coordinator._kvduo_reserved_prefill_pages() == pages
-    assert not coordinator._kvduo_prefill_limited_objects
     assert int(coordinator.kvduo_req_hot_capacity[0, 0]) == 28
 
 
@@ -306,7 +304,7 @@ def test_prefill_never_demotes_active_full_even_with_net_reclaimable_pages(
         layers=2, ratio=ratio, full_reclaim_policy=policy
     )
     before = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
-    assert c.reserve_kvduo_prefill(1, [0]) is None
+    assert c.reserve_kvduo_prefill(1) is None
     assert physical.free_pages == 0
     assert c._kvduo_mandatory_hot_pages() == 0
     assert not c._kvduo_reserved_prefill_pages()
@@ -317,7 +315,7 @@ def test_prefill_never_demotes_active_full_even_with_net_reclaimable_pages(
 
 def test_prefill_does_not_demote_full_when_new_hot_minimum_consumes_all_gain():
     coordinator, physical, req = make_full_coordinator(pages=4, layers=2)
-    assert coordinator.reserve_kvduo_prefill(1, [0]) is None
+    assert coordinator.reserve_kvduo_prefill(1) is None
     assert physical.free_pages == 0
     assert not coordinator._mixed_slots[0]
     assert not coordinator._kvduo_pending_hot_minimum
@@ -328,8 +326,8 @@ def test_prefill_does_not_demote_full_when_new_hot_minimum_consumes_all_gain():
 def test_prefill_full_protection_preserves_incoming_prefix_and_earlier_reservations():
     coordinator, physical, req = make_full_coordinator(layers=2)
     physical.free_pages = 1
-    first = coordinator.reserve_kvduo_prefill(1, [0])
-    second = coordinator.reserve_kvduo_prefill(1, [0], prefix_indices=torch.arange(4))
+    first = coordinator.reserve_kvduo_prefill(1)
+    second = coordinator.reserve_kvduo_prefill(1, prefix_indices=torch.arange(4))
     assert first is not None and second is None
     mapping = coordinator.mem_pool_device.full_to_hisparse_device_index_mapping
     assert torch.all(mapping[:4] > 0)
@@ -385,7 +383,7 @@ def test_fully_resident_finish_caches_only_prefill_pages(committed, expected):
 def test_mandatory_hot_allocation_cannot_spend_reserved_prefill_pages(allow_reclaim):
     coordinator, physical, _ = make_full_coordinator(pages=4)
     physical.free_pages = 1
-    token = coordinator.reserve_kvduo_prefill(1, [0])
+    token = coordinator.reserve_kvduo_prefill(1)
     assert token is not None
     coordinator._mixed_slots[0] = True
     coordinator._kvduo_pending_hot_minimum.add(0)

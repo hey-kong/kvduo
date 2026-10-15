@@ -717,9 +717,6 @@ def _kvduo_observation_case(selected=(2, 1), *, capacity=4, k=1, lru=(2, 0, 3, 1
         hot_growth_events=torch.zeros(1, dtype=torch.int32, device=DEVICE),
         touch_clock=torch.ones(1, dtype=torch.int64, device=DEVICE),
         observe_cache=torch.ones(1, dtype=torch.int32, device=DEVICE),
-        hot_base_capacities=torch.tensor([2], dtype=torch.int32, device=DEVICE),
-        prefill_ema=torch.zeros((1, 2), dtype=torch.float32, device=DEVICE),
-        prefill_steps=torch.zeros(1, dtype=torch.int64, device=DEVICE),
     )
     return kwargs
 
@@ -1310,7 +1307,7 @@ def test_kvduo_merge_copies_flat_c4_values_and_scales_before_freeing_pages():
     )
     coordinator.mem_pool_device.layer_num = 1
     coordinator._active_kvduo_reqs = {0: object()}
-    coordinator._init_kvduo_prefill_rollback_state(1)
+    coordinator._init_kvduo_capacity_state(1)
     coordinator.kvduo_hot_growth_events = torch.ones(
         (1, 1), dtype=torch.int32, device=DEVICE
     )
@@ -1362,7 +1359,6 @@ def test_kvduo_merge_copies_flat_c4_values_and_scales_before_freeing_pages():
     assert coordinator.lru_slots[0, 0, : 2 * k].cpu().tolist() == [2 * k - 1] + list(
         range(2 * k - 1)
     )
-    assert coordinator.kvduo_prefill_steps.item() == 0
 
 
 def test_kvduo_resolver_graph_replays_after_actual_merge_without_recapture():
@@ -1406,13 +1402,10 @@ def test_kvduo_resolver_graph_replays_after_actual_merge_without_recapture():
     coordinator.kvduo_req_hot_capacity_gpu = kwargs["req_hot_buffer_sizes"].unsqueeze(0)
     coordinator.mem_pool_device.layer_num = 1
     coordinator._active_kvduo_reqs = {0: object()}
-    coordinator._init_kvduo_prefill_rollback_state(1)
+    coordinator._init_kvduo_capacity_state(1)
     coordinator.kvduo_hot_growth_events = torch.ones(
         (1, 1), dtype=torch.int32, device=DEVICE
     )
-    coordinator.kvduo_hot_base_capacity = kwargs["hot_base_capacities"].unsqueeze(0)
-    coordinator.kvduo_prefill_ema = kwargs["prefill_ema"].unsqueeze(0)
-    coordinator.kvduo_prefill_steps = kwargs["prefill_steps"].unsqueeze(0)
     coordinator._kvduo_hot_generation[0, 0] = 0
     coordinator.req_device_buffer_tokens = kwargs["device_buffer_tokens"].unsqueeze(0)
     coordinator.req_device_buffer_token_locs = kwargs["device_buffer_locs"].unsqueeze(0)
@@ -1442,8 +1435,6 @@ def test_kvduo_resolver_graph_replays_after_actual_merge_without_recapture():
     graph.replay()
     torch.cuda.synchronize()
     assert kwargs["req_hot_buffer_sizes"].item() == 2
-    assert coordinator.kvduo_prefill_steps.item() == 1
-    assert coordinator.kvduo_prefill_ema.cpu().tolist() == [[[0, 2]]]
     for index, token in enumerate([5, 4]):
         location = kwargs["top_k_device_locs"][0, index].item()
         assert torch.equal(
@@ -1465,7 +1456,7 @@ def test_kvduo_resolver_graph_replays_after_actual_merge_without_recapture():
         "failed",
     ],
 )
-def test_kvduo_segment_and_extra_ema_use_actual_pre_update_hot_reuse_and_misses(kind):
+def test_kvduo_segment_ema_uses_actual_pre_update_hot_reuse_and_misses(kind):
     kwargs = _kvduo_observation_case()
     expected = [1, 0]  # slot2 extra, slot0 base, independent of LRU rank.
     observed = True
@@ -1507,8 +1498,6 @@ def test_kvduo_segment_and_extra_ema_use_actual_pre_update_hot_reuse_and_misses(
                 segments[(capacity - 1 - rank) // kwargs["page_size"]] += 1
     load_cache_to_device_buffer_mla(**kwargs)
     torch.cuda.synchronize()
-    assert kwargs["prefill_ema"].cpu().tolist() == [expected]
-    assert kwargs["prefill_steps"].item() == int(observed)
 
     assert kwargs["capacity_ema"].cpu().tolist() == [
         segments + [expected[1] if capacity and observed else 0]
@@ -1599,11 +1588,14 @@ def test_kvduo_ema_decays_on_valid_zero_counts_and_marks_reuse_after_h2d():
     kwargs = _kvduo_observation_case(selected=(3, 6))
     load_cache_to_device_buffer_mla(**kwargs)
     torch.cuda.synchronize()
-    assert kwargs["prefill_ema"].cpu().tolist() == [[0, 2]]
+    assert kwargs["capacity_ema"][0, 8].item() == 2
+    assert kwargs["capacity_ema"][0, :8].sum().item() == 0
+    assert kwargs["capacity_steps"].item() == 1
     load_cache_to_device_buffer_mla(**kwargs)
     torch.cuda.synchronize()
-    assert kwargs["prefill_ema"].cpu().tolist() == [[1 / 64, 2 * 63 / 64]]
-    assert kwargs["prefill_steps"].item() == 2
+    assert kwargs["capacity_ema"][0, 8].item() == 2 * 63 / 64
+    assert kwargs["capacity_ema"][0, :8].sum().item() == 2 / 64
+    assert kwargs["capacity_steps"].item() == 2
 
 
 @pytest.mark.parametrize("kind", ["valid", "invalid", "failed", "padding", "capture"])
@@ -1612,8 +1604,6 @@ def test_mixed_full_only_resolver_keeps_hot_metadata_and_observation_rules(kind)
     kwargs["full_to_device_loc"][[1, 2]] = torch.tensor([12, 13], device=DEVICE)
     kwargs["capacity_ema"].fill_(64)
     kwargs["capacity_steps"].fill_(65)
-    kwargs["prefill_ema"][0] = torch.tensor([8, 16], device=DEVICE)
-    kwargs["prefill_steps"].fill_(67)
     kwargs["hot_growth_events"].fill_(1)
     kwargs["touch_clock"].fill_(7)
     expected_accesses = 2
@@ -1639,12 +1629,8 @@ def test_mixed_full_only_resolver_keeps_hot_metadata_and_observation_rules(kind)
     assert kwargs["resolver_stats"].tolist() == [[0, expected_accesses]]
     observed = kind == "valid"
     assert kwargs["capacity_steps"].item() == 65 + observed
-    assert kwargs["prefill_steps"].item() == 67 + observed
     expected_capacity = [63] * 9 if observed else [64] * 9
     assert kwargs["capacity_ema"].tolist() == [expected_capacity]
-    assert kwargs["prefill_ema"].tolist() == [
-        [8 * (63 / 64 if observed else 1), 16 * (63 / 64 if observed else 1)]
-    ]
     assert kwargs["hot_growth_events"].item() == int(kind in {"padding", "capture"})
     if kind in {"valid", "capture"}:
         assert kwargs["top_k_device_locs"].tolist() == [[12, 13]]
@@ -1671,13 +1657,10 @@ def test_mixed_full_fast_path_graph_switches_to_hot_and_h2d_without_recapture():
     kwargs["observe_cache"].fill_(1)
     kwargs["capacity_ema"].zero_()
     kwargs["capacity_steps"].zero_()
-    kwargs["prefill_ema"].zero_()
-    kwargs["prefill_steps"].zero_()
     kwargs["full_to_device_loc"][2] = 0
     graph.replay()
     torch.cuda.synchronize()
     assert kwargs["top_k_device_locs"].tolist() == [[12, 1]]
-    assert kwargs["prefill_ema"].tolist() == [[1, 0]]
     kwargs["top_k_tokens"][0, 1] = 6
     graph.replay()
     torch.cuda.synchronize()
@@ -1688,15 +1671,12 @@ def test_mixed_full_fast_path_graph_switches_to_hot_and_h2d_without_recapture():
     assert kwargs["hot_growth_events"].item() == 0  # Already at maximum capacity.
     old_lru = kwargs["lru_slots"].clone()
     old_capacity_ema = kwargs["capacity_ema"].clone()
-    old_prefill_ema = kwargs["prefill_ema"].clone()
     kwargs["full_to_device_loc"][6] = 14
     graph.replay()
     torch.cuda.synchronize()
     assert kwargs["top_k_device_locs"].tolist() == [[12, 14]]
     assert torch.equal(kwargs["lru_slots"], old_lru)
     assert torch.equal(kwargs["capacity_ema"], old_capacity_ema * (63 / 64))
-    assert torch.equal(kwargs["prefill_ema"], old_prefill_ema * (63 / 64))
-    assert kwargs["capacity_steps"].item() == kwargs["prefill_steps"].item() == 3
     assert torch.equal(kwargs["device_buffer"][12], full_payload)
     assert addresses == [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
 
@@ -1870,8 +1850,6 @@ def test_generic_kvduo_resolver_reads_full_hot_and_host_across_layers_after_grap
     assert output[0, 1].item() == base_loc.item()
     assert output[0, 2].item() == extra_loc.item()
     assert backing[output[0].long(), 0, 0].tolist() == [10, 20, 30, 40]
-    assert c.kvduo_prefill_ema[1, 0].tolist() == [1, 1]
-    assert c.kvduo_prefill_steps[1, 0].item() == 1
     pointers = [
         bank.data_ptr()
         for bank in (
@@ -1897,8 +1875,6 @@ def test_generic_kvduo_resolver_reads_full_hot_and_host_across_layers_after_grap
     torch.cuda.synchronize()
     assert backing[output[0].long(), 0, 0].tolist() == [10, 20, 30, 40]
     # MRU retention includes the freshly inserted item; compaction is not an access.
-    assert c.kvduo_prefill_ema[1, 0].tolist() == [0, 0]
-    assert c.kvduo_prefill_steps[1, 0].item() == 1
     assert pointers == [
         bank.data_ptr()
         for bank in (
@@ -1909,28 +1885,6 @@ def test_generic_kvduo_resolver_reads_full_hot_and_host_across_layers_after_grap
             c.kvduo_req_hot_capacity_gpu,
         )
     ]
-    c.destroy()
-
-
-def test_generic_kvduo_fast_rollback_keeps_base_payload_and_filters_lru(monkeypatch):
-    c, pool, allocator = _generic_kvduo_stack(monkeypatch)
-    k = c.hot_page_size
-    c.req_device_buffer_tokens[1, 0, : 2 * k] = torch.arange(2 * k, device=DEVICE)
-    locs = c.req_device_buffer_token_locs[1, 0, : 2 * k].long()
-    pool.get_flat_key_buffer()[locs] = torch.arange(
-        2 * k, device=DEVICE, dtype=torch.bfloat16
-    )[:, None, None]
-    c.lru_slots[1, 0, : 2 * k] = torch.arange(2 * k, device=DEVICE).flip(0)
-    expected = pool.get_flat_key_buffer().clone()
-    base = c._kvduo_hot_base_pages[1, 0]
-    before = allocator.hisparse_attn_allocator.available_size()
-    c._rollback_kvduo_hot_batch(((1, 0),))
-    assert c._kvduo_req_layer_pages[1, 0] == list(base)
-    assert allocator.hisparse_attn_allocator.available_size() == before + 64
-    assert torch.equal(pool.get_flat_key_buffer(), expected)
-    assert c.lru_slots[1, 0, :k].tolist() == list(reversed(range(k)))
-    assert torch.all(c.req_device_buffer_tokens[1, 0, k:] == -1)
-    assert torch.all(c.req_device_buffer_token_locs[1, 0, k:] == -1)
     c.destroy()
 
 
@@ -1949,9 +1903,6 @@ def test_generic_resolver_preserves_lru_slots_above_int16_range():
         lru_slots=torch.arange(capacity, dtype=torch.int32, device=DEVICE).unsqueeze(0),
         hot_buffer_size=capacity,
         req_hot_buffer_sizes=torch.tensor([capacity], dtype=torch.int32, device=DEVICE),
-        hot_base_capacities=torch.tensor(
-            [capacity - 1], dtype=torch.int32, device=DEVICE
-        ),
         resolver_scratch=allocate_hisparse_resolver_scratch(
             1, 2, capacity, 256, torch.device(DEVICE)
         ),
@@ -1959,71 +1910,6 @@ def test_generic_resolver_preserves_lru_slots_above_int16_range():
     load_cache_to_device_buffer_mla(**kwargs)
     torch.cuda.synchronize()
     assert kwargs["lru_slots"][0, -2:].tolist() == [capacity - 2, capacity - 1]
-    assert kwargs["prefill_ema"].tolist() == [[1, 0]]
-
-
-@pytest.mark.parametrize("capacity", [8, 512, 39936])
-@pytest.mark.parametrize("page_size", [2, 64])
-@pytest.mark.parametrize("reset_stats", [False, True])
-def test_kvduo_batched_no_copy_rollback_preserves_graph_addresses_and_stable_lru(
-    capacity, page_size, reset_stats
-):
-    from sglang.kernels.ops.kvcache.hisparse import rollback_kvduo_hot_metadata
-
-    # Match the coordinator's padded banks and unpadded LRU. Selected owners
-    # cross both request and layer boundaries, exposing incorrect row strides.
-    padded_capacity = capacity + page_size
-    tokens = torch.arange(
-        2 * 3 * padded_capacity, dtype=torch.int32, device=DEVICE
-    ).view(2, 3, padded_capacity)
-    locations = (tokens + 100).clone()
-    slot_dtype = torch.int32 if capacity > 32767 else torch.int16
-    order = torch.arange(capacity, dtype=slot_dtype, device=DEVICE).flip(0)
-    lru = torch.stack([order.roll(i) for i in range(6)]).view(2, 3, capacity)
-    capacities = torch.full((2, 3), capacity, dtype=torch.int32, device=DEVICE)
-    statistics = (
-        (
-            torch.arange(1, 55, dtype=torch.float32, device=DEVICE).view(2, 3, 9),
-            torch.full((2, 3), 73, dtype=torch.int64, device=DEVICE),
-            torch.full((2, 3), 2, dtype=torch.int32, device=DEVICE),
-            torch.arange(1, 13, dtype=torch.float32, device=DEVICE).view(2, 3, 2),
-            torch.full((2, 3), 65, dtype=torch.int64, device=DEVICE),
-        )
-        if reset_stats
-        else ()
-    )
-    banks = (tokens, locations, lru, capacities, *statistics)
-    before = [bank.clone() for bank in banks]
-    addresses = [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
-    selected = {(0, 1): capacity // 2, (1, 0): capacity // 4, (1, 2): capacity * 3 // 4}
-    rollback_kvduo_hot_metadata(
-        torch.tensor(list(selected), dtype=torch.int64, device=DEVICE),
-        torch.tensor(list(selected.values()), dtype=torch.int32, device=DEVICE),
-        tokens,
-        locations,
-        lru,
-        capacities,
-        *statistics,
-    )
-    torch.cuda.synchronize()
-    for layer in range(2):
-        for req in range(3):
-            owner = (layer, req)
-            if owner not in selected:
-                for bank, original in zip(banks, before):
-                    assert torch.equal(bank[owner], original[owner])
-                continue
-            target = selected[owner]
-            old_order = before[2][owner]
-            assert torch.equal(lru[owner][:target], old_order[old_order < target])
-            assert torch.all(lru[owner][target:] == -1)
-            for bank, original in zip((tokens, locations), (before[0], before[1])):
-                assert torch.equal(bank[owner][:target], original[owner][:target])
-            assert torch.all(tokens[owner][target:] == -1)
-            assert torch.all(locations[owner][target:] == -1)
-            assert capacities[owner].item() == target
-            assert all(torch.all(bank[owner] == 0) for bank in statistics)
-    assert addresses == [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
 
 
 @pytest.mark.parametrize("active_capacity", [0, 78 * 64, 8 * 78 * 64])
@@ -2120,11 +2006,6 @@ def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_sc
         hot_growth_events=torch.zeros(requests, dtype=torch.int32, device=DEVICE),
         touch_clock=torch.ones(1, dtype=torch.int64, device=DEVICE),
         observe_cache=torch.ones(1, dtype=torch.int32, device=DEVICE),
-        hot_base_capacities=torch.full(
-            (requests,), base, dtype=torch.int32, device=DEVICE
-        ),
-        prefill_ema=torch.zeros((requests, 2), dtype=torch.float32, device=DEVICE),
-        prefill_steps=torch.zeros(requests, dtype=torch.int64, device=DEVICE),
         resolver_scratch=scratch,
         lru_scratch=lru_scratch,
     )
@@ -2135,9 +2016,6 @@ def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_sc
     output = kwargs["top_k_device_locs"]
     assert torch.equal(device[output[:2].long(), 0, 0], expected.flip(0))
     assert torch.all(output[2] == -1)
-    extra_hits = int(active_capacity > base and not full_only)
-    misses = topk - 2 if active_capacity and not full_only else 0
-    assert kwargs["prefill_ema"].tolist() == [[extra_hits, misses]] * requests
     if compact and (full_only or active_capacity == 0):
         assert torch.all(lru_scratch == -123)
     if scratch is not None:
@@ -2147,8 +2025,6 @@ def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_sc
     with torch.cuda.graph(graph):
         load_cache_to_device_buffer_mla(**kwargs)
     kwargs["observe_cache"].fill_(1)
-    kwargs["prefill_ema"].zero_()
-    kwargs["prefill_steps"].zero_()
     if scratch is not None:
         scratch.fill_(31)  # Scratch from older objects must never affect replay.
     if compact:
@@ -2156,112 +2032,11 @@ def test_large_resolver_full_one_page_and_max_capacity_replay_with_persistent_sc
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(device[output[:2].long(), 0, 0], expected.flip(0))
-    assert kwargs["prefill_ema"].tolist() == [[extra_hits, 0]] * requests
-    assert kwargs["prefill_steps"].tolist() == [1] * requests
     if compact and (full_only or active_capacity == 0):
         assert torch.all(lru_scratch == -321)
     assert addresses == [(bank.data_ptr(), bank.shape, bank.stride()) for bank in banks]
     if scratch is not None:
         assert torch.all(scratch[:, words:] == 31)
-
-
-@pytest.mark.parametrize("bad_bank", ["locations", "lru"])
-def test_kvduo_rollback_rejects_incompatible_bank_shapes_before_mutation(bad_bank):
-    from sglang.kernels.ops.kvcache.hisparse import rollback_kvduo_hot_metadata
-
-    tokens = torch.ones((2, 3, 10), dtype=torch.int32, device=DEVICE)
-    locations = tokens.clone()
-    lru = torch.arange(8, dtype=torch.int16, device=DEVICE).repeat(2, 3, 1)
-    if bad_bank == "locations":
-        locations = torch.ones((2, 3, 9), dtype=torch.int32, device=DEVICE)
-    else:
-        lru = torch.arange(12, dtype=torch.int16, device=DEVICE).repeat(2, 3, 1)
-    capacities = torch.full((2, 3), 8, dtype=torch.int32, device=DEVICE)
-    banks = (tokens, locations, lru, capacities)
-    before = [bank.clone() for bank in banks]
-    with pytest.raises(RuntimeError, match="Size mismatch|Padded metadata"):
-        rollback_kvduo_hot_metadata(
-            torch.tensor([[1, 2]], dtype=torch.int64, device=DEVICE),
-            torch.tensor([4], dtype=torch.int32, device=DEVICE),
-            *banks,
-        )
-    assert all(torch.equal(bank, original) for bank, original in zip(banks, before))
-
-
-@pytest.mark.parametrize("compact", [False, True])
-def test_kvduo_resolver_graph_replays_after_no_copy_rollback_without_recapture(compact):
-    from sglang.kernels.ops.kvcache.hisparse import rollback_kvduo_hot_metadata
-
-    kwargs = _kvduo_observation_case()
-    if compact:
-        kwargs["lru_scratch"] = torch.empty_like(kwargs["lru_slots"])
-    kwargs.update(
-        hot_base_capacities=torch.tensor([2], dtype=torch.int32, device=DEVICE),
-        prefill_ema=torch.zeros((1, 2), dtype=torch.float32, device=DEVICE),
-        prefill_steps=torch.zeros(1, dtype=torch.int64, device=DEVICE),
-    )
-    load_cache_to_device_buffer_mla(**kwargs)
-    kwargs["observe_cache"].zero_()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        load_cache_to_device_buffer_mla(**kwargs)
-    keys = (
-        "device_buffer_tokens",
-        "device_buffer_locs",
-        "lru_slots",
-        "req_hot_buffer_sizes",
-        "hot_base_capacities",
-        "prefill_ema",
-        "prefill_steps",
-        "capacity_ema",
-        "capacity_steps",
-        "hot_growth_events",
-    )
-    if compact:
-        keys += ("lru_scratch",)
-    addresses = [
-        (kwargs[key].data_ptr(), kwargs[key].shape, kwargs[key].stride())
-        for key in keys
-    ]
-    rollback_kvduo_hot_metadata(
-        torch.tensor([[0, 0]], dtype=torch.int64, device=DEVICE),
-        torch.tensor([2], dtype=torch.int32, device=DEVICE),
-        kwargs["device_buffer_tokens"].unsqueeze(0),
-        kwargs["device_buffer_locs"].unsqueeze(0),
-        kwargs["lru_slots"].unsqueeze(0),
-        kwargs["req_hot_buffer_sizes"].unsqueeze(0),
-        kwargs["capacity_ema"].unsqueeze(0),
-        kwargs["capacity_steps"].unsqueeze(0),
-        kwargs["hot_growth_events"].unsqueeze(0),
-        kwargs["prefill_ema"].unsqueeze(0),
-        kwargs["prefill_steps"].unsqueeze(0),
-    )
-    assert torch.all(kwargs["device_buffer_tokens"][:, 2:] == -1)
-    assert torch.all(kwargs["device_buffer_locs"][:, 2:] == -1)
-    assert all(
-        torch.all(kwargs[key] == 0)
-        for key in (
-            "capacity_ema",
-            "capacity_steps",
-            "hot_growth_events",
-            "prefill_ema",
-            "prefill_steps",
-        )
-    )
-    kwargs["observe_cache"].fill_(1)
-    kwargs["top_k_tokens"].copy_(
-        torch.tensor([[1, 6]], dtype=torch.int32, device=DEVICE)
-    )
-    graph.replay()
-    torch.cuda.synchronize()
-    assert kwargs["top_k_device_locs"].cpu().tolist() == [[9, 7]]
-    assert kwargs["prefill_ema"].cpu().tolist() == [[0, 1]]
-    assert kwargs["prefill_steps"].item() == 1
-    assert addresses == [
-        (kwargs[key].data_ptr(), kwargs[key].shape, kwargs[key].stride())
-        for key in keys
-    ]
-    assert torch.equal(kwargs["device_buffer"][7].cpu(), kwargs["host_cache"][6])
 
 
 @pytest.mark.parametrize("compact", [False, True])
@@ -2278,8 +2053,6 @@ def test_kvduo_graph_observes_new_capacity_without_recapture_or_synthetic_reuse(
     with torch.cuda.graph(graph):
         load_cache_to_device_buffer_mla(**kwargs)
     keys = (
-        "prefill_ema",
-        "prefill_steps",
         "capacity_ema",
         "capacity_steps",
         "req_hot_buffer_sizes",
@@ -2296,17 +2069,12 @@ def test_kvduo_graph_observes_new_capacity_without_recapture_or_synthetic_reuse(
     kwargs["lru_slots"][0] = torch.tensor(
         [2, 3, 0, 1], dtype=torch.int16, device=DEVICE
     )
-    kwargs["prefill_ema"].zero_()
-    kwargs["prefill_steps"].zero_()
     kwargs["observe_cache"].fill_(1)
     kwargs["top_k_tokens"][0] = torch.tensor([3, 6], dtype=torch.int32, device=DEVICE)
     graph.replay()
     torch.cuda.synchronize()
-    assert kwargs["prefill_ema"].cpu().tolist() == [[0, 2]]
     graph.replay()
     torch.cuda.synchronize()
-    assert kwargs["prefill_ema"].cpu().tolist() == [[2 / 64, 2 * 63 / 64]]
-    assert kwargs["prefill_steps"].item() == 2
     assert addresses == [
         (kwargs[key].data_ptr(), kwargs[key].shape, kwargs[key].stride())
         for key in keys

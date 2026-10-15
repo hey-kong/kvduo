@@ -223,3 +223,20 @@ def plan_kvduo_hot_merge(
         tuple(new_tokens),
         tuple(new_lru),
     )
+
+
+@dataclass(frozen=True)
+class KVDuoCapacityPolicy:
+    max_relative_miss_increase: float = 0.10
+
+    def __post_init__(self):
+        value = self.max_relative_miss_increase
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(
+                "max_relative_miss_increase must be a finite nonnegative number"
+            )

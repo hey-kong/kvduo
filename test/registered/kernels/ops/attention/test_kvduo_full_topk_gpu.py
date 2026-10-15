@@ -48,8 +48,6 @@ def test_fused_full_topk_replay_matches_addresses_page_ages_and_observations(
     stats = torch.zeros((3, 2, 2), dtype=torch.int32, device="cuda")
     status = torch.zeros((3, 2), dtype=torch.int32, device="cuda")
     growth = torch.ones_like(status)
-    ema = torch.full((3, 2, 2), 64.0, device="cuda")
-    steps = torch.full((3, 2), 65, dtype=torch.int64, device="cuda")
     observe = torch.zeros(1, dtype=torch.int32, device="cuda")
     real = torch.zeros(1, dtype=torch.int32, device="cuda")
     clock = torch.tensor([10], dtype=torch.int64, device="cuda")
@@ -69,8 +67,6 @@ def test_fused_full_topk_replay_matches_addresses_page_ages_and_observations(
             observe,
             real,
             base,
-            ema[layer],
-            steps[layer],
             layer,
             layer_stride,
             64,
@@ -125,8 +121,6 @@ def test_fused_full_topk_replay_matches_addresses_page_ages_and_observations(
         stats,
         status,
         growth,
-        ema,
-        steps,
         clock,
         base,
     )
@@ -135,8 +129,6 @@ def test_fused_full_topk_replay_matches_addresses_page_ages_and_observations(
         scores.neg_()
         requests[:2] = torch.tensor([step % 2, 1 - step % 2], device="cuda")
         before_stats = stats.clone()
-        before_ema = ema.clone()
-        before_steps = steps.clone()
         before_clock = clock.item()
         begin_kvduo_decode(clock, base, observe, real, batch_size=2, full_layers=3)
         graph.replay()
@@ -159,8 +151,6 @@ def test_fused_full_topk_replay_matches_addresses_page_ages_and_observations(
                 assert (stats - before_stats)[layer, rid].tolist() == [0, ids.numel()]
             ages = touches.reshape(-1, 64).amax(1)
             assert torch.all(ages[torch.unique(logical // 64)] == before_clock + 3)
-        assert torch.allclose(ema, before_ema * (63 / 64), rtol=0, atol=0)
-        assert torch.equal(steps, before_steps + 1)
         assert identities == [(t.data_ptr(), t.shape, t.stride()) for t in banks]
 
 
@@ -182,7 +172,7 @@ plan=plan_topk_v2(seq)
 i32=lambda shape:torch.zeros(shape,dtype=torch.int32,device="cuda")
 i64=lambda shape:torch.zeros(shape,dtype=torch.int64,device="cuda")
 real=i32((1,))
-spec=KVDuoFullTopK(resolved,i64((1,)),i64((1,4)),i64((1,)),i64((1,)),i32((1,)),i32((1,2)),i32((1,)),torch.ones(1,dtype=torch.int32,device="cuda"),real,i64((1,)),torch.zeros((1,2),device="cuda"),i64((1,)),0,64,64)
+spec=KVDuoFullTopK(resolved,i64((1,)),i64((1,4)),i64((1,)),i64((1,)),i32((1,)),i32((1,2)),i32((1,)),torch.ones(1,dtype=torch.int32,device="cuda"),real,i64((1,)),0,64,64)
 def run(): topk_transform_512_v2(scores,seq,pages,out,64,plan,raw,raw_only=True,full_metadata=spec)
 run()
 torch.cuda.synchronize()

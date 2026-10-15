@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.sparsity.core.kvduo_state import KVDuoPressureAction
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
 from test_kvduo_hot_growth import make_host_pool
-from test_kvduo_prefill_rollback import actual_budget_adder_and_req, ready_coordinator
+from test_kvduo_prefill_admission import actual_budget_adder_and_req, ready_coordinator
 from test_kvduo_pressure_admission import make_full_coordinator
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -64,7 +64,9 @@ def prompt(size=8, rid="incoming"):
 
 
 @pytest.mark.parametrize("path", ["new", "chunk"])
-def test_host_full_defers_prefill_before_hot_rollback_with_real_allocator_budgets(path):
+def test_host_full_defers_prefill_before_physical_admission_with_real_allocator_budgets(
+    path,
+):
     c, physical = ready_coordinator()
     adder, req = actual_budget_adder_and_req(c, path=path)
     c.is_dsv4_hisparse = True
@@ -85,7 +87,6 @@ def test_host_full_defers_prefill_before_hot_rollback_with_real_allocator_budget
     assert not hasattr(req, "extend_range")
     assert int(c.kvduo_req_hot_capacity[0, 0]) == 28
     assert torch.equal(c.req_device_buffer_tokens, before)
-    assert not c._kvduo_prefill_limited_objects
     assert not c._kvduo_prefill_host_reservations
     assert not c._kvduo_prefill_reservations
     c.reclaim_kvduo_full_pages.assert_not_called()
@@ -96,7 +97,8 @@ def test_host_full_defers_prefill_before_hot_rollback_with_real_allocator_budget
 def test_prefill_evicts_host_cache_and_keeps_complete_prompt_hold_after_chunk(
     path, slots
 ):
-    c, _ = ready_coordinator(extra=4 if path == "chunk" else 3)
+    c, physical = ready_coordinator(extra=4 if path == "chunk" else 3)
+    physical.free_pages = 4 if path == "chunk" else 3
     adder, req = actual_budget_adder_and_req(c, path=path)
     c.is_dsv4_hisparse = True
     pool = host_inventory(c, 256)
@@ -109,7 +111,7 @@ def test_prefill_evicts_host_cache_and_keeps_complete_prompt_hold_after_chunk(
     key = c._kvduo_prefill_key(req)
     assert c._kvduo_prefill_host_reservations[key][1] == slots
     assert pool.available_size() == slots
-    assert int(c.kvduo_req_hot_capacity[0, 0]) == 16
+    assert int(c.kvduo_req_hot_capacity[0, 0]) == (32 if path == "chunk" else 28)
     for token in adder.kvduo_prefill_reservations:
         c.finish_kvduo_prefill_reservation(token, cancelled=False)
     assert c._kvduo_prefill_host_reservations[key][1] == slots
@@ -127,7 +129,7 @@ def test_host_hold_rounds_compressed_complete_prompt_not_current_chunk(
     host_inventory(c, expected)
     req = prompt(length)
     req.extend_range = Range(0, 1)
-    token = c.reserve_kvduo_prefill(1, [0], prefill_req=req)
+    token = c.reserve_kvduo_prefill(1, prefill_req=req)
     assert token is not None
     assert c._kvduo_prefill_host_reservations[c._kvduo_prefill_key(req)][1] == expected
 
@@ -137,9 +139,9 @@ def test_other_prefills_and_decode_cannot_spend_host_hold_and_cancellation_relea
     physical.free_pages = 64
     pool = host_inventory(c, 8)
     first, second = prompt(6, "first"), prompt(4, "second")
-    token = c.reserve_kvduo_prefill(1, [0], prefill_req=first)
+    token = c.reserve_kvduo_prefill(1, prefill_req=first)
     assert token is not None and pool.available_size() == 8
-    assert c.reserve_kvduo_prefill(1, [0], prefill_req=second) is None
+    assert c.reserve_kvduo_prefill(1, prefill_req=second) is None
     assert c._kvduo_host_capacity_ready(2)
     assert not c._kvduo_host_capacity_ready(4)
     decode = SimpleNamespace(req_pool_idx=0, kv_committed_len=4)
@@ -151,7 +153,7 @@ def test_other_prefills_and_decode_cannot_spend_host_hold_and_cancellation_relea
     c.finish_kvduo_prefill_reservation(token, cancelled=True)
     assert not c._kvduo_prefill_host_reservations
     assert not hasattr(first, "kvduo_prefill_generation")
-    assert c.reserve_kvduo_prefill(1, [0], prefill_req=second) is not None
+    assert c.reserve_kvduo_prefill(1, prefill_req=second) is not None
 
 
 @pytest.mark.parametrize("valid,expected_slots", [(True, 2), (False, 4)])
@@ -163,7 +165,7 @@ def test_prefill_pins_only_reusable_contiguous_valid_host_pages(valid, expected_
     identity = c._host_prefix_identity(req, 0)
     record = cached_page(c, pool.alloc(2), identity=identity, valid=valid)
     unrelated = cached_page(c, pool.alloc(2))
-    token = c.reserve_kvduo_prefill(1, [0], prefill_req=req)
+    token = c.reserve_kvduo_prefill(1, prefill_req=req)
     assert token is not None
     key = c._kvduo_prefill_key(req)
     assert c._kvduo_prefill_host_reservations[key][1] == expected_slots
@@ -187,14 +189,13 @@ def test_failed_prefill_releases_new_host_hold_and_pins(failure):
             side_effect=RuntimeError("allocation")
         )
         with pytest.raises(RuntimeError, match="allocation"):
-            c.reserve_kvduo_prefill(1, [0], prefill_req=req)
+            c.reserve_kvduo_prefill(1, prefill_req=req)
     elif failure == "plan":
-        c.kvduo_prefill_steps.zero_()
-        assert c.reserve_kvduo_prefill(1, [0], prefill_req=req) is None
+        assert c.reserve_kvduo_prefill(1, prefill_req=req) is None
     else:
         physical.free_pages = 64
         with c.kvduo_prefill_reservation_scope():
-            assert c.reserve_kvduo_prefill(1, [0], prefill_req=req) is not None
+            assert c.reserve_kvduo_prefill(1, prefill_req=req) is not None
     assert not c._kvduo_prefill_host_reservations
     assert not record.pinned
 
@@ -204,11 +205,11 @@ def test_later_chunk_retry_keeps_existing_host_hold_until_request_ends():
     physical.free_pages = 64
     host_inventory(c, 8)
     req = prompt(8)
-    token = c.reserve_kvduo_prefill(1, [0], prefill_req=req)
+    token = c.reserve_kvduo_prefill(1, prefill_req=req)
     c.finish_kvduo_prefill_reservation(token, cancelled=False)
     key = c._kvduo_prefill_key(req)
     c._reserve_kvduo_prefill_physical = MagicMock(return_value=None)
-    assert c.reserve_kvduo_prefill(1, [0], prefill_req=req) is None
+    assert c.reserve_kvduo_prefill(1, prefill_req=req) is None
     assert c._kvduo_prefill_host_reservations[key][1] == 8
     c._end_kvduo_prefill_lifecycle(0, prompt(8, req.rid))
     assert key in c._kvduo_prefill_host_reservations
@@ -224,7 +225,7 @@ def test_request_finish_releases_host_hold_before_slot_reuse():
     host_inventory(c, 8)
     req.rid = "ending"
     req.full_untruncated_fill_ids = req.origin_input_ids
-    token = c.reserve_kvduo_prefill(1, [0], prefill_req=req)
+    token = c.reserve_kvduo_prefill(1, prefill_req=req)
     assert token is not None
     c.finish_kvduo_prefill_reservation(token, cancelled=False)
     assert c._kvduo_prefill_host_reservations
@@ -243,7 +244,7 @@ def test_staging_converts_hold_to_real_host_allocation_and_request_prefix_pin(
     pool = host_inventory(c, 8)
     req = prompt(8)
     record = cached_page(c, pool.alloc(2), identity=c._host_prefix_identity(req, 0))
-    token = c.reserve_kvduo_prefill(1, [0], prefill_req=req)
+    token = c.reserve_kvduo_prefill(1, prefill_req=req)
     c.finish_kvduo_prefill_reservation(token, cancelled=False)
     assert c._kvduo_prefill_host_reservations[c._kvduo_prefill_key(req)][1] == 6
     req.req_pool_idx = 1
@@ -345,22 +346,21 @@ def _tp_host_worker(rank, init_file):
     )
     try:
         c, physical = ready_coordinator()
-        physical.free_pages = 2
+        physical.free_pages = 5
         c.tp_world_size = 2
         c.tp_group = dist.group.WORLD
         pool = host_inventory(c, 8)
         if rank == 0:
             pool.alloc(8)
         req = prompt(8)
-        assert c.reserve_kvduo_prefill(1, [0], prefill_req=req) is None
+        assert c.reserve_kvduo_prefill(1, prefill_req=req) is None
         assert not c._kvduo_prefill_host_reservations
-        assert not c._kvduo_prefill_limited_objects
         assert int(c.kvduo_req_hot_capacity[0, 0]) == 28
         pool.clear()
         if rank == 0:
             for ordinal, locs in enumerate(pool.alloc(8).split(2)):
                 cached_page(c, locs, identity=c._host_prefix_identity(req, ordinal))
-        token = c.reserve_kvduo_prefill(1, [0], prefill_req=req)
+        token = c.reserve_kvduo_prefill(1, prefill_req=req)
         assert token is not None
         assert (
             c._kvduo_prefill_host_reservations[c._kvduo_prefill_key(req)][1] == 8 * rank
@@ -368,6 +368,9 @@ def _tp_host_worker(rank, init_file):
         c.finish_kvduo_prefill_reservation(token, cancelled=True)
         assert not c._kvduo_prefill_host_reservations
         assert all(not record.pinned for record in c.host_prefix_cache.records.values())
+        physical.free_pages = 0 if rank == 0 else 8
+        assert c.reserve_kvduo_prefill(1) is None
+        assert not c._kvduo_prefill_reservations
     finally:
         dist.destroy_process_group()
 

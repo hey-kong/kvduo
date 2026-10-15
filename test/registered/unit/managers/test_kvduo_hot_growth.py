@@ -60,12 +60,9 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
     coordinator.req_to_host_pool_allocated_len = torch.zeros(
         requests, dtype=torch.int64
     )
-    from sglang.srt.mem_cache.sparsity.core.kvduo_prefill_rollback import (
-        KVDuoPrefillPolicy,
-    )
 
-    coordinator.kvduo_prefill_policy = KVDuoPrefillPolicy()
-    coordinator._init_kvduo_prefill_rollback_state(requests)
+    coordinator.kvduo_max_relative_miss_increase = 0.10
+    coordinator._init_kvduo_capacity_state(requests)
     coordinator.kvduo_observe = torch.ones(1, dtype=torch.int32)
     # Match production: LRU has HOT capacity, other banks have page padding.
     metadata_shape = (layers, requests, coordinator.padded_buffer_size)
@@ -409,20 +406,11 @@ def test_resolver_ffi_receives_the_stable_growth_event_pointer(monkeypatch, dsv4
         touch_clock=torch.ones(1, dtype=torch.int64),
         hot_growth_events=coordinator.kvduo_hot_growth_events[0],
         observe_cache=coordinator.kvduo_observe,
-        hot_base_capacities=coordinator.kvduo_hot_base_capacity[0],
-        prefill_ema=coordinator.kvduo_prefill_ema[0],
-        prefill_steps=coordinator.kvduo_prefill_steps[0],
     )
 
     args = module.load_cache_to_device_buffer.call_args.args
     assert args[20] == coordinator.kvduo_hot_growth_events[0].data_ptr()
     assert args[12] == coordinator.kvduo_capacity_ema[0].data_ptr()
     assert args[27] == coordinator.kvduo_capacity_steps[0].data_ptr()
-    assert args[-8:-4] == (
-        coordinator.kvduo_observe.data_ptr(),
-        coordinator.kvduo_hot_base_capacity[0].data_ptr(),
-        coordinator.kvduo_prefill_ema[0].data_ptr(),
-        coordinator.kvduo_prefill_steps[0].data_ptr(),
-    )
     assert args[-4:] == (0, 0, 0, 0)  # This fixture keeps the original shared path.
     assert all(isinstance(arg, (int, bool, float)) for arg in args)

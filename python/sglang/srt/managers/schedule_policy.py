@@ -565,20 +565,8 @@ class PrefillAdder:
             return True, None
         coordinator.protect_kvduo_prefill_plan(req, end)
         pages = coordinator.kvduo_prefill_pages(len(req.prefix_indices), end)
-        indices = (
-            [
-                r.req_pool_idx
-                for r in self.running_batch.reqs
-                if r.req_pool_idx is not None
-                and not r.finished()
-                and not getattr(r, "hisparse_staging", False)
-            ]
-            if self.running_batch is not None
-            else []
-        )
         token = coordinator.reserve_kvduo_prefill(
             pages,
-            indices,
             tree_cache=self.tree_cache,
             prefix_indices=req.prefix_indices,
             prefill_req=req,

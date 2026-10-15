@@ -20,12 +20,8 @@ def native_observation(tmp_path_factory):
         pytest.skip("A C++ compiler is required")
     directory = tmp_path_factory.mktemp("kvduo-observation")
     source = directory / "observation.cpp"
-    source.write_text(
-        """
+    source.write_text("""
 #include <sgl_kernel/kvduo_cache_observation.h>
-extern "C" void observe(int e, int m, int d, float* counts, int64_t* steps) {
-  sglang::kvduo_update_prefill_ema(e,m,d,counts,*steps);
-}
 extern "C" void capacity(const int* hits, int m, int d, int n, float* counts, int64_t* steps) {
   sglang::kvduo_update_capacity_ema(hits,m,d,n,counts,*steps);
 }
@@ -36,8 +32,7 @@ extern "C" bool can_record_growth(bool full_lookup, bool observe, const int32_t*
                                   const int32_t* status, int64_t rid) {
   return sglang::kvduo_can_record_growth(full_lookup,observe,events,status,rid);
 }
-"""
-    )
+""")
     library = directory / "observation.so"
     subprocess.run(
         [
@@ -56,11 +51,6 @@ extern "C" bool can_record_growth(bool full_lookup, bool observe, const int32_t*
         text=True,
     )
     native = ctypes.CDLL(str(library))
-    native.observe.argtypes = [ctypes.c_int] * 3 + [
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_int64),
-    ]
-    native.observe.restype = None
     native.capacity.argtypes = (
         [ctypes.POINTER(ctypes.c_int)]
         + [ctypes.c_int] * 3
@@ -123,19 +113,6 @@ def test_production_lru_segments_use_pre_update_current_capacity(native_observat
     assert steps.value == 2
 
 
-def test_production_ema_initializes_and_includes_valid_zero_count_steps(
-    native_observation,
-):
-    counts = (ctypes.c_float * 2)(99, 99)
-    steps = ctypes.c_int64(0)
-    native_observation.observe(8, 20, 32, counts, ctypes.byref(steps))
-    assert list(counts) == [8, 20] and steps.value == 1
-    native_observation.observe(0, 0, 32, counts, ctypes.byref(steps))
-    assert list(counts) == [8 * 63 / 64, 20 * 63 / 64] and steps.value == 2
-    native_observation.observe(0, 0, 0, counts, ctypes.byref(steps))
-    assert list(counts) == [8 * 63 / 64, 20 * 63 / 64] and steps.value == 2
-
-
 def test_replay_reenables_observation_and_growth_keeps_capacity_history():
     c, _ = make_coordinator()
     c.kvduo_observe.zero_()
@@ -143,16 +120,11 @@ def test_replay_reenables_observation_and_growth_keeps_capacity_history():
     assert c.kvduo_observe.item() == 1
     c.kvduo_capacity_ema.fill_(3)
     c.kvduo_capacity_steps.fill_(65)
-    c.kvduo_prefill_ema.fill_(7)
-    c.kvduo_prefill_steps.fill_(66)
     pointer = c.kvduo_capacity_ema.data_ptr()
     c.kvduo_hot_growth_events[0, 0] = 1
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
     assert c.kvduo_capacity_ema[0, 0].tolist() == [3] * 9
     assert c.kvduo_capacity_steps.item() == 65
-    assert c.kvduo_prefill_steps.item() == 66 and c.kvduo_prefill_ema[
-        0, 0
-    ].tolist() == [7, 7]
     assert c.kvduo_capacity_ema.data_ptr() == pointer
 
 
@@ -229,18 +201,12 @@ def test_first_hot_allocation_starts_fresh_observation():
     assert not c.kvduo_capacity_ema.any() and not c.kvduo_capacity_steps.any()
 
 
-def test_failed_growth_restores_capacity_and_prefill_histories():
+def test_failed_growth_restores_capacity_history():
     c, p = make_coordinator(layers=2)
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
-    for layer in range(2):
-        owner = (layer, 0)
-        c._establish_kvduo_hot_base(owner, c._kvduo_req_layer_pages[owner])
-        c._kvduo_prefill_budget_reference[c._kvduo_owner_key(owner)] = 2.0
     c.kvduo_capacity_ema.fill_(3)
     c.kvduo_capacity_ema[:, :, 1] = 9
     c.kvduo_capacity_steps.fill_(65)
-    c.kvduo_prefill_ema.fill_(7)
-    c.kvduo_prefill_steps.fill_(66)
     banks = (
         c.req_device_buffer_tokens,
         c.req_device_buffer_token_locs,
@@ -249,11 +215,8 @@ def test_failed_growth_restores_capacity_and_prefill_histories():
         c.kvduo_req_hot_capacity_gpu,
         c.kvduo_capacity_ema,
         c.kvduo_capacity_steps,
-        c.kvduo_prefill_ema,
-        c.kvduo_prefill_steps,
     )
     before = [bank.clone() for bank in banks]
-    references = dict(c._kvduo_prefill_budget_reference)
     owners = dict(c._kvduo_hot_page_owners)
     free_pages = p.free_pages
     observe = c._observe_kvduo_hot_growth
@@ -267,21 +230,16 @@ def test_failed_growth_restores_capacity_and_prefill_histories():
     with pytest.raises(RuntimeError, match="publication failed"):
         c._ensure_kvduo_hot_capacity_targets_batch({(0, 0): 8, (1, 0): 8})
     assert all(torch.equal(bank, old) for bank, old in zip(banks, before))
-    assert c._kvduo_prefill_budget_reference == references
     assert c._kvduo_hot_page_owners == owners and p.free_pages == free_pages
 
 
 def test_reset_waits_old_decode_then_clears_only_reused_request_generation():
     c, _ = make_coordinator(layers=2, requests=2)
     c.kvduo_capacity_ema.fill_(2)
-    c.kvduo_prefill_ema.fill_(3)
-    c.kvduo_prefill_steps.fill_(65)
     c._kvduo_hand = 3
-    c._kvduo_hand_sequence = 8
 
     def old_decode():
         c.kvduo_capacity_ema[:, 0] = 100
-        c.kvduo_prefill_ema[:, 0] = 100
 
     c._wait_kvduo_hot_merge_boundary = MagicMock(side_effect=old_decode)
     c._reset_kvduo_hot_metadata(0)
@@ -289,8 +247,4 @@ def test_reset_waits_old_decode_then_clears_only_reused_request_generation():
     assert not c.kvduo_capacity_ema[:, 0].any() and torch.all(
         c.kvduo_capacity_ema[:, 1] == 2
     )
-    assert not c.kvduo_prefill_ema[:, 0].any() and torch.all(
-        c.kvduo_prefill_ema[:, 1] == 3
-    )
     assert c._kvduo_request_generation == [1, 0]
-    assert c._kvduo_hand == 3 and c._kvduo_hand_sequence == 8

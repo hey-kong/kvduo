@@ -64,9 +64,6 @@ def execute_kvduo_hot_merge(
     capacity_ema,
     capacity_steps,
     growth_events,
-    base_capacity,
-    prefill_ema,
-    prefill_steps,
 ):
     """Queue planning, disjoint payload moves, publication, and compact feedback.
 
@@ -100,9 +97,6 @@ def execute_kvduo_hot_merge(
         (capacity_ema, torch.float32, 9),
         (capacity_steps, torch.int64, 1),
         (growth_events, torch.int32, 1),
-        (base_capacity, torch.int32, 1),
-        (prefill_ema, torch.float32, 2),
-        (prefill_steps, torch.int64, 1),
     )
     for bank, dtype, count in banks:
         if bank.dtype != dtype or bank.numel() != count:

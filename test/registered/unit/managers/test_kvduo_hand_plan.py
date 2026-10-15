@@ -147,10 +147,8 @@ def test_actual_merge_loop_preserves_hand_order_payloads_and_maturity(compact):
     reclaim = c._reclaim_kvduo_hot_pages_gpu if compact else c.reclaim_kvduo_hot_pages
     assert reclaim(3) == 4
     assert c._kvduo_hand == 3
-    assert c._kvduo_hot_processed == {(1, 2): 1, (1, 0): 2, (0, 1): 3}
     assert int(c.kvduo_capacity_steps[1, 2]) == 20
-    assert len(c._kvduo_hot_base_pages[1, 2]) == 3
-    assert (0, 0) not in c._kvduo_hot_processed
+    assert len(c._kvduo_req_layer_pages[1, 2]) == 3
     for owner in c._kvduo_req_layer_pages:
         assert_payloads_match_tokens(c, *owner)
 
@@ -170,7 +168,7 @@ def test_compact_loop_continues_after_an_actual_merge_cannot_release(monkeypatch
     assert c._kvduo_hand == 2 and p.free_pages == 1
 
 
-@pytest.mark.parametrize("stale", ["generation", "staging", "limited", "tp"])
+@pytest.mark.parametrize("stale", ["generation", "staging", "tp"])
 def test_compact_plan_revalidates_request_and_tp_before_any_merge(monkeypatch, stale):
     from sglang.kernels.ops.kvcache import kvduo_hand_plan as module
 
@@ -183,12 +181,10 @@ def test_compact_plan_revalidates_request_and_tp_before_any_merge(monkeypatch, s
             c._kvduo_request_generation[0] += 1
         elif stale == "staging":
             c._active_kvduo_reqs[0] = type("Req", (), {"hisparse_staging": True})()
-        elif stale == "limited":
-            c._kvduo_prefill_limited_objects.add(c._kvduo_owner_key((0, 0)))
         else:
             monkeypatch.setattr(c, "_kvduo_consensus", lambda plan: False)
         return snapshot
 
     monkeypatch.setattr(module, "prepare_kvduo_hand", invalidate)
     assert c._reclaim_kvduo_hot_pages_gpu(2) == 0
-    assert not c._kvduo_hot_processed and p.free_pages == 0 and c._kvduo_hand == 0
+    assert p.free_pages == 0 and c._kvduo_hand == 0

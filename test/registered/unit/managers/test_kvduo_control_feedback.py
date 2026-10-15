@@ -3,7 +3,6 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 import torch
 import torch.distributed as dist
 
@@ -65,13 +64,6 @@ def _tp_worker(rank, path):
             assert free == 8
             assert consistent == (scenario not in ("different", "protected"))
             assert reduce.call_count == 1 and gather.call_count == 0
-        with patch.object(
-            dist, "all_reduce", wraps=dist.all_reduce
-        ) as reduce, patch.object(
-            dist, "all_gather_object", wraps=dist.all_gather_object
-        ) as gather:
-            c._recover_kvduo_objects({})
-        assert reduce.call_count == 0 and gather.call_count == 0
     finally:
         dist.destroy_process_group()
 

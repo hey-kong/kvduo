@@ -240,9 +240,6 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t item_size_bytes,
     int64_t full_location_base,
     const int32_t* __restrict__ observe_cache,
-    const int32_t* __restrict__ hot_base_capacities,
-    float* __restrict__ prefill_ema,
-    int64_t* __restrict__ prefill_steps,
     int32_t* __restrict__ resolver_scratch,
     int64_t resolver_scratch_stride,
     typename SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::SlotT* __restrict__ lru_scratch,
@@ -277,9 +274,6 @@ __global__ void load_cache_to_device_buffer_kernel(
       enable_dynamic_hot_view ? min(max(req_hot_buffer_sizes[rid], 0), HOT_BUFFER_SIZE) : HOT_BUFFER_SIZE;
   const int num_buffer_chunks = (hot_buffer_size + WARP_SIZE - 1) / WARP_SIZE;
   const bool observe = observe_cache == nullptr || observe_cache[0] != 0;
-  const bool observe_prefill = prefill_ema != nullptr && observe;
-  const int base_capacity =
-      hot_base_capacities != nullptr && hot_base_capacities[rid] > 0 ? hot_base_capacities[rid] : hot_buffer_size;
 
   // Calculate offsets for this request
   const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
@@ -298,14 +292,12 @@ __global__ void load_cache_to_device_buffer_kernel(
   __shared__ int needs_hot_resolver;
   __shared__ int full_resident_accesses;
   __shared__ int needs_hot_growth;
-  __shared__ int base_hot_hits;
   __shared__ int segment_hot_hits[8];
   if (tid < 8) segment_hot_hits[tid] = 0;
   if (tid == 0) {
     needs_hot_resolver = 0;
     full_resident_accesses = 0;
     needs_hot_growth = 0;
-    base_hot_hits = 0;
   }
   __syncthreads();
   // Fast path: short sequences have all tokens in the device buffer in order.
@@ -483,9 +475,6 @@ __global__ void load_cache_to_device_buffer_kernel(
               capacity_ema + rid * 9,
               capacity_steps[rid]);
         }
-        if (observe_prefill) {
-          sglang::kvduo_update_prefill_ema(0, 0, full_resident_accesses, prefill_ema + rid * 2, prefill_steps[rid]);
-        }
       }
     }
     return;
@@ -554,10 +543,6 @@ __global__ void load_cache_to_device_buffer_kernel(
     if (has_valid_chunk) {
       const BallotMask hit_mask = __ballot_sync(FULL_WARP_MASK, is_hit);
       const BallotMask evict_mask = __ballot_sync(FULL_WARP_MASK, is_evictable);
-      if (observe_prefill) {
-        const BallotMask base_mask = __ballot_sync(FULL_WARP_MASK, is_hit && buf_slot < base_capacity);
-        if (lane_id == 0) atomicAdd(&base_hot_hits, popc_mask(base_mask));
-      }
       local_hit_offset = popc_mask(hit_mask & lanes_before);
       local_evict_offset = popc_mask(evict_mask & lanes_before);
       if (lane_id == 0) {
@@ -693,14 +678,6 @@ __global__ void load_cache_to_device_buffer_kernel(
             hot_buffer_size / page_size,
             capacity_ema + rid * 9,
             capacity_steps[rid]);
-      }
-      if (observe_prefill && swap_status[rid] == 0) {
-        sglang::kvduo_update_prefill_ema(
-            s_total_hits - base_hot_hits,
-            total_misses,
-            total_misses + s_total_hits + s_full_hits + s_newest_hit,
-            prefill_ema + rid * 2,
-            prefill_steps[rid]);
       }
     }
   }
@@ -839,9 +816,6 @@ void load_cache_to_device_buffer(
     int64_t item_size_bytes,
     int64_t full_location_base,
     uint64_t observe_cache_ptr,
-    uint64_t hot_base_capacities_ptr,
-    uint64_t prefill_ema_ptr,
-    uint64_t prefill_steps_ptr,
     uint64_t resolver_scratch_ptr,
     int64_t resolver_scratch_stride,
     uint64_t lru_scratch_ptr = 0,
@@ -928,9 +902,6 @@ void load_cache_to_device_buffer(
         item_size_bytes,
         full_location_base,
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(observe_cache_ptr)),
-        reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(hot_base_capacities_ptr)),
-        reinterpret_cast<float*>(static_cast<uintptr_t>(prefill_ema_ptr)),
-        reinterpret_cast<int64_t*>(static_cast<uintptr_t>(prefill_steps_ptr)),
         reinterpret_cast<int32_t*>(static_cast<uintptr_t>(resolver_scratch_ptr)),
         resolver_scratch_stride,
         reinterpret_cast<SlotT*>(static_cast<uintptr_t>(lru_scratch_ptr)),

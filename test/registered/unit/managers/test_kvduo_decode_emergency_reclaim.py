@@ -184,13 +184,11 @@ def test_emergency_cannot_override_no_hot_reclaim_or_spend_prefill_reservation()
 
 
 @pytest.mark.parametrize(
-    "protection", ["locked", "moving", "staging", "finished", "generation", "minimum"]
+    "protection", ["moving", "staging", "finished", "generation", "minimum"]
 )
 def test_emergency_keeps_all_existing_protection_and_minimum_rules(protection):
     _, c, physical = pressure_batch(True, pages=1 if protection == "minimum" else 4)
-    if protection == "locked":
-        c._kvduo_prefill_limited_objects.add(c._kvduo_owner_key((0, 0)))
-    elif protection == "moving":
+    if protection == "moving":
         c._kvduo_hot_pressure_protected.add((0, 0, 0))
     elif protection == "staging":
         c._active_kvduo_reqs[0].hisparse_staging = True

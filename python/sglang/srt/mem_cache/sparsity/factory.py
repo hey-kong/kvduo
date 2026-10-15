@@ -173,11 +173,11 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
             f"swap_in_block_size ({block_size}) must be in the range [1, 1024]"
         )
 
-    from sglang.srt.mem_cache.sparsity.core.kvduo_prefill_rollback import (
-        KVDuoPrefillPolicy,
+    from sglang.srt.mem_cache.sparsity.core.kvduo_hot_merge import (
+        KVDuoCapacityPolicy,
     )
 
-    policy = KVDuoPrefillPolicy(values.get("max_relative_miss_increase", 0.10))
+    policy = KVDuoCapacityPolicy(values.get("max_relative_miss_increase", 0.10))
     full_reclaim_policy = values.get("full_reclaim_policy", "request")
     if not isinstance(full_reclaim_policy, str) or full_reclaim_policy not in (
         "request",

@@ -21,8 +21,6 @@ class KVDuoFullTopK:
     observe: torch.Tensor
     real_requests: torch.Tensor
     clock_base: torch.Tensor
-    prefill_ema: torch.Tensor
-    prefill_steps: torch.Tensor
     layer: int
     layer_stride: int
     page_size: int
@@ -54,8 +52,6 @@ class KVDuoFullTopK:
             ("observe", torch.int32, (1,)),
             ("real_requests", torch.int32, (1,)),
             ("clock_base", torch.int64, (1,)),
-            ("prefill_ema", torch.float32, (requests, 2)),
-            ("prefill_steps", torch.int64, (requests,)),
         )
         pointers = []
         for name, dtype, shape in fields:
