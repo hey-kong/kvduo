@@ -96,7 +96,7 @@ class KVDuoPrefillHostCache:
         self._upload_free = None
 
     @classmethod
-    def create(cls, coordinator, ratio):
+    def create(cls, coordinator, *, num_swa_pages):
         from sglang.srt.mem_cache.memory_pool_host import (
             DeepSeekV4PagedHostPool,
             DeepSeekV4StateHostPool,
@@ -110,7 +110,7 @@ class KVDuoPrefillHostCache:
         page = allocator.page_size
         full_pages = coordinator.mem_pool_host.num_host_pages
         pin_memory = is_pin_memory_available(coordinator.device)
-        swa_pages = max(1, int(kv.swa_size * ratio) // kv.swa_page_size)
+        swa_pages = num_swa_pages
         history = {}
         if kv.c4_indexer_kv_pool is not None:
             buffers = kv.c4_indexer_kv_pool.index_k_with_scale_buffer

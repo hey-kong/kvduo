@@ -2694,8 +2694,9 @@ class ServerArgs:
         Optional[str],
         Arg(
             help=(
-                "A JSON object for KVDuo. Example: "
-                '\'{"top_k": 2048, "tail_protected_pages": 2, '
+                "A JSON object for KVDuo. host_size is the per-rank Host KV "
+                "budget in GB (0: automatic). Example: "
+                '\'{"top_k": 2048, "host_size": 0, "tail_protected_pages": 2, '
                 '"full_reclaim_policy": "request"}\''
             )
         ),
@@ -7845,7 +7846,7 @@ class ServerArgs:
                 "top_k": kvduo.top_k,
                 # Capture-stable maximum-tier metadata; physical pages remain lazy.
                 "device_buffer_size": 16 * kvduo.top_k,
-                "host_to_device_ratio": kvduo.host_to_device_ratio,
+                "host_to_device_ratio": 1,
                 "swap_in_block_size": kvduo.swap_in_block_size,
             }
         )

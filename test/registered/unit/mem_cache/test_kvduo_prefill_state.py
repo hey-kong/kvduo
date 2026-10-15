@@ -146,7 +146,9 @@ def stack(monkeypatch, device="cpu"):
     c._reclaim_for_physical_allocation = MagicMock(
         return_value=SimpleNamespace(action=KVDuoPressureAction.SUCCESS)
     )
-    c.kvduo_prefill_host_cache = KVDuoPrefillHostCache.create(c, 2)
+    c.kvduo_prefill_host_cache = KVDuoPrefillHostCache.create(
+        c, num_swa_pages=max(1, 2 * kv.swa_size // kv.swa_page_size)
+    )
     c.req_to_host_pool = torch.full((4, 2048), -1, dtype=torch.int64, device=device)
     c.req_to_host_pool_allocated_len = torch.zeros(4, dtype=torch.int64)
     c._req_host_prefix_records = [set() for _ in range(4)]
