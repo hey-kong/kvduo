@@ -145,12 +145,13 @@ def test_prefill_evicts_radix_before_rejecting_an_immature_hot_rollback(path):
     coordinator.is_dsv4_hisparse = True
     coordinator.kvduo_prefill_steps.zero_()
     adder, req = actual_budget_adder_and_req(coordinator, path=path)
-    adder.tree_cache.full_evictable_size.return_value = 16
+    pages = 2 if path == "new" else 4
+    adder.tree_cache.full_evictable_size.return_value = pages * 8
 
     def evict(params):
-        assert params.num_tokens == 16 and params.swa_num_tokens == 0
-        physical.free_pages += 2
-        return EvictResult(num_tokens_evicted=16)
+        assert params.num_tokens == pages * 8 and params.swa_num_tokens == 0
+        physical.free_pages += pages
+        return EvictResult(num_tokens_evicted=pages * 8)
 
     adder.tree_cache.evict.side_effect = evict
     if path == "new":
@@ -159,7 +160,7 @@ def test_prefill_evicts_radix_before_rejecting_an_immature_hot_rollback(path):
         assert adder.add_chunked_req(req) is req
     adder.tree_cache.evict.assert_called_once()
     coordinator.reclaim_kvduo_full_pages.assert_not_called()
-    assert physical.free_pages == coordinator._kvduo_reserved_prefill_pages() == 2
+    assert physical.free_pages == coordinator._kvduo_reserved_prefill_pages() == pages
     assert not coordinator._kvduo_prefill_limited_objects
     assert int(coordinator.kvduo_req_hot_capacity[0, 0]) == 28
 
@@ -238,6 +239,8 @@ def make_full_coordinator(
     initial_count = initial_pages * coordinator.page_size * ratio
     req = SimpleNamespace(
         req_pool_idx=0,
+        decode_batch_idx=1,
+        prefix_indices=torch.empty(0, dtype=torch.int64),
         cache_protected_len=0,
         hisparse_staging=False,
         kv=SimpleNamespace(kv_allocated_len=initial_count),
@@ -295,24 +298,21 @@ def test_decode_defers_when_full_reclaim_cannot_fund_new_mixed_minima(policy):
 
 
 @pytest.mark.parametrize("ratio", [1, 4])
-@pytest.mark.parametrize("policy,reclaimed", [("page", 3), ("request", 6)])
-def test_prefill_full_demotion_reserves_new_mixed_owners_minimum_in_every_layer(
-    ratio, policy, reclaimed
+@pytest.mark.parametrize("policy", ["page", "request"])
+def test_prefill_never_demotes_active_full_even_with_net_reclaimable_pages(
+    ratio, policy
 ):
-    coordinator, physical, req = make_full_coordinator(
+    c, physical, req = make_full_coordinator(
         layers=2, ratio=ratio, full_reclaim_policy=policy
     )
-    token = coordinator.reserve_kvduo_prefill(1, [0])
-    assert token is not None
-    assert physical.free_pages == reclaimed
-    assert coordinator._kvduo_mandatory_hot_pages() == 2
-    assert coordinator._kvduo_reserved_prefill_pages() == 1
-    assert req.kvduo_mixed_residency
-    coordinator.reclaim_kvduo_hot_pages.assert_not_called()
-    coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
-    assert physical.free_pages == reclaimed - 2
-    assert coordinator._kvduo_mandatory_hot_pages() == 0
-    assert coordinator.kvduo_req_hot_capacity[:, 0].tolist() == [4, 4]
+    before = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
+    assert c.reserve_kvduo_prefill(1, [0]) is None
+    assert physical.free_pages == 0
+    assert c._kvduo_mandatory_hot_pages() == 0
+    assert not c._kvduo_reserved_prefill_pages()
+    assert not c._mixed_slots[0]
+    assert torch.equal(c.mem_pool_device.full_to_hisparse_device_index_mapping, before)
+    c.reclaim_kvduo_hot_pages.assert_not_called()
 
 
 def test_prefill_does_not_demote_full_when_new_hot_minimum_consumes_all_gain():
@@ -325,18 +325,18 @@ def test_prefill_does_not_demote_full_when_new_hot_minimum_consumes_all_gain():
     coordinator.reclaim_kvduo_hot_pages.assert_not_called()
 
 
-def test_prefill_full_reclaim_preserves_incoming_prefix_and_earlier_reservations():
+def test_prefill_full_protection_preserves_incoming_prefix_and_earlier_reservations():
     coordinator, physical, req = make_full_coordinator(layers=2)
     physical.free_pages = 1
     first = coordinator.reserve_kvduo_prefill(1, [0])
     second = coordinator.reserve_kvduo_prefill(1, [0], prefix_indices=torch.arange(4))
-    assert first is not None and second is not None
+    assert first is not None and second is None
     mapping = coordinator.mem_pool_device.full_to_hisparse_device_index_mapping
     assert torch.all(mapping[:4] > 0)
     assert req.kvduo_radix_insert_len == 4
-    assert physical.free_pages == 4
-    assert coordinator._kvduo_mandatory_hot_pages() == 2
-    assert coordinator._kvduo_reserved_prefill_pages() == 2
+    assert physical.free_pages == 1
+    assert coordinator._kvduo_mandatory_hot_pages() == 0
+    assert coordinator._kvduo_reserved_prefill_pages() == 1
 
 
 @pytest.mark.parametrize("ratio", [1, 4])

@@ -61,12 +61,12 @@ def test_host_prefix_chunk_wait_keeps_recovery_credit_out_of_prefill_space(dsv4)
     req.host_hit_length = page
     req.full_untruncated_fill_ids = list(range(4 * page))
     c.mem_pool_host = make_host_pool(0, c.page_size)
-    p.free_pages = 3
+    p.free_pages = 2
     before = c.kvduo_req_hot_capacity.clone()
     costs = dict(c._kvduo_prefill_budget_cost)
 
     assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
-    assert c._kvduo_optional_protected_pages() == 3  # Restore, chunk, HOT minimum.
+    assert c._kvduo_optional_protected_pages() == 2  # Restore and current chunk.
 
     c.kvduo_hot_growth_events[0, 0] = 1
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
@@ -74,7 +74,7 @@ def test_host_prefix_chunk_wait_keeps_recovery_credit_out_of_prefill_space(dsv4)
     assert c._kvduo_object_limited((0, 0))
     assert torch.equal(c.kvduo_req_hot_capacity, before)
     assert c._kvduo_prefill_budget_cost == costs
-    assert p.free_pages == 3 and c._kvduo_recovery_credits == 0
+    assert p.free_pages == 2 and c._kvduo_recovery_credits == 0
 
     # Recovery gets one page only after the complete prefill demand is covered.
     p.free_pages = 4
@@ -195,7 +195,7 @@ def test_recovery_waits_only_for_its_own_associated_prefill():
     second = c._kvduo_prefill_key(SimpleNamespace(rid="second"))
     c._kvduo_prefill_associations[(0, 0, 0)] = {first}
     c._kvduo_prefill_associations[(1, 0, 0)] = {second}
-    c._kvduo_prefill_lifecycle[second][1] = "converted"
+    c._kvduo_prefill_lifecycle[second][1] = "ready"
     p.free_pages = 1
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
     assert c._kvduo_object_limited((0, 0))
@@ -223,7 +223,7 @@ def test_recovery_revalidates_protection_after_preparing_selection():
     assert c._kvduo_recovery_credits == 0 and p.free_pages == 2
 
 
-def test_full_prefill_waits_for_conversion_and_all_grouped_prefills():
+def test_full_prefill_waits_for_all_grouped_prefills():
     c, p = fixed_stack(layers=2)
     key = c._kvduo_owner_key((0, 0))
     first, second = SimpleNamespace(rid="a"), SimpleNamespace(rid="b")
@@ -232,10 +232,10 @@ def test_full_prefill_waits_for_conversion_and_all_grouped_prefills():
     c._kvduo_prefill_associations[key] = {first_key, second_key}
     p.free_pages = 20
     c.kvduo_complete_prefill(first)
-    assert c._kvduo_prefill_lifecycle[first_key][1] == "awaiting_backup"
+    assert c._kvduo_prefill_lifecycle[first_key][1] == "ready"
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
     assert c._kvduo_object_limited((0, 0))
-    c._kvduo_prefill_lifecycle[first_key][1] = "converted"
+    c._kvduo_prefill_lifecycle[first_key][1] = "ready"
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
     assert c._kvduo_object_limited((0, 0))
     c._kvduo_prefill_lifecycle[second_key][1] = "cancelled"
@@ -245,80 +245,48 @@ def test_full_prefill_waits_for_conversion_and_all_grouped_prefills():
 
 
 @pytest.mark.parametrize("ratio", [1, 4])
-def test_conversion_releases_all_eligible_history_despite_abundant_space(ratio):
+@pytest.mark.parametrize("locked", [False, True])
+def test_prefill_completion_and_schedule_boundary_keep_full_residency(ratio, locked):
     c, p, req = make_full_coordinator(pages=8, initial_pages=8, ratio=ratio)
     req.rid = "new"
-    req.cache_protected_len = 3 * ratio  # include the partially overlapped page
-    c._kvduo_prefill_limited_objects.add((0, 0, 99))
-    c.kvduo_complete_prefill(req)
-    key = c._kvduo_prefill_key(req)
-    p.free_pages = 100
+    req.decode_batch_idx = 0
+    if locked:
+        c._kvduo_prefill_limited_objects.add((0, 0, 99))
     mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
-    c.process_kvduo_full_conversions()
-    assert mapping[:4].tolist() == [2, 3, 4, 5]
-    assert not mapping[4:12].any()
-    assert mapping[12:].tolist() == [14, 15, 16, 17]
-    assert p.free_pages == 104
-    assert c._kvduo_prefill_lifecycle[key][1] == "converted"
-    assert c._mixed_slots[0] and c._kvduo_mandatory_hot_pages() == 1
-
-
-def test_conversion_waits_for_host_version_and_transfer_protection_then_finishes():
-    c, p, req = make_full_coordinator(pages=8, initial_pages=8)
-    req.rid = "new"
-    c._kvduo_prefill_limited_objects.add((0, 0, 99))
+    before = mapping.clone()
     c.kvduo_complete_prefill(req)
-    key = c._kvduo_prefill_key(req)
-    c.full_host_version[4:6] = 0
-    c._kvduo_pressure_protected = torch.tensor([6, 7])
-    c.process_kvduo_full_conversions()
-    assert c._kvduo_prefill_lifecycle[key][1] == "awaiting_backup"
-    assert c._kvduo_full_conversion_pending[key] == c._kvduo_request_key(0)
-    assert p.free_pages == 4
-    # A requested conversion survives the disappearance of other locks.
-    c._kvduo_prefill_limited_objects.clear()
-    c.full_host_version[4:6] = 1
-    c._kvduo_pressure_protected = None
-    c.process_kvduo_full_conversions()
-    assert p.free_pages == 6
-    assert c._kvduo_prefill_lifecycle[key][1] == "converted"
+    c.begin_kvduo_schedule_boundary()
+    assert c.reclaim_kvduo_full_pages(c.page_size, reserve_hot_minimum=True) == 0
+    assert torch.equal(mapping, before)
+    assert p.free_pages == 0 and not c._mixed_slots[0]
+    req.decode_batch_idx = 1
+    assert c.reclaim_kvduo_full_pages(c.page_size, reserve_hot_minimum=True) > 0
+    assert c._mixed_slots[0]
 
 
-def test_no_locked_request_keeps_prefill_full_resident():
-    c, p, req = make_full_coordinator(pages=8, initial_pages=8)
-    req.rid = "new"
-    c.kvduo_complete_prefill(req)
-    c.process_kvduo_full_conversions()
-    assert p.free_pages == 0
-    assert torch.all(c.mem_pool_device.full_to_hisparse_device_index_mapping > 0)
-
-
-def test_prefill_mixed_minimum_cannot_be_spent_by_optional_growth():
+def test_prefill_reserves_full_pages_without_future_mixed_minimum():
     c, p = ready_coordinator(extra=4)
     req = SimpleNamespace(rid="new", prefix_indices=torch.empty(0, dtype=torch.int64))
-    # Four compute pages plus its one-page HOT minimum cannot fit the rollback.
-    before = c.req_device_buffer_tokens.clone()
-    assert c.reserve_kvduo_prefill(4, [0], prefill_req=req) is None
-    assert torch.equal(c.req_device_buffer_tokens, before) and p.free_pages == 0
-    token = c.reserve_kvduo_prefill(3, [0], prefill_req=req)
-    assert token is not None and c._kvduo_mandatory_hot_pages() == 1
+    # A complete four-page rollback fits four FULL compute pages.
+    token = c.reserve_kvduo_prefill(4, [0], prefill_req=req)
+    assert token is not None and c._kvduo_mandatory_hot_pages() == 0
     assert c._kvduo_optional_protected_pages() == 4
     c.finish_kvduo_prefill_reservation(token, cancelled=True)
     assert c._kvduo_optional_protected_pages() == 0
     assert not c._kvduo_object_limited((0, 0))
 
 
-def test_plan_protection_does_not_double_count_reservation_or_hot_commitment():
+def test_plan_protection_does_not_double_count_reservation():
     c, p = ready_coordinator(extra=4)
     req = SimpleNamespace(rid="new", prefix_indices=torch.empty(0, dtype=torch.int64))
     c.protect_kvduo_prefill_plan(req, 6)  # three compute pages
     token = c.reserve_kvduo_prefill(3, [0], prefill_req=req)
     assert token is not None
-    assert c._kvduo_optional_protected_pages() == 4
+    assert c._kvduo_optional_protected_pages() == 3
     c.bind_kvduo_prefill_batch([req], [token])
     c.consume_kvduo_prefill_reservation(token, 3)
     c.finish_kvduo_prefill_reservation(token, cancelled=False)
-    assert c._kvduo_optional_protected_pages() == 1
+    assert c._kvduo_optional_protected_pages() == 0
 
 
 def test_tp_disagreement_never_rolls_back_or_unlocks_local_request():
@@ -453,30 +421,25 @@ def test_locked_mode_with_enough_space_admits_prefill_without_extra_rollback():
     token = c.reserve_kvduo_prefill(2, [0], prefill_req=req)
     assert token is not None and p.free_pages == 8
     assert torch.equal(c.kvduo_req_hot_capacity, before)
-    assert c._kvduo_mandatory_hot_pages() == 2
+    assert c._kvduo_mandatory_hot_pages() == 0
     c.consume_kvduo_prefill_reservation(token, 2)
     c.finish_kvduo_prefill_reservation(token, cancelled=False)
     for layer in range(2):
         c._release_kvduo_prefill_hold(c._kvduo_owner_key((layer, 0)))
     c.kvduo_complete_prefill(req)
     assert c._kvduo_mandatory_hot_pages() == 0
-    assert c._kvduo_prefill_lifecycle[c._kvduo_prefill_key(req)][1] == "converted"
+    assert c._kvduo_prefill_lifecycle[c._kvduo_prefill_key(req)][1] == "ready"
 
 
-def test_locked_prefill_reclaims_full_for_its_future_hot_minimum_before_hot_rollback():
+def test_locked_prefill_never_reclaims_full_or_charges_future_hot_minimum():
     c, p = fixed_stack(layers=2)
     p.free_pages = 2
     req = SimpleNamespace(rid="new", prefix_indices=torch.empty(0, dtype=torch.int64))
     before = c.kvduo_req_hot_capacity.clone()
-
-    def reclaim(slots, *, reserve_hot_minimum):
-        assert slots == 4 and reserve_hot_minimum
-        p.free_pages += 2
-        return slots
-
-    c.reclaim_kvduo_full_pages = MagicMock(side_effect=reclaim)
+    c.reclaim_kvduo_full_pages = MagicMock()
+    assert c.reserve_kvduo_prefill(3, [0], prefill_req=req) is None
     token = c.reserve_kvduo_prefill(2, [0], prefill_req=req)
     assert token is not None
-    c.reclaim_kvduo_full_pages.assert_called_once()
+    c.reclaim_kvduo_full_pages.assert_not_called()
     assert torch.equal(c.kvduo_req_hot_capacity, before)
-    assert c._kvduo_optional_protected_pages() == 4
+    assert c._kvduo_optional_protected_pages() == 2

@@ -54,7 +54,11 @@ def cached_page(c, locations, *, identity=None, pinned=False, valid=True):
 
 
 def prompt(size=8, rid="incoming"):
-    req = SimpleNamespace(rid=rid, full_untruncated_fill_ids=list(range(size)))
+    req = SimpleNamespace(
+        rid=rid,
+        full_untruncated_fill_ids=list(range(size)),
+        prefix_indices=torch.empty(0, dtype=torch.int64),
+    )
     req.get_fill_ids = lambda: req.full_untruncated_fill_ids
     return req
 
@@ -92,7 +96,7 @@ def test_host_full_defers_prefill_before_hot_rollback_with_real_allocator_budget
 def test_prefill_evicts_host_cache_and_keeps_complete_prompt_hold_after_chunk(
     path, slots
 ):
-    c, _ = ready_coordinator()
+    c, _ = ready_coordinator(extra=4 if path == "chunk" else 3)
     adder, req = actual_budget_adder_and_req(c, path=path)
     c.is_dsv4_hisparse = True
     pool = host_inventory(c, 256)
@@ -335,7 +339,8 @@ def _tp_host_worker(rank, init_file):
         timeout=timedelta(seconds=20),
     )
     try:
-        c, _ = ready_coordinator()
+        c, physical = ready_coordinator()
+        physical.free_pages = 2
         c.tp_world_size = 2
         c.tp_group = dist.group.WORLD
         pool = host_inventory(c, 8)

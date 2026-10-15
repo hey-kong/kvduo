@@ -336,7 +336,7 @@ def actual_budget_adder_and_req(
 
 @pytest.mark.parametrize("path", ["new", "chunk"])
 def test_dsv4_full_physical_pool_reaches_rollback_with_real_allocator_budgets(path):
-    coordinator, physical = ready_coordinator()
+    coordinator, physical = ready_coordinator(extra=4 if path == "chunk" else 3)
     adder, req = actual_budget_adder_and_req(coordinator, path=path)
     allocator = adder.token_to_kv_pool_allocator
     assert allocator.logical_attn_allocator.full_available_size() == 1024
@@ -358,12 +358,12 @@ def test_dsv4_full_physical_pool_reaches_rollback_with_real_allocator_budgets(pa
     )
     assert adder.can_run_list == [req]
     assert req.extend_range == Range(8, 24)
-    assert physical.free_pages == 3
+    assert physical.free_pages == (4 if path == "chunk" else 3)
     assert int(coordinator.kvduo_req_hot_capacity[0, 0]) == 16
-    assert coordinator._kvduo_reserved_prefill_pages() == 2
+    assert coordinator._kvduo_reserved_prefill_pages() == (4 if path == "chunk" else 2)
     assert adder.rem_total_tokens == adder.cur_rem_tokens == 1000
     # Actual allocator budgeting still bounds allocations by physical capacity.
-    assert allocator.full_available_size() == 24
+    assert allocator.full_available_size() == (32 if path == "chunk" else 24)
     assert adder.rem_swa_token_offset > 0
 
 
@@ -513,7 +513,7 @@ def test_kvduo_keeps_logical_headroom_for_future_decode_before_rollback(path):
 
 def test_multiple_prefills_charge_logical_swa_offsets_and_separate_physical_reservations():
     coordinator, physical = ready_coordinator()
-    physical.free_pages = 2
+    physical.free_pages = 0
     adder, first = actual_budget_adder_and_req(coordinator)
     _, second = actual_budget_adder_and_req(coordinator)
     second.full_untruncated_fill_ids = list(range(16))
@@ -523,8 +523,8 @@ def test_multiple_prefills_charge_logical_swa_offsets_and_separate_physical_rese
     assert adder.rem_total_tokens == adder.cur_rem_tokens == 984
     assert adder.rem_swa_token_offset == 40
     assert coordinator._kvduo_reserved_prefill_pages() == 3
-    assert physical.free_pages == 5
-    assert coordinator._kvduo_mandatory_hot_pages() == 2
+    assert physical.free_pages == 3
+    assert coordinator._kvduo_mandatory_hot_pages() == 0
     assert len(adder.kvduo_prefill_reservations) == 2
     # A third prefill cannot use the already-reserved physical pages.
     _, third = actual_budget_adder_and_req(coordinator)
@@ -550,23 +550,26 @@ def test_host_restore_and_chunk_share_exact_reservation_and_cancellation_release
     coordinator, physical = ready_coordinator(extra=4)
     physical.free_pages = 1
     adder, req = adder_and_req(coordinator, host_hit=4)
+    req.full_untruncated_fill_ids = list(range(10))
 
     def restore(_):
-        assert coordinator._kvduo_reserved_prefill_pages() == 4
+        assert coordinator._kvduo_reserved_prefill_pages() == 5
         physical.free_pages -= 2
         return torch.tensor([2, 3, 4, 5]), object()
 
     adder.tree_cache.init_load_back.side_effect = restore
     assert adder.add_one_req(req, False, None) is AddReqResult.CONTINUE
     assert req.extend_range == Range(6, 10)
-    assert coordinator._kvduo_reserved_prefill_pages() == 2
+    assert coordinator._kvduo_reserved_prefill_pages() == 3
     assert physical.free_pages == 3
-    assert coordinator._kvduo_mandatory_hot_pages() == 1
+    assert coordinator._kvduo_mandatory_hot_pages() == 0
     token = adder.kvduo_prefill_reservations[0]
     coordinator.finish_kvduo_prefill_reservation(token, cancelled=False)
-    assert coordinator._kvduo_reserved_prefill_pages() == 0
+    assert coordinator._kvduo_reserved_prefill_pages() == 1
     coordinator, physical = ready_coordinator(extra=4)
+    physical.free_pages = 1
     adder, req = adder_and_req(coordinator, host_hit=4)
+    req.full_untruncated_fill_ids = list(range(10))
     adder.tree_cache.init_load_back.return_value = (None, None)
     assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
     assert not coordinator._kvduo_prefill_reservations

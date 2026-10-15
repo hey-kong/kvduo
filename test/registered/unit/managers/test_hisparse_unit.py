@@ -486,6 +486,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
                     reserve_hot_minimum=True,
                     prefill_reservation=None,
                     allow_hot_reclaim=False,
+                    allow_full_reclaim=False,
                 )
             ]
             * 2,
