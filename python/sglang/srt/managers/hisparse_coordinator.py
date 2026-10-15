@@ -183,7 +183,7 @@ class HiSparseCoordinator:
         swap_in_block_size: int = 960,
         tail_protected_pages: int = 0,
         prefill_policy: KVDuoPrefillPolicy | None = None,
-        full_reclaim_policy: str = "page",
+        full_reclaim_policy: str = "request",
         decode_emergency_reclaim: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
@@ -3672,7 +3672,11 @@ class HiSparseCoordinator:
         prefix_indices: torch.Tensor | None = None,
         prefill_req=None,
     ) -> int | None:
-        """Check one fixed round's miss budget before any no-copy rollback."""
+        """Admit against actual free pages after mandatory capacity and holds.
+
+        Decode-owned FULL reclaim may leave surplus for the next boundary;
+        this path never increases that reclaim to fit a waiting prefill.
+        """
         self._prune_kvduo_prefill_budget()
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         prefill_key = (
@@ -4560,6 +4564,7 @@ class HiSparseCoordinator:
                 admission_order,
                 needed,
                 release_all=release_all,
+                mixed_owners=[self._mixed_slots[req_idx] for req_idx in owners],
             )
         else:
             selected = select_kvduo_full_pages(

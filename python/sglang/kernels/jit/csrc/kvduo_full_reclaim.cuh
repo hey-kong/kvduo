@@ -190,6 +190,7 @@ __global__ void kvduo_full_request_select_kernel(
     const int64_t* owners,
     const int64_t* costs,
     const int64_t* admission,
+    const int32_t* mixed,
     int32_t* workspace,
     int64_t* packet,
     int pages,
@@ -224,7 +225,9 @@ __global__ void kvduo_full_request_select_kernel(
         for (int owner = 0; owner < owner_count; ++owner) {
           const int64_t gain = counts[owner] - costs[owner];
           if (chosen[owner] || gain <= 0) continue;
-          if (best < 0 || gain > best_gain || (gain == best_gain && admission[owner] < admission[best])) {
+          if (best < 0 || mixed[owner] > mixed[best] ||
+              (mixed[owner] == mixed[best] &&
+               (gain > best_gain || (gain == best_gain && admission[owner] < admission[best])))) {
             best = owner;
             best_gain = gain;
           }
@@ -256,6 +259,7 @@ void kvduo_full_request_select(
     tvm::ffi::TensorView owners,
     tvm::ffi::TensorView costs,
     tvm::ffi::TensorView admission,
+    tvm::ffi::TensorView mixed,
     tvm::ffi::TensorView workspace,
     tvm::ffi::TensorView packet,
     int64_t needed,
@@ -270,6 +274,7 @@ void kvduo_full_request_select(
   TensorMatcher({pages}).with_dtype<int64_t>().with_device(device).verify(owners);
   TensorMatcher({pages}).with_dtype<int32_t>().with_device(device).verify(valid);
   TensorMatcher({owner_count}).with_dtype<int64_t>().with_device(device).verify(costs).verify(admission);
+  TensorMatcher({owner_count}).with_dtype<int32_t>().with_device(device).verify(mixed);
   TensorMatcher({words}).with_dtype<int32_t>().with_device(device).verify(workspace);
   TensorMatcher({packet_size}).with_dtype<int64_t>().with_device(device).verify(packet);
   RuntimeCheck(pages.unwrap() > 0 && pages.unwrap() <= INT32_MAX && owner_count.unwrap() > 0, "Invalid FULL plan size");
@@ -282,6 +287,7 @@ void kvduo_full_request_select(
       static_cast<const int64_t*>(owners.data_ptr()),
       static_cast<const int64_t*>(costs.data_ptr()),
       static_cast<const int64_t*>(admission.data_ptr()),
+      static_cast<const int32_t*>(mixed.data_ptr()),
       static_cast<int32_t*>(workspace.data_ptr()),
       static_cast<int64_t*>(packet.data_ptr()),
       static_cast<int>(pages.unwrap()),

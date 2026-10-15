@@ -27,13 +27,13 @@ Prefill 生成 FULL KV，支持前缀复用。Decode 依次查找 FULL/tail、�
 
 活跃 FULL 仅因 decode 必需分配或 HOT 扩容回收，包括已完成 prefill、尚未首次 decode 的请求。FULL 只能在 Host 副本完整、有效且版本同步后回收。候选页排除共享引用保护、最新 tail、未写满页，以及使用、分配或传输中的页。仅单个活跃请求持有的 Radix 独占后缀可先从树中摘出，将槽位所有权交还请求，再参与 FULL 回收；共享节点和无法安全转移的前缀继续保护。摘出不搬运或释放 KV，后续前缀匹配不会将该后缀误报为 GPU 命中，有效 Host 副本仍可用于恢复。Tail 默认保护最新 2 页。
 
-设置 `full_reclaim_policy="request"` 可按请求批量回收：优先选择合格 FULL 页数减去尚需新增最低 HOT 页数后净收益最大的请求，同分优先最早进入 decode 的请求，再按请求槽位排序。一次释放选中请求的全部合格页，净空间够用即停止；GPU 汇总和选择，不按页访问时间排序。
+默认 `full_reclaim_policy="request"` 按请求批量回收：先选择已混合驻留的请求；同一驻留类别内，优先选择合格 FULL 页数减去尚需新增最低 HOT 页数后净收益最大的请求，同分优先最早进入 decode 的请求，再按请求槽位排序。一次释放选中请求的全部合格页，净空间够用即停止；GPU 汇总和选择，不按页访问时间排序。
 
-默认使用 `full_reclaim_policy="page"` 逐页策略：跨活跃请求按 FULL 页内最近条目访问时间排序，最久未访问的页优先；同分按请求槽位、页偏移排序，空间够用即停止。两种策略均保留上述保护，只清除 GPU 完整映射，被驱逐页中的热点不主动搬入 HOT。
+可设置 `full_reclaim_policy="page"` 使用逐页策略：跨活跃请求按 FULL 页内最近条目访问时间排序，最久未访问的页优先；同分按请求槽位、页偏移排序，空间够用即停止。两种策略均保留上述保护，只清除 GPU 完整映射，被驱逐页中的热点不主动搬入 HOT。
 
 在 `"page"` 模式下，decode 必需分配或 HOT 扩容优先按请求自身的 FULL 页 LRU 回收，每个请求以其新增页和最低 HOT 容量缺口为目标；扣除首次混合驻留所需的最低 HOT 页后仍有缺口，再使用全局页 LRU。批次中无分配需求的请求不进入优先回收阶段。
 
-该配置控制 decode 的常规 FULL 压力回收，不用于 prefill 准入。
+该配置控制 decode 的常规 FULL 压力回收，不用于 prefill 准入。按请求回收完成后，扣除 decode 必需分配、最低 HOT 容量和已有预留；下一调度边界仅用真实剩余空间重新判断等待的 prefill。不会为该 prefill 额外扩大 FULL 回收，也不会提前回收尚未开始 decode 请求的 FULL 来准入它。
 
 ### 空间分配
 
@@ -188,10 +188,12 @@ python3 -m sglang.launch_server \
 | `host_to_device_ratio` | `2` | Host pool 相对 device pool 的容量比例 |
 | `swap_in_block_size` | `960` | Resolver CUDA block 线程数，须为 32 的倍数且不超过设备上限，通常为 32–1024 |
 | `tail_protected_pages` | `2` | 每请求保护的最新 FULL 页数 |
-| `full_reclaim_policy` | `"page"` | `"request"` 按请求批量释放全部合格 FULL 页；`"page"` 按页 LRU 回收 |
+| `full_reclaim_policy` | `"request"` | `"request"` 按请求批量释放全部合格 FULL 页；`"page"` 按页 LRU 回收 |
 | `max_relative_miss_increase` | `0.10` | 普通缩容、对象回退及累计预算共用的预计 miss 相对增幅容忍比例 |
 | `decode_emergency_reclaim` | `false` | 开启后，必需 decode 的普通回收失败时允许 HOT 应急缩至最低容量，优先避免整请求回退 |
 
 前四项须为正整数，回收策略只接受 `"request"` 或 `"page"`，miss 容忍比例须为有限非负数，应急开关须为布尔值；未知字段报错。`--kvduo-config` 必须配合 `--enable-kvduo`。默认 10% 是实验初值。
 
 KVDuo 要求 RadixTree，不能与 HiSparse、HiCache 或 speculative decoding 同时启用；支持 chunked prefill，不改其分块设置。通用 DSA 和 DeepSeek-V4 均按实际存储层数计算 HOT 页容量；`flashmla_kv` 要求 FP8 KV 存储，BF16 使用受支持的其他稀疏 backend。
+
+KVDuo 的 `--swa-full-tokens-ratio` 默认值沿用对应模型，不再减半；DeepSeek-V4 为 `0.1`。显式设置仍优先。

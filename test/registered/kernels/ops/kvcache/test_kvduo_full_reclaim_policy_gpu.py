@@ -15,8 +15,11 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("needed", [1, 129, 10000])
 @pytest.mark.parametrize("release_all", [False, True])
 @pytest.mark.parametrize("charged", [False, True])
+@pytest.mark.parametrize(
+    "mixed", [[False] * 9, [True, False, True, False, True, False, True, False, True]]
+)
 def test_request_selection_matches_cpu_across_tiles_and_interleaved_owners(
-    needed, release_all, charged
+    needed, release_all, charged, mixed
 ):
     generator = torch.Generator().manual_seed(7712)
     owners = torch.randint(0, 9, (1025,), generator=generator).tolist()
@@ -25,11 +28,23 @@ def test_request_selection_matches_cpu_across_tiles_and_interleaved_owners(
     for _ in range(3):
         valid = (torch.rand(len(owners), generator=generator) > 0.25).int()
         expected = select_kvduo_full_requests(
-            valid, owners, costs, ages, needed, release_all=release_all
+            valid,
+            owners,
+            costs,
+            ages,
+            needed,
+            release_all=release_all,
+            mixed_owners=mixed,
         )
         assert (
             select_kvduo_full_requests(
-                valid.cuda(), owners, costs, ages, needed, release_all=release_all
+                valid.cuda(),
+                owners,
+                costs,
+                ages,
+                needed,
+                release_all=release_all,
+                mixed_owners=mixed,
             )
             == expected
         )
