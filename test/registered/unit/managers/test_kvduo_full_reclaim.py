@@ -351,6 +351,7 @@ def test_full_reclaim_keeps_request_page_ties_protection_and_publication_before_
     c.kvduo_req_hot_capacity = torch.zeros((1, 2), dtype=torch.int64)
     c._kvduo_host_valid_len = [count, count - 6]
     c._mixed_slots = [False, False]
+    c._kvduo_request_generation = [0, 0]
     c._active_kvduo_reqs = {1: req1, 0: req0}
     c._kvduo_pressure_protected = torch.tensor([3], dtype=torch.int32)
     c.full_host_version[count + 1] = 0

@@ -16,6 +16,13 @@ DomainIdentity = Hashable
 OwnerIdentity = Hashable
 
 
+class KVDuoResidencyMode(Enum):
+    """Request residency policy; protected FULL may remain in HOT mode."""
+
+    FULL_RESIDENT = auto()
+    HOT_RESIDENT = auto()
+
+
 class KVDuoPhysicalPageKind(Enum):
     """Exclusive state of one cross-storage-layer physical page number."""
 

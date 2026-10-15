@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.sparsity.core.kvduo_state import (
     KVDuoPressureResult,
     KVDuoPressureStatus,
     KVDuoResidencyCatalog,
+    KVDuoResidencyMode,
     execute_kvduo_pressure_plan,
     plan_kvduo_allocation,
 )
@@ -3132,6 +3133,8 @@ class HiSparseCoordinator:
         self._kvduo_hot_base_pages = {}
         self._kvduo_hot_generation = {}
         self._kvduo_request_generation = [0] * requests
+        self._kvduo_hot_tail_starts = {}
+        self._kvduo_tail_cleanup_pending = {}
         self._kvduo_decode_order = {}
         self._kvduo_decode_sequence = 0
         self._kvduo_hot_base_generation = {}
@@ -3143,6 +3146,8 @@ class HiSparseCoordinator:
         self._kvduo_prefill_next_reservation = 0
 
     def _reset_kvduo_prefill_request(self, req_idx: int) -> None:
+        self._kvduo_hot_tail_starts.pop(req_idx, None)
+        self._kvduo_tail_cleanup_pending.pop(req_idx, None)
         if not hasattr(self, "kvduo_prefill_ema"):
             return
         old_keys = {
@@ -3300,12 +3305,53 @@ class HiSparseCoordinator:
         pages = self.kvduo_prefill_pages(len(req.prefix_indices), end)
         self._kvduo_next_prefill_pages = max(0, pages)
 
+    def kvduo_residency_mode(self, req_idx: int) -> KVDuoResidencyMode:
+        return (
+            KVDuoResidencyMode.HOT_RESIDENT
+            if self._mixed_slots[req_idx]
+            else KVDuoResidencyMode.FULL_RESIDENT
+        )
+
+    def _cleanup_kvduo_old_tails(self) -> None:
+        if not self.enable_mixed_residency:
+            return
+        pending = self._kvduo_tail_cleanup_pending
+        for req_idx, generation in list(pending.items()):
+            if (
+                req_idx not in self._active_kvduo_reqs
+                or generation != self._kvduo_request_generation[req_idx]
+                or self.kvduo_residency_mode(req_idx)
+                is not KVDuoResidencyMode.HOT_RESIDENT
+            ):
+                pending.pop(req_idx)
+        if not pending:
+            return
+        # Poll only page-turnover jobs; all ranks defer an unfinished backup.
+        # The reclaimer orders old readers with a stream wait, rather than
+        # requiring an idle producer (which overlap scheduling may never offer).
+        ready = (
+            not getattr(self, "_has_pending_backup", False)
+            or self._backup_done_event.query()
+        )
+        if (
+            not self._kvduo_consensus((tuple(sorted(pending.items())), ready))
+            or not ready
+        ):
+            return
+        owners = set(pending)
+        self.reclaim_kvduo_full_pages(
+            self.page_size, request_indices=owners, release_all=True, tail_cleanup=True
+        )
+        for req_idx in owners:
+            pending.pop(req_idx, None)
+
     def begin_kvduo_schedule_boundary(self) -> None:
         state_cache = getattr(self, "kvduo_prefill_host_cache", None)
         if state_cache is not None:
             state_cache.poll()
         self._kvduo_next_prefill_pages = 0
         self._kvduo_next_prefill_key = None
+        self._cleanup_kvduo_old_tails()
 
     def bind_kvduo_prefill_batch(self, requests, reservation_tokens) -> None:
         keys = {self._kvduo_prefill_key(req) for req in requests}
@@ -4038,6 +4084,11 @@ class HiSparseCoordinator:
             )
         )
         self._has_pending_backup = True
+        for req_idx, _, _ in page_jobs:
+            if self._mixed_slots[req_idx]:
+                self._kvduo_tail_cleanup_pending[req_idx] = (
+                    self._kvduo_request_generation[req_idx]
+                )
 
     def _eager_backup_previous_token(
         self,
@@ -4447,11 +4498,12 @@ class HiSparseCoordinator:
         reserve_hot_minimum: bool = False,
         request_indices=None,
         release_all=False,
+        tail_cleanup=False,
     ) -> int:
         """Demote eligible request-owned FULL pages using the configured policy.
 
         The host copy is complete before requests leave staging. This control
-        path may synchronize only when allocation pressure occurs; steady-state
+        path runs under allocation pressure or sealed-tail cleanup; steady-state
         full/hot/host resolution remains entirely device-driven and graph-safe.
         """
         if not self.enable_mixed_residency or num_tokens <= 0:
@@ -4464,7 +4516,8 @@ class HiSparseCoordinator:
         tree_cache = getattr(self, "kvduo_tree_cache", None)
         plan_prefix = getattr(tree_cache, "kvduo_reclaimable_prefix", None)
         can_transfer = (
-            callable(plan_prefix)
+            not tail_cleanup
+            and callable(plan_prefix)
             and getattr(self, "_kvduo_pressure_protected", None) is None
         )
         prefix_transfers = {}
@@ -4485,25 +4538,46 @@ class HiSparseCoordinator:
                     protected_len = tree_len - length
                     prefix_transfers[req_idx] = (length, tree_len)
             allocated_len = req.kv.kv_allocated_len
-            compressed = self.mem_pool_device.translate_loc_from_full_to_compressed(
-                self.req_to_token_pool.req_to_token[req_idx, :allocated_len]
-            )
-            prefix_len = len(
-                self.mem_pool_device.translate_loc_from_full_to_compressed(
-                    self.req_to_token_pool.req_to_token[req_idx, :protected_len]
+            if tail_cleanup:
+                compressed_len = self.host_token_len(allocated_len)
+                prefix_len = self.host_token_len(protected_len)
+            else:
+                compressed = self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    self.req_to_token_pool.req_to_token[req_idx, :allocated_len]
                 )
-            )
-            num_pages = (len(compressed) + self.page_size - 1) // self.page_size
+                compressed_len = len(compressed)
+                prefix_len = len(
+                    self.mem_pool_device.translate_loc_from_full_to_compressed(
+                        self.req_to_token_pool.req_to_token[req_idx, :protected_len]
+                    )
+                )
+            num_pages = (compressed_len + self.page_size - 1) // self.page_size
             tail_first = max(0, num_pages - self.tail_protected_pages)
             first_owned_page = (prefix_len + self.page_size - 1) // self.page_size
             start = first_owned_page * self.page_size
+            if tail_cleanup:
+                record = self._kvduo_hot_tail_starts.get(req_idx)
+                if (
+                    record is None
+                    or record[0] != self._kvduo_request_generation[req_idx]
+                    or not self._mixed_slots[req_idx]
+                ):
+                    continue
+                start = max(start, record[1])
             host_valid_end = (
                 self._kvduo_host_valid_len[req_idx] // self.page_size * self.page_size
             )
             end = min(tail_first * self.page_size, host_valid_end)
             if end <= start:
                 continue
-            pages = compressed[start:end].view(-1, self.page_size)
+            if tail_cleanup:
+                pages = self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    self.req_to_token_pool.req_to_token[
+                        req_idx, start * self.compress_ratio : end * self.compress_ratio
+                    ]
+                ).view(-1, self.page_size)
+            else:
+                pages = compressed[start:end].view(-1, self.page_size)
             candidate_pages.append(pages)
             candidate_meta.extend(
                 (req_idx, offset) for offset in range(start, end, self.page_size)
@@ -4604,13 +4678,21 @@ class HiSparseCoordinator:
         ] = 0
         for req_idx, start in first_holes.items():
             req = self._active_kvduo_reqs[req_idx]
+            if not self._mixed_slots[req_idx]:
+                compressed_len = self.host_token_len(req.kv.kv_allocated_len)
+                pages = (compressed_len + self.page_size - 1) // self.page_size
+                self._kvduo_hot_tail_starts[req_idx] = (
+                    self._kvduo_request_generation[req_idx],
+                    max(0, pages - self.tail_protected_pages) * self.page_size,
+                )
             req.kvduo_mixed_residency = True
             req.kvduo_radix_insert_len = min(
                 getattr(req, "kvduo_radix_insert_len", start * self.compress_ratio),
                 start * self.compress_ratio,
             )
             self._mixed_slots[req_idx] = True
-            self._kvduo_pending_hot_minimum.add(req_idx)
+            if not tail_cleanup:
+                self._kvduo_pending_hot_minimum.add(req_idx)
         if published is not None:
             published.record(device_module.current_stream(self.device))
             published.synchronize()
