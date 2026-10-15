@@ -269,8 +269,9 @@ def test_staging_converts_hold_to_real_host_allocation_and_request_prefix_pin(
 
 
 @pytest.mark.parametrize("ratio", [1, 4])
+@pytest.mark.parametrize("mixed", [False, True])
 def test_decode_sealed_backup_evicts_only_unpinned_host_prefix_before_allocating(
-    monkeypatch, ratio
+    monkeypatch, ratio, mixed
 ):
     import sglang.srt.managers.hisparse_coordinator as module
 
@@ -300,7 +301,11 @@ def test_decode_sealed_backup_evicts_only_unpinned_host_prefix_before_allocating
     module.device_module.stream.side_effect = lambda stream: nullcontext()
     lengths = torch.tensor([7 * ratio])
     indices = torch.tensor([0])
+    c._mixed_slots[0] = mixed
     c._backup_kvduo_sealed_pages(lengths, indices, lengths, indices)
+    assert c._kvduo_tail_cleanup_pending == (
+        {0: c._kvduo_request_generation[0]} if mixed else {}
+    )
     assert pool.available_size() == 0
     assert int(c.req_to_host_pool_allocated_len[0]) == 6
     assert c._has_pending_backup

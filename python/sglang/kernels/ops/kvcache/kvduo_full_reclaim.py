@@ -202,16 +202,20 @@ def select_kvduo_full_requests(
     needed_pages: int,
     *,
     release_all: bool = False,
+    mixed_owners: Sequence[bool] | None = None,
 ) -> list[int]:
-    """Release complete eligible owner sets, largest net gain first.
+    """Prefer largest net gain, then mixed owners at equal gain.
 
-    Equal gains prefer earlier decode admission, then the stable owner index.
+    Equal gain and residency prefer earlier decode admission, then owner index.
     Page validity and one-time HOT minimum costs match the page policy. GPU
     planning never sorts page ages or downloads the full validity vector.
     """
+    if mixed_owners is None:
+        mixed_owners = [False] * len(minimum_costs)
     n = valid.numel()
     if (
-        valid.ndim != 1
+        len(mixed_owners) != len(minimum_costs)
+        or valid.ndim != 1
         or len(owner_indices) != n
         or len(admission_order) != len(minimum_costs)
         or any(owner < 0 or owner >= len(minimum_costs) for owner in owner_indices)
@@ -226,6 +230,7 @@ def select_kvduo_full_requests(
         owners = torch.tensor(owner_indices, dtype=torch.int64, device=device)
         costs = torch.tensor(minimum_costs, dtype=torch.int64, device=device)
         order = torch.tensor(admission_order, dtype=torch.int64, device=device)
+        mixed = torch.tensor(mixed_owners, dtype=torch.int32, device=device)
         largest_owner = max(Counter(owner_indices).values())
         bound = (
             n
@@ -241,6 +246,7 @@ def select_kvduo_full_requests(
             owners,
             costs,
             order,
+            mixed,
             workspace,
             packet,
             needed_pages,
@@ -257,6 +263,7 @@ def select_kvduo_full_requests(
         (owner for owner, count in counts.items() if count > minimum_costs[owner]),
         key=lambda owner: (
             -(counts[owner] - minimum_costs[owner]),
+            not mixed_owners[owner],
             admission_order[owner],
             owner,
         ),

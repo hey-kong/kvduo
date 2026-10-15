@@ -46,12 +46,18 @@ def test_request_selection_preserves_validity_and_releases_complete_owner_sets(
     for _ in range(50):
         valid = (torch.rand(521, generator=generator) > 0.25).int()
         costs = torch.randint(0, 65, (9,), generator=generator).tolist()
-        age = torch.randperm(9, generator=generator).tolist()
+        age = torch.randint(0, 3, (9,), generator=generator).tolist()
+        mixed = (torch.rand(9, generator=generator) > 0.5).tolist()
         need = int(torch.randint(1, 300, (), generator=generator))
         counts = Counter(owner for owner, ok in zip(owners, valid.tolist()) if ok)
         ordered = sorted(
             (owner for owner in counts if counts[owner] > costs[owner]),
-            key=lambda owner: (costs[owner] - counts[owner], age[owner], owner),
+            key=lambda owner: (
+                costs[owner] - counts[owner],
+                not mixed[owner],
+                age[owner],
+                owner,
+            ),
         )
         chosen, net = set(), 0
         for owner in ordered:
@@ -66,7 +72,13 @@ def test_request_selection_preserves_validity_and_releases_complete_owner_sets(
         ]
         assert (
             select_kvduo_full_requests(
-                valid, owners, costs, age, need, release_all=release_all
+                valid,
+                owners,
+                costs,
+                age,
+                need,
+                release_all=release_all,
+                mixed_owners=mixed,
             )
             == expected
         )
@@ -339,6 +351,7 @@ def test_full_reclaim_keeps_request_page_ties_protection_and_publication_before_
     c.kvduo_req_hot_capacity = torch.zeros((1, 2), dtype=torch.int64)
     c._kvduo_host_valid_len = [count, count - 6]
     c._mixed_slots = [False, False]
+    c._kvduo_request_generation = [0, 0]
     c._active_kvduo_reqs = {1: req1, 0: req0}
     c._kvduo_pressure_protected = torch.tensor([3], dtype=torch.int32)
     c.full_host_version[count + 1] = 0
@@ -664,3 +677,85 @@ def test_full_reclaim_does_not_detach_unused_prefix(blocked):
         c.page_size if blocked == "owned_suffix" else len(values)
     )
     allocator.free_segment.assert_not_called()
+
+
+@pytest.mark.parametrize("needed,expected", [(1, list(range(5))), (5, list(range(7)))])
+def test_larger_net_gain_precedes_mixed_owner(needed, expected):
+    assert (
+        select_kvduo_full_requests(
+            torch.ones(7, dtype=torch.int32),
+            [0] * 5 + [1] * 2,
+            [1, 0],
+            [0, 99],
+            needed,
+            mixed_owners=[False, True],
+        )
+        == expected
+    )
+
+
+def test_mixed_owner_ties_use_net_gain_decode_age_then_slot():
+    valid = torch.ones(12, dtype=torch.int32)
+    owners = [0] * 4 + [1] * 4 + [2] * 4
+    assert select_kvduo_full_requests(
+        valid,
+        owners,
+        [0, 0, 0],
+        [2, 1, 1],
+        1,
+        mixed_owners=[True, True, True],
+    ) == [4, 5, 6, 7]
+
+
+def test_coordinator_passes_actual_mixed_state_to_request_selection():
+    c, physical, width = make_request_reclaim_coordinator([3, 2], policy="request")
+    c._mixed_slots[1] = True
+    c.kvduo_req_hot_capacity[:, 1] = c.hot_page_size
+    before = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
+    assert (
+        c.reclaim_kvduo_full_pages(c.page_size, reserve_hot_minimum=True)
+        == 2 * c.page_size
+    )
+    assert torch.equal(
+        c.mem_pool_device.full_to_hisparse_device_index_mapping[:width], before[:width]
+    )
+    assert physical.free_pages == 2
+
+
+@pytest.mark.parametrize("prefill_pages,admitted", [(3, True), (4, False)])
+def test_prefill_rechecks_only_real_surplus_after_decode_request_reclaim(
+    prefill_pages, admitted
+):
+    from types import MethodType
+
+    c, p, req = make_full_coordinator(layers=2, full_reclaim_policy="request")
+    req.decode_batch_idx = 0
+    c.reclaim_kvduo_full_pages = MagicMock(wraps=c.reclaim_kvduo_full_pages)
+    assert c.reserve_kvduo_prefill(prefill_pages, [0]) is None
+    c.reclaim_kvduo_full_pages.assert_not_called()
+    c._reclaim_for_physical_allocation = MethodType(
+        HiSparseCoordinator._reclaim_for_physical_allocation, c
+    )
+    c._require_allocation_ready = HiSparseCoordinator._require_allocation_ready
+    c._guard_kvduo_physical_allocation(c.page_size)
+    assert p.free_pages == 6
+    p.alloc(c.page_size)
+    assert c._kvduo_mandatory_hot_pages() == 2
+    calls = c.reclaim_kvduo_full_pages.call_count
+    token = c.reserve_kvduo_prefill(prefill_pages, [0])
+    assert (token is not None) == admitted
+    assert c.reclaim_kvduo_full_pages.call_count == calls
+    c.prepare_kvduo_graph_replay(torch.tensor([0]))
+    assert c.kvduo_req_hot_capacity[:, 0].tolist() == [4, 4]
+    assert p.free_pages == 3
+
+
+def test_equal_net_gain_prefers_mixed_even_when_full_owner_started_earlier():
+    assert select_kvduo_full_requests(
+        torch.ones(5, dtype=torch.int32),
+        [0, 0, 0, 1, 1],
+        [1, 0],
+        [0, 99],
+        1,
+        mixed_owners=[False, True],
+    ) == [3, 4]
