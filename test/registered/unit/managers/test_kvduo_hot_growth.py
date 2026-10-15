@@ -97,6 +97,7 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
     )
     coordinator._require_allocation_ready = MagicMock()
     physical = SimpleNamespace(free_pages=free_pages, next_page=2, released_starts=[])
+    physical.size = 4096
     physical.device = "cpu"
     physical.page_size = coordinator.page_size
 

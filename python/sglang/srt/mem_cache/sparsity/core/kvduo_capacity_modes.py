@@ -1,4 +1,4 @@
-"""Object-level elasticity recovery with a protected prefill space plan."""
+"""Object-level unlock after associated prefill completion."""
 
 from dataclasses import dataclass
 
@@ -10,17 +10,12 @@ class KVDuoRecoveryObject:
     ready: bool
 
 
-def plan_kvduo_recovery(objects, available_pages, prefill_pages):
-    """FIFO recovery of ready objects, reserving one page for each."""
-    remaining = available_pages - prefill_pages
-    if remaining < 0:
-        return ()
-    selected = []
-    for obj in sorted(objects, key=lambda o: (o.order, o.key[1], o.key[0], o.key[2])):
-        if not obj.ready:
-            continue
-        if remaining < 1:
-            break
-        selected.append(obj.key)
-        remaining -= 1
-    return tuple(selected)
+def plan_kvduo_recovery(objects):
+    """Unlock ready objects in stable FIFO order without allocating pages."""
+    return tuple(
+        obj.key
+        for obj in sorted(
+            objects, key=lambda o: (o.order, o.key[1], o.key[0], o.key[2])
+        )
+        if obj.ready
+    )

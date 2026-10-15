@@ -44,10 +44,10 @@ def cleanup_stack(*, rollback=False, ratio=1):
     set_global_server_args_for_scheduler(
         ServerArgs(model_path="dummy", enable_kvduo=True, enable_hisparse=True)
     )
-    c, physical = ready_coordinator(requests=2)
+    c, physical = ready_coordinator(extra=4, requests=2)
     c.compress_ratio = ratio
     c.is_dsv4_hisparse = ratio > 1
-    physical.free_pages = 0 if rollback else 64
+    physical.free_pages = 1 if rollback else 64
     pool = host_inventory(c, 8)
     request_pool = ReqToTokenPool(1, 32 * ratio, "cpu", enable_memory_saver=False)
     cache = SimpleNamespace(
@@ -148,8 +148,7 @@ def prefill_result(req):
 def assert_prefill_released(c, cache, req, key, record):
     assert not c._kvduo_prefill_host_reservations
     assert key not in c._kvduo_prefill_lifecycle
-    assert key not in c._kvduo_prefill_hot_commitments
-    assert key not in c._kvduo_full_conversion_pending
+    assert key not in c._kvduo_prefill_future_pages
     assert all(
         key not in associations
         for associations in c._kvduo_prefill_associations.values()

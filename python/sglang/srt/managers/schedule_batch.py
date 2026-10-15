@@ -44,6 +44,7 @@ import re
 import sys
 from array import array
 from concurrent.futures import Future
+from contextlib import nullcontext
 from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
@@ -3034,7 +3035,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
         # the allocator, triggered from mem_cache/common.py.)
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        coordinator = self.hisparse_coordinator
+        reservation_scope = (
+            coordinator.kvduo_decode_reservation_scope(self.reqs)
+            if coordinator is not None and coordinator.enable_mixed_residency
+            else nullcontext()
+        )
+        with reservation_scope:
+            self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
         # Update req-level memory management fields
         for req in self.reqs:

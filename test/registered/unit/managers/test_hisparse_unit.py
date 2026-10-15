@@ -486,6 +486,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
                     reserve_hot_minimum=True,
                     prefill_reservation=None,
                     allow_hot_reclaim=False,
+                    allow_full_reclaim=False,
                 )
             ]
             * 2,
@@ -600,6 +601,8 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.enable_mixed_residency = True
+        coordinator.full_reclaim_policy = "page"
+        coordinator.reclaim_kvduo_full_pages = MagicMock(return_value=0)
         coordinator.kvduo_observe = torch.ones(1, dtype=torch.int32)
         coordinator.decode_producer_stream = None
         coordinator.device = "cpu"

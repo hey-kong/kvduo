@@ -99,12 +99,12 @@ def test_decode_common_check_includes_all_host_and_physical_commitments(dsv4):
         reserved_pages=2,
         reserved_host_slots=64,
     )
-    c._kvduo_prefill_hot_commitments[0] = 1
+    c._kvduo_prefill_future_pages[0] = 1
     assert batch.check_decode_mem()
     c._kvduo_common_available.assert_called_once_with(1)
     c._reclaim_for_physical_allocation.assert_not_called()
-    assert c._kvduo_mandatory_hot_pages() == 2
-    assert c._kvduo_reserved_prefill_pages() == 2
+    assert c._kvduo_mandatory_hot_pages() == 1
+    assert c._kvduo_reserved_prefill_pages() == 3
     assert c._kvduo_prefill_host_reservations[0][1] == 64
 
 

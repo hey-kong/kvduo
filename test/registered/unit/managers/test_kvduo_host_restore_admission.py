@@ -110,6 +110,7 @@ def test_generic_prefill_reservation_funds_restore_and_keeps_fresh_tail_quota(
     cache_type,
 ):
     c, physical, adder, req = restore_setup(dsv4=False, cache_type=cache_type, extra=3)
+    req.sampling_params.max_new_tokens = 2
     assert physical.free_pages == 0
     assert adder.token_to_kv_pool_allocator.available_size() == 0
 
@@ -118,13 +119,13 @@ def test_generic_prefill_reservation_funds_restore_and_keeps_fresh_tail_quota(
     assert adder.can_run_list == [req]
     assert req.extend_range == Range(2 * adder.page_size, 3 * adder.page_size)
     assert physical.free_pages == 2
-    assert c._kvduo_reserved_prefill_pages() == 1
-    assert c._kvduo_mandatory_hot_pages() == 1
+    assert c._kvduo_reserved_prefill_pages() == 2
+    assert c._kvduo_mandatory_hot_pages() == 0
     assert c._kvduo_prefill_budget_cost == {(0, 0, 0): 1}
     assert c._kvduo_object_limited((0, 0))
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_called_once()
     c.mem_pool_host.load_to_device_per_layer.assert_called_once()
-    c.reclaim_kvduo_full_pages.assert_called_once()  # Initial admission only.
+    c.reclaim_kvduo_full_pages.assert_not_called()
     assert all(
         record.restore_pins == 0 for record in c.host_prefix_cache.records.values()
     )
