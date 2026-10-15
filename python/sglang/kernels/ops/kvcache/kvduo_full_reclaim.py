@@ -204,9 +204,9 @@ def select_kvduo_full_requests(
     release_all: bool = False,
     mixed_owners: Sequence[bool] | None = None,
 ) -> list[int]:
-    """Prefer mixed owners, then largest net gain within each residency class.
+    """Prefer largest net gain, then mixed owners at equal gain.
 
-    Equal gains prefer earlier decode admission, then the stable owner index.
+    Equal gain and residency prefer earlier decode admission, then owner index.
     Page validity and one-time HOT minimum costs match the page policy. GPU
     planning never sorts page ages or downloads the full validity vector.
     """
@@ -262,8 +262,8 @@ def select_kvduo_full_requests(
     eligible = sorted(
         (owner for owner, count in counts.items() if count > minimum_costs[owner]),
         key=lambda owner: (
-            not mixed_owners[owner],
             -(counts[owner] - minimum_costs[owner]),
+            not mixed_owners[owner],
             admission_order[owner],
             owner,
         ),

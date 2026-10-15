@@ -53,8 +53,8 @@ def test_request_selection_preserves_validity_and_releases_complete_owner_sets(
         ordered = sorted(
             (owner for owner in counts if counts[owner] > costs[owner]),
             key=lambda owner: (
-                not mixed[owner],
                 costs[owner] - counts[owner],
+                not mixed[owner],
                 age[owner],
                 owner,
             ),
@@ -678,8 +678,8 @@ def test_full_reclaim_does_not_detach_unused_prefix(blocked):
     allocator.free_segment.assert_not_called()
 
 
-@pytest.mark.parametrize("needed,expected", [(1, [5, 6]), (3, list(range(7)))])
-def test_mixed_owner_precedes_larger_full_owner(needed, expected):
+@pytest.mark.parametrize("needed,expected", [(1, list(range(5))), (5, list(range(7)))])
+def test_larger_net_gain_precedes_mixed_owner(needed, expected):
     assert (
         select_kvduo_full_requests(
             torch.ones(7, dtype=torch.int32),
@@ -707,7 +707,7 @@ def test_mixed_owner_ties_use_net_gain_decode_age_then_slot():
 
 
 def test_coordinator_passes_actual_mixed_state_to_request_selection():
-    c, physical, width = make_request_reclaim_coordinator([6, 2], policy="request")
+    c, physical, width = make_request_reclaim_coordinator([3, 2], policy="request")
     c._mixed_slots[1] = True
     c.kvduo_req_hot_capacity[:, 1] = c.hot_page_size
     before = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
@@ -747,3 +747,14 @@ def test_prefill_rechecks_only_real_surplus_after_decode_request_reclaim(
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
     assert c.kvduo_req_hot_capacity[:, 0].tolist() == [4, 4]
     assert p.free_pages == 3
+
+
+def test_equal_net_gain_prefers_mixed_even_when_full_owner_started_earlier():
+    assert select_kvduo_full_requests(
+        torch.ones(5, dtype=torch.int32),
+        [0, 0, 0, 1, 1],
+        [1, 0],
+        [0, 99],
+        1,
+        mixed_owners=[False, True],
+    ) == [3, 4]

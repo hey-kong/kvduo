@@ -225,9 +225,10 @@ __global__ void kvduo_full_request_select_kernel(
         for (int owner = 0; owner < owner_count; ++owner) {
           const int64_t gain = counts[owner] - costs[owner];
           if (chosen[owner] || gain <= 0) continue;
-          if (best < 0 || mixed[owner] > mixed[best] ||
-              (mixed[owner] == mixed[best] &&
-               (gain > best_gain || (gain == best_gain && admission[owner] < admission[best])))) {
+          if (best < 0 || gain > best_gain ||
+              (gain == best_gain &&
+               (mixed[owner] > mixed[best] ||
+                (mixed[owner] == mixed[best] && admission[owner] < admission[best])))) {
             best = owner;
             best_gain = gain;
           }

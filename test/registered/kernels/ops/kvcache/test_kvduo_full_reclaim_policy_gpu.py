@@ -95,3 +95,18 @@ def test_request_selection_download_is_bounded_by_whole_owner_overshoot(monkeypa
         valid, owners, [1] * 8, list(range(8)), 1
     ) == list(range(1024))
     assert downloads == [1033]
+
+
+@pytest.mark.parametrize("costs,expected", [([0, 0], [0, 1, 2]), ([1, 0], [3, 4])])
+def test_net_gain_precedes_residency_and_residency_breaks_gain_ties(costs, expected):
+    assert (
+        select_kvduo_full_requests(
+            torch.ones(5, dtype=torch.int32, device="cuda"),
+            [0, 0, 0, 1, 1],
+            costs,
+            [0, 99],
+            1,
+            mixed_owners=[False, True],
+        )
+        == expected
+    )
