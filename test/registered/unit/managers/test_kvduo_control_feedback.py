@@ -9,7 +9,7 @@ import torch.distributed as dist
 from sglang.kernels.ops.kvcache.kvduo_control import pack_kvduo_feedback
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 def fixture():
@@ -72,6 +72,50 @@ def test_two_tp_ranks_check_exact_applicants_and_free_pages_once(tmp_path):
     torch.multiprocessing.start_processes(
         _tp_worker,
         args=(str(tmp_path / "gloo-init"),),
+        nprocs=2,
+        join=True,
+        start_method="spawn",
+    )
+
+
+def _replay_tp_worker(rank, path):
+    c, allocator = fixture()(layers=2, requests=2, free_pages=32)
+    requests = torch.tensor([0, 1])
+    # Start with identical, already materialized mandatory HOT capacities.
+    c.prepare_kvduo_graph_replay(requests)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{path}",
+        world_size=2,
+        rank=rank,
+        timeout=timedelta(seconds=10),
+    )
+    try:
+        c.tp_world_size = 2
+        c.tp_group = dist.group.WORLD
+        for scenario in ("rank0_only", "rank1_only", "empty", "matching"):
+            before = c.kvduo_req_hot_capacity.clone()
+            if scenario == "matching" or scenario == f"rank{rank}_only":
+                c.kvduo_hot_growth_events[0, 0] = 1
+            with patch.object(dist, "all_reduce", wraps=dist.all_reduce) as reduce:
+                c.prepare_kvduo_graph_replay(requests)
+            # The next collective must match on both ranks even if one had no
+            # local event. A skipped replay collective deadlocks here.
+            dist.barrier()
+            assert reduce.call_count == 1
+            expected = before.clone()
+            if scenario == "matching":
+                expected[0, 0] += c.hot_page_size
+            assert torch.equal(c.kvduo_req_hot_capacity, expected)
+            assert not c.kvduo_hot_growth_events.any()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_replay_no_local_growth_still_participates_in_tp_consensus(tmp_path):
+    torch.multiprocessing.start_processes(
+        _replay_tp_worker,
+        args=(str(tmp_path / "gloo-replay"),),
         nprocs=2,
         join=True,
         start_method="spawn",

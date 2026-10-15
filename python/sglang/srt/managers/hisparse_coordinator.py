@@ -2560,7 +2560,14 @@ class HiSparseCoordinator:
         event_capacities = {
             owner: int(self.kvduo_req_hot_capacity[owner]) for owner in growth_events
         }
-        if not pending_minimum and not growth_events:
+        # Events are rank-local. Mixed TP ranks must all reach the optional
+        # growth collective, including ranks with no event in this replay.
+        # Otherwise the next control collective can match a different step.
+        if (
+            not pending_minimum
+            and not growth_events
+            and getattr(self, "tp_world_size", 1) <= 1
+        ):
             return
         requested = set(pending_minimum)
         requested.update(req_idx for _, req_idx in growth_events)
