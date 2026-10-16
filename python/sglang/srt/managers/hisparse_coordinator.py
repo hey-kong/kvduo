@@ -2767,8 +2767,6 @@ class HiSparseCoordinator:
         if not self.enable_mixed_residency or num_tokens <= 0:
             return 0
         self._wait_kvduo_hot_merge_boundary()
-        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
-        target = allocator.available_size() + num_tokens
         layers = self.mem_pool_device.layer_num
         owners = [
             (layer, req)
@@ -2788,7 +2786,7 @@ class HiSparseCoordinator:
             )
             for owner, can_merge in zip(owners, eligible)
         )
-        if not self._kvduo_consensus((hand, target, self.min_hot_pages, snapshot)):
+        if not self._kvduo_consensus((hand, num_tokens, self.min_hot_pages, snapshot)):
             return 0
         candidate_count = sum(eligible)
         if not candidate_count:
@@ -2810,7 +2808,7 @@ class HiSparseCoordinator:
                     len(self._kvduo_req_layer_pages[owner]) > self.min_hot_pages
                 )
                 candidate_count -= not eligible[index]
-            if allocator.available_size() >= target or not candidate_count:
+            if reclaimed >= num_tokens or not candidate_count:
                 break
         return reclaimed
 

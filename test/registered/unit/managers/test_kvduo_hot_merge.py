@@ -195,6 +195,39 @@ def test_hand_batches_scan_but_retains_each_merge_consensus(monkeypatch):
     assert c._kvduo_hand == 1
 
 
+@pytest.mark.parametrize("initial_free_tokens", [0, 64])
+def test_hand_reclaims_same_amount_with_different_tp_free_space(
+    monkeypatch, initial_free_tokens
+):
+    transcript = []
+    for rank_free_tokens in (0, initial_free_tokens):
+        c, physical = make_merge_coordinator({(0, 0): 20, (0, 1): 20})
+        physical.free_pages = rank_free_tokens // c.page_size
+        physical.available_size.reset_mock()
+        c.tp_world_size = 2
+        c.tp_group = object()
+        observed = []
+
+        def gather(values, value, **kwargs):
+            index = len(observed)
+            observed.append(value)
+            peer = transcript[index] if transcript else value
+            values[:] = [value, peer]
+
+        collective = MagicMock(side_effect=gather)
+        monkeypatch.setattr(torch.distributed, "all_gather_object", collective)
+        assert c.reclaim_kvduo_hot_pages(64) == 72
+        assert physical.free_pages * c.page_size == rank_free_tokens + 72
+        assert c.kvduo_req_hot_capacity.tolist() == [[8, 8]]
+        assert c._kvduo_hand == 0
+        assert collective.call_count == 3  # One snapshot and two merge plans.
+        physical.available_size.assert_not_called()
+        if transcript:
+            assert observed == transcript
+        else:
+            transcript = observed
+
+
 def test_hand_snapshot_disagreement_does_not_mutate_or_merge(monkeypatch):
     c, _ = make_merge_coordinator({(0, 0): 2})
     c.tp_world_size = 2
