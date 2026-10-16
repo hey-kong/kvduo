@@ -6,7 +6,6 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
@@ -122,7 +121,7 @@ def test_plain_hisparse_keeps_separate_layer_buffers():
     assert len({buf.untyped_storage().data_ptr() for buf in pool.kv_buffer}) == 3
 
 
-@pytest.mark.parametrize("layers,top_k", [(3, 64), (3, 193), (78, 2048)])
+@pytest.mark.parametrize("layers,top_k", [(1, 576), (3, 64), (3, 193), (78, 2048)])
 def test_real_coordinator_allocates_lp_slots_per_whole_hot_page(
     monkeypatch, layers, top_k
 ):
@@ -131,10 +130,10 @@ def test_real_coordinator_allocates_lp_slots_per_whole_hot_page(
     minimum = (top_k + k - 1) // k
     assert c.hot_storage_layers == layers
     assert c.hot_page_size == k
-    assert c.device_buffer_size == 8 * k
+    assert c.device_buffer_size == minimum * k
     assert c.min_hot_pages == minimum
-    expected_dtype = torch.int32 if 8 * k > 32767 else torch.int16
-    assert c.lru_slots.dtype == expected_dtype
+    assert c.lru_slots.numel() == 0
+    assert c.kvduo_hot_pointers.shape == (layers, c.req_to_host_pool.size(0), 4)
     before = allocator.hisparse_attn_allocator.available_size()
     c._ensure_kvduo_hot_capacity_targets_batch({(layers - 1, 1): minimum * k})
     pages = c._kvduo_req_layer_pages[layers - 1, 1]
@@ -146,13 +145,7 @@ def test_real_coordinator_allocates_lp_slots_per_whole_hot_page(
         for storage_layer in range(layers)
         for offset in range(64)
     ]
-    assert (
-        c.req_device_buffer_token_locs[layers - 1, 1, : minimum * k].tolist()
-        == expected
-    )
-    assert c.lru_slots[layers - 1, 1, : minimum * k].tolist() == list(
-        range(minimum * k)
-    )
+    assert c.kvduo_hot_buffers[layers - 1, 1].locations.tolist() == expected
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
@@ -164,26 +157,29 @@ def test_generic_merge_moves_payload_across_storage_layers_before_whole_page_fre
     owner = (1, 0)
     c._ensure_kvduo_hot_capacity_targets_batch({owner: 3 * k})
     pages = list(c._kvduo_req_layer_pages[owner])
-    locations = c.req_device_buffer_token_locs[owner][: 3 * k].long()
-    c.req_device_buffer_tokens[owner][: 3 * k] = torch.arange(3 * k)
+    locations = c.kvduo_hot_buffers[owner].locations[: 3 * k].long()
+    c.kvduo_hot_buffers[owner].tokens[: 3 * k] = torch.arange(3 * k)
     pool.get_flat_key_buffer()[locations] = (
         torch.arange(3 * k).remainder(251).to(pool.store_dtype)[:, None, None]
     )
     survivors = [0, k + 64, 2 * k + 64, 2 * k + 65]
-    c.req_device_buffer_tokens[owner][: 3 * k] = -1
-    c.req_device_buffer_tokens[owner][survivors] = torch.tensor(
+    c.kvduo_hot_buffers[owner].tokens[: 3 * k] = -1
+    c.kvduo_hot_buffers[owner].tokens[survivors] = torch.tensor(
         survivors, dtype=torch.int32
     )
-    c.kvduo_capacity_steps[owner] = 65
-    c.kvduo_capacity_ema[owner] = 0
+    from sglang.srt.mem_cache.sparsity.core.kvduo_frequency import pack_frequency
+
+    c.kvduo_hot_buffers[owner].frequency.copy_(
+        pack_frequency([3 if i in survivors else 0 for i in range(3 * k)])
+    )
     payloads = pool.get_flat_key_buffer()[locations[survivors]].clone()
     physical = allocator.hisparse_attn_allocator
     free = physical._release_page_ids
 
     def free_after_copy(indices):
         assert c._kvduo_req_layer_pages[owner] == [pages[2]]
-        locs = c.req_device_buffer_token_locs[owner]
-        tokens = c.req_device_buffer_tokens[owner]
+        locs = c.kvduo_hot_buffers[owner].locations
+        tokens = c.kvduo_hot_buffers[owner].tokens
         for slot, token in enumerate(survivors):
             mapped = locs[torch.where(tokens == token)[0][0]]
             assert torch.equal(pool.get_flat_key_buffer()[mapped], payloads[slot])
@@ -195,7 +191,11 @@ def test_generic_merge_moves_payload_across_storage_layers_before_whole_page_fre
     assert c._merge_kvduo_hot_pages(*owner) == 128
     assert allocator.hisparse_attn_allocator.available_size() == before + 128
     assert (
-        c.req_device_buffer_tokens[owner][c.lru_slots[owner][:k].long()][-4:].tolist()
+        sorted(
+            c.kvduo_hot_buffers[owner]
+            .tokens[c.kvduo_hot_buffers[owner].tokens >= 0]
+            .tolist()
+        )
         == survivors
     )
     assert c._kvduo_req_layer_pages[owner] == [pages[2]]
@@ -207,7 +207,6 @@ def test_generic_resolver_receives_flat_backing_and_local_full_layer_offset(
     monkeypatch,
     clock_advanced,
 ):
-    import sglang.srt.managers.hisparse_coordinator as module
 
     c, pool, _ = make_stack(monkeypatch, start_layer=7)
     c.full_touch_clock.fill_(40)
@@ -218,8 +217,13 @@ def test_generic_resolver_receives_flat_backing_and_local_full_layer_offset(
             operation,
             MagicMock(side_effect=AssertionError("unfused status check")),
         )
-    swap = MagicMock()
-    monkeypatch.setattr(module, "load_cache_to_device_buffer_mla", swap)
+    import sglang.kernels.ops.kvcache.kvduo_frequency as frequency
+
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda _: SimpleNamespace(cuda_stream=0)
+    )
+    ffi = MagicMock()
+    monkeypatch.setattr(frequency, "module", lambda *args: SimpleNamespace(resolve=ffi))
     c.swap_in_selected_pages(
         torch.tensor([1]),
         torch.tensor([64]),
@@ -227,71 +231,20 @@ def test_generic_resolver_receives_flat_backing_and_local_full_layer_offset(
         8,
         touch_clock_advanced=clock_advanced,
     )
-    kwargs = swap.call_args.kwargs
-    assert kwargs["device_buffer"] is pool.get_flat_key_buffer()
-    assert kwargs["full_location_base"] == pool.flat_layer_slot_stride
-    assert kwargs["page_size"] == 3 * 64
-    assert kwargs["full_page_size"] == 64
+    args = ffi.call_args.args
+    assert args[13] == pool.get_flat_key_buffer().data_ptr()
+    assert args[15] == pool.flat_layer_slot_stride
     assert c.full_touch_clock.item() == (40 if clock_advanced else 41)
-    assert kwargs["validate_status"] is True
-    assert kwargs["host_cache"].data_ptr() == c.mem_pool_host.kv_buffer[1].data_ptr()
+    assert args[12] == c.mem_pool_host.kv_buffer[1].data_ptr()
 
 
-def test_coordinator_initializes_workspace_once_and_reuses_it_across_requests(
-    monkeypatch,
-):
-    import sglang.srt.managers.hisparse_coordinator as module
-    from sglang.kernels.ops.kvcache.hisparse import hisparse_resolver_scratch_words
-
-    allocate = MagicMock(
-        side_effect=lambda requests, topk, capacity, block, device, **kwargs: torch.empty(
-            (requests, hisparse_resolver_scratch_words(topk, capacity)),
-            dtype=torch.int32,
-            device=device,
-        )
-    )
-    monkeypatch.setattr(module, "allocate_hisparse_resolver_scratch", allocate)
+def test_frequency_workspace_is_topk_sized_and_shared_across_layers(monkeypatch):
     c, _, _ = make_stack(monkeypatch, layers=78, top_k=2048)
-    c.mem_pool_host.kv_buffer = torch.zeros((78, 1, 1, 16), dtype=torch.bfloat16)
-    swap = MagicMock()
-    monkeypatch.setattr(module, "load_cache_to_device_buffer_mla", swap)
-    workspace = c.resolver_scratch
-    assert c.resolver_lru_scratch is None
-    assert allocate.call_args.kwargs["use_lru_scratch"]
-    for req in (1, 0):
-        c.swap_in_selected_pages(
-            torch.tensor([req]),
-            torch.tensor([2048]),
-            torch.zeros((1, 2048), dtype=torch.int32),
-            77,
-        )
-        assert swap.call_args.kwargs["resolver_scratch"] is workspace
-    allocate.assert_called_once_with(
-        2, 2048, 39936, 960, torch.device("cpu"), use_lru_scratch=True
-    )
-
-
-def test_coordinator_reuses_compact_lru_workspace_across_requests_and_layers(
-    monkeypatch,
-):
-    import sglang.srt.managers.hisparse_coordinator as module
-
-    c, _, _ = make_stack(monkeypatch, layers=78, top_k=2048)
-    assert c.resolver_scratch is None
-    workspace = c.resolver_lru_scratch
-    assert workspace.shape == (2, 39936) and workspace.dtype == torch.int32
-    c.mem_pool_host.kv_buffer = torch.zeros((78, 1, 1, 16), dtype=torch.bfloat16)
-    swap = MagicMock()
-    monkeypatch.setattr(module, "load_cache_to_device_buffer_mla", swap)
-    for layer, req in ((77, 1), (0, 0)):
-        c.swap_in_selected_pages(
-            torch.tensor([req]),
-            torch.tensor([2048]),
-            torch.zeros((1, 2048), dtype=torch.int32),
-            layer,
-        )
-        assert swap.call_args.kwargs["lru_scratch"] is workspace
-        assert swap.call_args.kwargs["resolver_scratch"] is None
+    assert c.resolver_scratch is None and c.resolver_lru_scratch is None
+    assert c.kvduo_frequency_scratch.shape == (2, 9 * 2048)
+    assert c.kvduo_hot_pointers.shape == (78, 2, 4)
+    assert c.kvduo_hot_buffers == {}
+    assert c.req_device_buffer_tokens.numel() == c.lru_slots.numel() == 0
 
 
 def test_kvduo_bf16_flashmla_kv_rejected_during_actual_backend_initialization(

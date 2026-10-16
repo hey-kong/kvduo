@@ -5,18 +5,18 @@ description: "共享 FULL/HOT 驻留、按收益调整 HOT 容量，以及按实
 
 ## 概述
 
-KVDuo 面向非 P/D 分离的稀疏注意力推理。完整 KV 页（FULL）和稀疏热点条目（HOT）共用 HBM 物理页池，Host 保存有效后备。Decode 空间不足时，先回收合格 FULL 页，再按近期访问收益调整 HOT 容量；等待的 prefill 只可在预算内借用低收益的 HOT 追加容量，不回收活跃 FULL。
+KVDuo 面向非 P/D 分离的稀疏注意力推理。完整 KV 页（FULL）和稀疏热点条目（HOT）共用 HBM 物理页池，Host 保存有效后备。Decode 空间不足时，先回收合格 FULL 页，再按近期访问收益调整 HOT 容量；等待的 prefill 仅使用实际剩余空间和闲置缓存，不主动回收活跃 FULL 或 HOT。
 
 ## 容量与统计口径
 
 - 一个 HOT 对象对应 `(request, layer)`，同一请求的各层独立管理。
 - 一张物理页包含所有存储层的同号页片段。用作 FULL 时，各层保存同一序列区间；用作 HOT 时，全部片段保存同一逻辑层的稀疏条目。片段可以由 stride 分隔，无需相邻。
 - 一张 HOT 页的条目数记为 K，等于存储层数乘以每层页条目数；存储层数不一定等于逻辑层数。例如 21 个存储层、每层 64 个条目，则 K 为 1344。
-- HOT 按需建立，初始页数为 `ceil(top_k / K)`，最多 8 页；最低页数不能超过 8。
+- HOT 按需建立，最低页数为 `ceil(top_k / K)`；不设 8 页上限，扩容受共享物理池可用空间及必要预留约束。
 
 只统计实际执行且解析成功的 decode。FULL/tail 直接命中、已有 HOT 命中和 Host miss 互斥；本轮 H2D 新换入不算命中。零命中步骤正常观察，padding、无效访问、Graph 捕获、预热及搬运不计入。
 
-HOT 收益统计使用 EMA：首次观察直接初始化，此后旧值占 63/64、本步值占 1/64。超过 64 个有效观察步才可评估，观察不足不能视为零损失。
+每个 HOT 条目使用 2-bit 饱和频次计数 `freq`，范围为 0–3；不再维护 HOT LRU、分段 EMA 或观察步数。
 
 ## 设计点 1：FULL 与 HOT 混合驻留
 
@@ -28,7 +28,7 @@ HOT 收益统计使用 EMA：首次观察直接初始化，此后旧值占 63/64
 
 该清理可能增加后续 Host 换入；它复用现有回收的规划和完成同步，并非零开销，但不会每个 decode 步都启动历史扫描。完整驻留请求保持 FULL，未改变私人请求结束 HBM 清理和 Host 前缀复用。
 
-Prefill 生成 FULL KV，支持前缀复用。Decode 依次查找 FULL/tail、对应对象的 HOT；均未命中时，从 Host 换入 HOT，优先用空槽，否则按条目 LRU 替换。
+Prefill 生成 FULL KV，支持前缀复用。Decode 依次查找 FULL/tail、对应对象的 HOT；均未命中时，从 Host 换入 HOT，优先用空槽；暂时无法扩容时，按低频优先替换，同频按槽位编号选择，并保护本轮已命中的 HOT 条目。
 
 活跃 FULL 仅因 decode 必需分配或 HOT 扩容回收，包括已完成 prefill、尚未首次 decode 的请求。FULL 只能在 Host 副本完整、有效且版本同步后回收。候选页排除共享引用保护、最新 tail、未写满页，以及使用、分配或传输中的页。仅单个活跃请求持有的 Radix 独占后缀可先从树中摘出，将槽位所有权交还请求，再参与 FULL 回收；共享节点和无法安全转移的前缀继续保护。摘出不搬运或释放 KV，后续前缀匹配不会将该后缀误报为 GPU 命中，有效 Host 副本仍可用于恢复。Tail 默认保护最新 2 页。
 
@@ -56,51 +56,39 @@ KVDuo 的 SWA 只为活跃计算保留数据，不为未来前缀复用长期占
 
 前缀复用只选择各 TP rank 都具备完整、有效副本的页对齐边界：恢复缺失的历史数据及边界前的 SWA 窗口和压缩状态，然后继续 prefill。只分配恢复窗口所需的 HBM SWA，不恢复整段历史 SWA。C128 请求状态按 HiCache 的页对齐规则重新开始。副本缺失、过期或尚未完成搬运时缩短命中；没有有效边界才从头计算。取消、请求结束和槽位复用释放相关引用，缓存清空同时清理 Host 副本。纯 HiSparse 路径保持原行为。
 
-`decode_emergency_reclaim` 默认关闭，可设置 `decode_emergency_reclaim=true` 开启。它仅用于必需 decode：正常 FULL 回收和预算内 HOT merge 后仍缺页时，将可安全处理的 HOT 对象缩至最低容量，优先处理可释放页数最多的对象，空间足够即停止。它允许观察不足或超出普通 miss 预算的对象应急缩容，优先保留运行中的请求，可能增加 H2D 换入和 merge 停顿；最低容量、页保护、TP 一致性和 prefill 预留仍有效。prefill 和可选扩容不使用此路径。
+`decode_emergency_reclaim` 保留为兼容配置，默认关闭。新的频次 Hand 已不受观察门槛或 miss 预算限制，因此该开关不再提供额外的缩容权限。最低容量、使用保护、TP 一致性和预留始终有效。
 
 首次 decode 准入失败时，日志记录逻辑／SWA、Host、物理空闲页、HOT 最低额度、prefill 预留及回收结果；整请求回退仍作为兜底。应急 HOT 回收无法解决独立池不足。
 
 准入前检查并预留完整 prompt 所需的主 KV Host 后备。已完成 chunk 的备份和 staging 分配将预留转为真实占用；取消或请求结束时释放剩余预留及其前缀 pin。
 
-## 设计点 2：按近期收益调整 HOT 容量
+## 设计点 2：Adaptive Hot Buffer Allocation
 
-### 扩容与收益估计
+### 频次与扩容
 
-新的 top-k H2D 换入需要替换已占用槽位时，提出增加一张 HOT 页的申请；同一安全边界前的多个事件合并一次。达到 8 页或空间不足时，在当前容量内继续 LRU 换入，不积累延期申请。
+新换入条目 `freq=0`；实际 HOT 命中时加一，最大为 3。FULL/tail 命中、新发生的 H2D、padding、预热和搬运不增加频次。
 
-没有真实扩容申请，或空闲页尚不能覆盖 prefill 保护量时，不通过可选扩容路径执行普通 merge 为 prefill 腾空间。
+新的 top-k H2D 换入需要替换已占用槽位时，申请增加一张 HOT 页，同一处理边界前的事件合并一次。扩容保留原条目及频次，新槽为空；没有固定最大页数。先使用空闲页，空间不足时回收合格 FULL，随后尝试 HOT merge。扩容仍须保护必要预留；暂缓的申请不累积，后续由新的容量不足事件触发。
 
-`lru_slots` 从 LRU 到 MRU 保存替换顺序。统计按更新前的排名，从 MRU 端每 K 个槽位划一段，记录最多 8 段的 HOT Hit EMA、一个 Miss EMA 和观察步数；FULL/tail 命中不计入分段。
+### Hand 与 merge
 
-统计成熟后，选择满足最低容量的最小保留页数，使被截掉段的 Hit EMA 总和不超过 Miss EMA 的 `max_relative_miss_increase` 倍，默认 10%。Miss 为零时，只能截掉贡献为零的段；未成熟时保持容量。
+Hand 按请求进入热点驻留的顺序扫描，请求内逐层处理 HOT 对象。跳过受保护、正在 staging、generation 失效、处于最低容量或正在申请扩容的对象。
 
-例如 4 页的分段命中为 `[100, 30, 5, 1]`，Miss EMA 为 100，预算为 10：保留 2 页会截掉 6 次预计命中，保留 1 页会截掉 36 次，因此目标为 2 页。
+每次 merge：
 
-扩容保留全部已有 EMA 和观察步数，新增尾段继承扩容前最后一个已有段的 Hit EMA。该初值是先验，不代表真实命中，也不会使只有 20 步观察的对象立即成熟。
+1. 仅保留操作前 `freq=3` 的有效条目，其余丢弃。
+2. 根据存活条目数计算所需整页数，至少保留 `ceil(top_k / K)` 页。
+3. 优先留下包含最多存活条目的物理页，将其余存活条目搬入保留页的空槽。
+4. 存活条目频次除以 2，即 3 变为 1；不把搬运视作访问。
+5. 发布映射和容量，确认旧访问、搬运及更新完成后归还物理页。
 
-### Hand 扫描与 merge
+一次 merge 可以不释放页，Hand 仍前进。允许跨轮继续扫描：没有 decode 插入时，第一轮保留的 3 已变成 1，下一轮可进一步缩容。所有可处理对象均到最低容量或不可处理时结束，避免无法释放空间的无限循环。
 
-共享池的 hand 按请求槽位优先、层号递增循环扫描，处理或跳过后推进，跨调用保留位置。跳过不活跃、未建立 HOT、staging、generation 不符、受使用或搬运保护的对象。
+### GPU 执行
 
-每个安全处理对象按上述预算确定目标。容量不变时保留已有统计和元数据。
+每个对象仅按实际容量分配 token、location 和打包的 2-bit freq；当前轮命中保护使用临时槽位标记。CUDA Graph 读取固定地址的指针表，扩缩容在安全边界替换该对象的存储并发布新指针，无需预分配每对象最大池容量或重新捕获 Graph。
 
-实际缩容时：
-
-1. 按真实 LRU 保留 MRU 端目标容量内的有效条目，不足时全部保留。
-2. 保留包含最多存活条目的目标数量物理页，同分优先原页列表中靠前的页。
-3. 将释放页中的存活 KV 搬入保留页的空槽或被丢弃条目槽位。
-4. 发布映射和容量，保持存活条目的相对 LRU 顺序，空槽优先；清零容量收益统计。
-5. 等待搬运和元数据更新完成，再归还物理页。
-
-同边界中被实际缩容对象的扩容申请会取消。空间够用即停止，超额释放页进入空闲池；完整一轮无释放、无外部状态变化时停止，不放宽预算。请求结束不重置全局 hand。
-
-### GPU 规划
-
-CUDA 路径中，CPU 筛选可安全处理的对象并验证 generation、页所有权和 TP 一致性；GPU 根据 EMA 计算缩容目标，按 hand 顺序筛选覆盖缺口的处理前缀。CPU 仅读取该前缀的紧凑规划，不下载完整 EMA。
-
-普通 merge 仍逐对象执行。GPU 用一个 CTA 规划存活条目、保留页、搬运向量和暂存元数据。容量相关工作区放在全局 scratch，避免共享内存随最大槽位数增长。
-
-确定缩容目标后，GPU 在同一 stream 中顺序规划、复制 KV（含必要 scale）、发布元数据并清零统计，复用固定工作区。CPU 在归还页前只读取一次状态、搬运数和保留页位掩码三个 int32 完成摘要，不读取完整条目数组。完整页直接按已知页编号归还，避免再次筛选和去重；规划失败不搬运或发布。原张量地址、形状和 stride 保持固定，完成等待和 KV 搬运仍有开销。
+GPU 选择保留页、规划并搬运存活 KV；CPU 接收页选择结果，检查 TP 一致性后完成页所有权与 allocator 更新。resolver 使用按 top-k 大小分配的全局 scratch，不随 HOT 容量增大而申请巨量 shared memory。
 
 ## 设计点 3：按实际剩余空间准入 Prefill
 
@@ -122,19 +110,19 @@ Prefill 完成不会主动将请求转为混合驻留，但其他请求的 decod
 
 ## 生命周期与执行约束
 
-首次建立 HOT 时从零观察；实际缩容清零容量统计；扩容保留历史并初始化新增段；请求结束或槽位复用清空该请求统计、预留和引用，不重置全局 hand。
+首次建立 HOT 时槽位为空、频次为零；扩容保留已有条目频次，merge 保留高频条目并衰减。请求结束或槽位复用清空该请求元数据、Hand 条目、预留和引用，不重置全局 Hand 的扫描进度。
 
 物理扩缩容在 decode 步之间执行，先准备资源，再修改状态。旧访问、在途传输、KV 搬运和元数据发布完成后才归还页；TP 各 rank 的准入和释放方案必须一致。
 
-CUDA Graph 的元数据地址、形状和 stride 固定，token/location padding 与 LRU 宽度分别处理。大容量 resolver 在初始化时检查设备资源，选择共享或持久化全局 scratch。
+CUDA Graph 使用的指针表、容量表和 scratch 地址固定。对象存储替换后，旧 tensor 在 GPU 读者和指针发布完成前保持存活。
 
 请求结束先完成尾部写回和在途操作，再按前缀缓存规则处理完整 KV，释放 HOT 及其他请求独占资源。前缀复用只接受从序列起点开始、所有所需存储层均完整有效的连续 FULL 页；共享页仅在最后一个保护引用消失后释放。
 
-容量收益统计占 44 bytes／对象，不含对齐、临时工作区及控制记录。全部请求绑定状态验证 generation。
+频次占每条目 2 bit，不含 token、location、临时工作区和控制记录。全部请求绑定状态验证 generation。
 
 ## 限制与评估
 
-分段命中是近期收益估计，不模拟缩容后的缓存演化。扩容尾段先验、访问变化及 EMA 滞后可能导致误判；预算不保证实际 miss、TTFT、TPOT 或 SLO 的严格上界。Decode FULL 回收引入的换入代价不由普通 HOT 缩容预算约束。
+频次是近期复用的轻量代理，不模拟缩容后的缓存演化。merge 会丢弃低频条目，可能增加后续 H2D；无释放的扫描也有成本。取消容量上限不意味着无限 HBM，仍须检查物理池、Host 及独立逻辑资源。策略不保证实际 miss、TTFT、TPOT 或 SLO 的严格上界。
 
 评测关注实际 miss、净释放量、prefill 等待、吞吐和尾延迟，以及准入频率、Host 备份和 GPU merge 的规划／搬运／同步成本。
 
@@ -159,10 +147,9 @@ python3 -m sglang.launch_server \
 | `swap_in_block_size` | `960` | Resolver CUDA block 线程数，须为 32 的倍数且不超过设备上限，通常为 32–1024 |
 | `tail_protected_pages` | `2` | 每请求保护的最新 FULL 页数 |
 | `full_reclaim_policy` | `"request"` | `"request"` 按请求批量释放全部合格 FULL 页；`"page"` 按页 LRU 回收 |
-| `max_relative_miss_increase` | `0.10` | 设计点 2 普通 HOT 缩容的预计 miss 相对增幅容忍比例 |
-| `decode_emergency_reclaim` | `false` | 开启后，必需 decode 的普通回收失败时允许 HOT 应急缩至最低容量，优先避免整请求回退 |
+| `decode_emergency_reclaim` | `false` | 兼容旧配置；频次 Hand 不再区分普通与应急缩容权限 |
 
-`top_k`、`logical_capacity_ratio`、`swap_in_block_size` 和 `tail_protected_pages` 须为正整数，`logical_capacity_tokens` 须为非负整数，`host_size` 须为有限非负数，回收策略只接受 `"request"` 或 `"page"`，miss 容忍比例须为有限非负数，应急开关须为布尔值；未知字段报错。`--kvduo-config` 必须配合 `--enable-kvduo`。默认 10% 是实验初值。
+`top_k`、`logical_capacity_ratio`、`swap_in_block_size` 和 `tail_protected_pages` 须为正整数，`logical_capacity_tokens` 须为非负整数，`host_size` 须为有限非负数，回收策略只接受 `"request"` 或 `"page"`，应急开关须为布尔值；未知字段报错。`--kvduo-config` 必须配合 `--enable-kvduo`。旧 `max_relative_miss_increase` 字段已移除。
 
 KVDuo 要求 RadixTree，不能与 HiSparse、HiCache 或 speculative decoding 同时启用；支持 chunked prefill，不改其分块设置。通用 DSA 和 DeepSeek-V4 均按实际存储层数计算 HOT 页容量；`flashmla_kv` 要求 FP8 KV 存储，BF16 使用受支持的其他稀疏 backend。
 

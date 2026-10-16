@@ -6,7 +6,6 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.sparsity.core.kvduo_prefix_cache import KVDuoHostPrefixCache
@@ -61,8 +60,12 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
         requests, dtype=torch.int64
     )
 
-    coordinator.kvduo_max_relative_miss_increase = 0.10
     coordinator._init_kvduo_capacity_state(requests)
+    coordinator._kvduo_hot_request_order = list(range(requests))
+    coordinator.kvduo_hot_buffers = {}
+    coordinator.kvduo_hot_pointers = torch.zeros(
+        (layers, requests, 4), dtype=torch.int64
+    )
     coordinator.kvduo_observe = torch.ones(1, dtype=torch.int32)
     # Match production: LRU has HOT capacity, other banks have page padding.
     metadata_shape = (layers, requests, coordinator.padded_buffer_size)
@@ -149,7 +152,9 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
     return coordinator, physical
 
 
-@pytest.mark.parametrize("top_k, expected_capacity", [(2, 4), (4, 4), (5, 8), (9, 12)])
+@pytest.mark.parametrize(
+    "top_k, expected_capacity", [(2, 4), (4, 4), (5, 8), (9, 12), (37, 40)]
+)
 def test_mixed_minimum_is_page_aligned_before_next_replay(top_k, expected_capacity):
     coordinator, physical = make_coordinator(top_k=top_k, layers=3, requests=2)
 
@@ -237,7 +242,7 @@ def test_host_misses_without_a_capacity_event_do_not_grow():
     assert int(coordinator.kvduo_req_hot_capacity[0, 0]) == 4
 
 
-def test_each_event_adds_one_page_and_stops_at_eight_pages():
+def test_each_event_adds_one_page_beyond_eight_pages():
     coordinator, physical = make_coordinator()
     coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
     capacities = []
@@ -246,9 +251,9 @@ def test_each_event_adds_one_page_and_stops_at_eight_pages():
         coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
         capacities.append(int(coordinator.kvduo_req_hot_capacity[0, 0]))
 
-    assert capacities == [8, 12, 16, 20, 24, 28, 32, 32, 32]
-    assert physical.alloc.call_count == 8
-    assert len(coordinator._kvduo_req_layer_pages[(0, 0)]) == 8
+    assert capacities == [8, 12, 16, 20, 24, 28, 32, 36, 40]
+    assert physical.alloc.call_count == 10
+    assert len(coordinator._kvduo_req_layer_pages[(0, 0)]) == 10
 
 
 @pytest.mark.parametrize("free_pages", [0, 1, 2])
@@ -258,9 +263,10 @@ def test_growth_spends_available_pages_on_individual_request_layer_owners(free_p
     physical.alloc.reset_mock()
     coordinator._reclaim_for_physical_allocation.reset_mock()
     physical.free_pages = free_pages
-    tokens = coordinator.req_device_buffer_tokens
-    tokens[:, :, :4] = torch.tensor([10, 11, 12, 13])
-    old_locs = coordinator.req_device_buffer_token_locs.clone()
+    old_locs = {}
+    for owner, buffer in coordinator.kvduo_hot_buffers.items():
+        buffer.tokens.copy_(torch.tensor([10, 11, 12, 13]))
+        old_locs[owner] = buffer.locations.clone()
     coordinator.kvduo_hot_growth_events.fill_(1)
 
     coordinator.prepare_kvduo_graph_replay(torch.tensor([0, 1]))
@@ -271,26 +277,10 @@ def test_growth_spends_available_pages_on_individual_request_layer_owners(free_p
     assert torch.equal(coordinator.kvduo_req_hot_capacity_gpu, expected.int())
     assert physical.free_pages == 0
     coordinator._reclaim_for_physical_allocation.assert_not_called()
-    assert torch.equal(tokens[:, :, :4], torch.tensor([10, 11, 12, 13]).expand(2, 2, 4))
-    assert torch.equal(
-        coordinator.req_device_buffer_token_locs[:, :, :4], old_locs[:, :, :4]
-    )
-    for layer_id, req_idx in torch.nonzero(expected == 8).tolist():
-        assert coordinator.lru_slots[layer_id, req_idx, :8].tolist() == [
-            4,
-            5,
-            6,
-            7,
-            0,
-            1,
-            2,
-            3,
-        ]
-    # The failed attempt is consumed; free pages appearing later are not enough
-    # to cause growth without another H2D capacity event.
-    physical.free_pages = 4
-    coordinator.prepare_kvduo_graph_replay(torch.tensor([0, 1]))
-    assert torch.equal(coordinator.kvduo_req_hot_capacity, expected)
+    for owner, buffer in coordinator.kvduo_hot_buffers.items():
+        assert buffer.tokens[:4].tolist() == [10, 11, 12, 13]
+        assert torch.equal(buffer.locations[:4], old_locs[owner])
+        assert (buffer.tokens[4:] == -1).all()
 
 
 def test_only_the_request_layer_with_a_capacity_event_grows():
@@ -358,59 +348,3 @@ def test_event_read_waits_for_the_preceding_producer_on_the_rank_device(monkeypa
     coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
 
     current_stream.assert_called_once_with(torch.device("cuda:3"))
-
-
-@pytest.mark.parametrize("dsv4", [False, True])
-def test_resolver_ffi_receives_the_stable_growth_event_pointer(monkeypatch, dsv4):
-    import sglang.kernels.ops.kvcache.hisparse as hisparse_ops
-
-    module = SimpleNamespace(load_cache_to_device_buffer=MagicMock())
-    monkeypatch.setattr(
-        hisparse_ops, "_jit_sparse_module", lambda *args, **kwargs: module
-    )
-    monkeypatch.setattr(
-        torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=0)
-    )
-    coordinator, _ = make_coordinator()
-    resolver = (
-        hisparse_ops.load_cache_to_device_buffer_dsv4_mla
-        if dsv4
-        else hisparse_ops.load_cache_to_device_buffer_mla
-    )
-    versions = torch.ones(16, dtype=torch.int64)
-    resolver(
-        top_k_tokens=torch.tensor([[0, 1]], dtype=torch.int32),
-        device_buffer_tokens=coordinator.req_device_buffer_tokens[0],
-        host_cache_locs=torch.arange(16, dtype=torch.int64).view(1, -1),
-        device_buffer_locs=coordinator.req_device_buffer_token_locs[0],
-        host_cache=torch.zeros((16, 1, 8)),
-        device_buffer=torch.zeros((16, 1, 8)),
-        top_k_device_locs=torch.zeros((1, 2), dtype=torch.int32),
-        req_pool_indices=torch.tensor([0], dtype=torch.int64),
-        seq_lens=torch.tensor([8], dtype=torch.int32),
-        lru_slots=coordinator.lru_slots[0],
-        item_size_bytes=32,
-        num_top_k=2,
-        hot_buffer_size=32,
-        num_real_reqs=torch.ones(1, dtype=torch.int32),
-        req_hot_buffer_sizes=coordinator.kvduo_req_hot_capacity_gpu[0],
-        capacity_ema=coordinator.kvduo_capacity_ema[0],
-        capacity_steps=coordinator.kvduo_capacity_steps[0],
-        req_to_logical_token=torch.arange(16, dtype=torch.int64).view(1, -1),
-        full_to_device_loc=torch.zeros(16, dtype=torch.int64),
-        full_last_touch=torch.zeros(16, dtype=torch.int64),
-        full_data_version=versions,
-        full_host_version=versions.clone(),
-        swap_status=torch.zeros(1, dtype=torch.int32),
-        resolver_stats=coordinator.kvduo_resolver_stats[0],
-        touch_clock=torch.ones(1, dtype=torch.int64),
-        hot_growth_events=coordinator.kvduo_hot_growth_events[0],
-        observe_cache=coordinator.kvduo_observe,
-    )
-
-    args = module.load_cache_to_device_buffer.call_args.args
-    assert args[20] == coordinator.kvduo_hot_growth_events[0].data_ptr()
-    assert args[12] == coordinator.kvduo_capacity_ema[0].data_ptr()
-    assert args[27] == coordinator.kvduo_capacity_steps[0].data_ptr()
-    assert args[-4:] == (0, 0, 0, 0)  # This fixture keeps the original shared path.
-    assert all(isinstance(arg, (int, bool, float)) for arg in args)

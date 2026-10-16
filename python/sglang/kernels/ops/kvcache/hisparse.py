@@ -178,8 +178,6 @@ def _load_cache_to_device_buffer_mla(
     block_size: int,
     num_real_reqs: torch.Tensor | None,
     req_hot_buffer_sizes: torch.Tensor | None = None,
-    capacity_ema: torch.Tensor | None = None,
-    capacity_steps: torch.Tensor | None = None,
     req_to_logical_token: torch.Tensor | None = None,
     full_to_device_loc: torch.Tensor | None = None,
     full_last_touch: torch.Tensor | None = None,
@@ -198,9 +196,9 @@ def _load_cache_to_device_buffer_mla(
 ) -> None:
     if full_page_size < 1:
         raise ValueError("FULL physical page size must be positive")
-    assert (
-        hot_buffer_size >= num_top_k
-    ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    assert hot_buffer_size >= num_top_k, (
+        f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    )
     assert lru_slots.dtype == (
         torch.int32 if hot_buffer_size > torch.iinfo(torch.int16).max else torch.int16
     ), "LRU slot dtype must match the compiled HOT capacity"
@@ -287,16 +285,6 @@ def _load_cache_to_device_buffer_mla(
         assert hot_growth_events.ndim == 1 and hot_growth_events.is_contiguous()
         assert hot_growth_events.numel() == device_buffer_tokens.size(0)
         assert hot_growth_events.device == top_k_tokens.device
-    if capacity_ema is not None or capacity_steps is not None:
-        assert capacity_ema is not None and capacity_steps is not None
-        assert enable_full_lookup and enable_dynamic_hot_view
-        assert (
-            capacity_ema.dtype == torch.float32 and capacity_steps.dtype == torch.int64
-        )
-        assert capacity_ema.shape == (device_buffer_tokens.size(0), 9)
-        assert capacity_steps.shape == (device_buffer_tokens.size(0),)
-        for tensor in (capacity_ema, capacity_steps):
-            assert tensor.is_contiguous() and tensor.device == top_k_tokens.device
     if observe_cache is not None:
         assert observe_cache.dtype == torch.int32 and observe_cache.numel() == 1
         assert (
@@ -316,7 +304,6 @@ def _load_cache_to_device_buffer_mla(
         lru_slots.data_ptr(),
         num_real_reqs.data_ptr(),
         req_hot_buffer_sizes.data_ptr() if enable_dynamic_hot_view else 0,
-        capacity_ema.data_ptr() if capacity_ema is not None else 0,
         req_to_logical_token.data_ptr() if enable_full_lookup else 0,
         full_to_device_loc.data_ptr() if enable_full_lookup else 0,
         full_last_touch.data_ptr() if enable_full_lookup else 0,
@@ -331,7 +318,6 @@ def _load_cache_to_device_buffer_mla(
         host_cache_locs.size(1),
         device_buffer_tokens.stride(0),
         lru_slots.stride(0),
-        capacity_steps.data_ptr() if capacity_steps is not None else 0,
         top_k_tokens.stride(0),
         top_k_device_locs.stride(0),
         req_to_logical_token.stride(0) if enable_full_lookup else 0,
@@ -369,8 +355,6 @@ def load_cache_to_device_buffer_mla(
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
     req_hot_buffer_sizes: torch.Tensor | None = None,
-    capacity_ema: torch.Tensor | None = None,
-    capacity_steps: torch.Tensor | None = None,
     req_to_logical_token: torch.Tensor | None = None,
     full_to_device_loc: torch.Tensor | None = None,
     full_last_touch: torch.Tensor | None = None,
@@ -407,8 +391,6 @@ def load_cache_to_device_buffer_mla(
         block_size=block_size,
         num_real_reqs=num_real_reqs,
         req_hot_buffer_sizes=req_hot_buffer_sizes,
-        capacity_ema=capacity_ema,
-        capacity_steps=capacity_steps,
         req_to_logical_token=req_to_logical_token,
         full_to_device_loc=full_to_device_loc,
         full_last_touch=full_last_touch,
@@ -445,8 +427,6 @@ def load_cache_to_device_buffer_dsv4_mla(
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
     req_hot_buffer_sizes: torch.Tensor | None = None,
-    capacity_ema: torch.Tensor | None = None,
-    capacity_steps: torch.Tensor | None = None,
     req_to_logical_token: torch.Tensor | None = None,
     full_to_device_loc: torch.Tensor | None = None,
     full_last_touch: torch.Tensor | None = None,
@@ -483,8 +463,6 @@ def load_cache_to_device_buffer_dsv4_mla(
         block_size=block_size,
         num_real_reqs=num_real_reqs,
         req_hot_buffer_sizes=req_hot_buffer_sizes,
-        capacity_ema=capacity_ema,
-        capacity_steps=capacity_steps,
         req_to_logical_token=req_to_logical_token,
         full_to_device_loc=full_to_device_loc,
         full_last_touch=full_last_touch,
@@ -501,66 +479,3 @@ def load_cache_to_device_buffer_dsv4_mla(
         validate_status=validate_status,
         full_page_size=full_page_size,
     )
-
-
-@functools.cache
-def _jit_kvduo_merge_module(capacity: int, block_size: int):
-    args = make_cpp_args(capacity, block_size)
-    return load_jit(
-        "kvduo_hot_merge",
-        capacity,
-        block_size,
-        cuda_files=["kvduo_hot_merge.cuh"],
-        cuda_wrappers=[
-            ("plan", f"kvduo_hot_merge_plan<{args}>"),
-            ("execute_linear", f"kvduo_hot_merge_execute<{args}, false>"),
-            ("execute_c4", f"kvduo_hot_merge_execute<{args}, true>"),
-        ],
-    )
-
-
-def build_kvduo_hot_merge_plan(
-    tokens: torch.Tensor,
-    locations: torch.Tensor,
-    lru: torch.Tensor,
-    capacity: int,
-    k: int,
-    target_pages: int,
-) -> tuple[torch.Tensor, ...]:
-    assert tokens.is_cuda
-    assert tokens.ndim == locations.ndim == lru.ndim == 1
-    assert tokens.shape == locations.shape and tokens.numel() >= lru.numel()
-    assert tokens.dtype == locations.dtype == torch.int32
-    assert lru.dtype == (
-        torch.int32 if lru.numel() > torch.iinfo(torch.int16).max else torch.int16
-    )
-    for tensor in (tokens, locations, lru):
-        assert tensor.device == tokens.device and tensor.is_contiguous()
-    hash_size = 1 << (2 * capacity - 1).bit_length()
-    workspace = torch.empty(
-        4 * capacity + hash_size, dtype=torch.int32, device=tokens.device
-    )
-    summary = torch.empty(3, dtype=torch.int32, device=tokens.device)
-    new_tokens = torch.empty_like(tokens)
-    new_locations = torch.empty_like(locations)
-    new_lru = torch.empty_like(lru)
-    sources = torch.empty(capacity, dtype=torch.int64, device=tokens.device)
-    destinations = torch.empty_like(sources)
-    _jit_kvduo_merge_module(lru.numel(), 256).plan(
-        tokens,
-        locations,
-        lru,
-        new_tokens,
-        new_locations,
-        new_lru,
-        sources,
-        destinations,
-        workspace,
-        summary,
-        capacity,
-        k,
-        target_pages,
-        hash_size,
-        torch.iinfo(torch.int32).max,
-    )
-    return summary, new_tokens, new_locations, new_lru, sources, destinations

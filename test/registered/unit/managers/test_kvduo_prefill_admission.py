@@ -5,7 +5,6 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -25,7 +24,9 @@ def ready_coordinator(extra=3, requests=1):
     coordinator, physical = make_merge_coordinator(
         {(0, 0): 8, **{(0, req): 1 for req in range(1, requests)}}
     )
-    coordinator.kvduo_capacity_ema[0, 0, :4] = 100
+    coordinator.kvduo_hot_buffers[0, 0].frequency.copy_(
+        torch.tensor([-1, 0], dtype=torch.int32)
+    )
     coordinator._merge_kvduo_hot_pages(0, 0)
     coordinator._ensure_kvduo_hot_capacity_targets_batch({(0, 0): (4 + extra) * 4})
     physical.free_pages = 0
@@ -354,8 +355,6 @@ def test_physical_shortage_waits_without_reclaiming_hot_or_active_full(path, dsv
         c.req_device_buffer_token_locs,
         c.lru_slots,
         c.kvduo_req_hot_capacity,
-        c.kvduo_capacity_ema,
-        c.kvduo_capacity_steps,
     )
     before = [bank.clone() for bank in banks]
     if path == "new":

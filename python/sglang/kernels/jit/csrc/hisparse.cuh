@@ -1,5 +1,4 @@
 #include <sgl_kernel/hisparse_resolver_layout.h>
-#include <sgl_kernel/kvduo_cache_observation.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -216,7 +215,6 @@ __global__ void load_cache_to_device_buffer_kernel(
     typename SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::SlotT* __restrict__ lru_slots,
     const int32_t* __restrict__ num_real_reqs,
     const int32_t* __restrict__ req_hot_buffer_sizes,
-    float* __restrict__ capacity_ema,
     const int64_t* __restrict__ req_to_logical_token,
     const int64_t* __restrict__ full_to_device_loc,
     int64_t* __restrict__ full_last_touch,
@@ -233,7 +231,6 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t buffer_stride_0,
     int64_t host_stride,
     int64_t lru_slot_stride_0,
-    int64_t* __restrict__ capacity_steps,
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t page_size,
@@ -292,8 +289,6 @@ __global__ void load_cache_to_device_buffer_kernel(
   __shared__ int needs_hot_resolver;
   __shared__ int full_resident_accesses;
   __shared__ int needs_hot_growth;
-  __shared__ int segment_hot_hits[8];
-  if (tid < 8) segment_hot_hits[tid] = 0;
   if (tid == 0) {
     needs_hot_resolver = 0;
     full_resident_accesses = 0;
@@ -461,21 +456,10 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
 
   // Mixed objects can also skip the entire HOT scan and LRU writeback when
-  // this selection is fully resident. Valid zero HOT counts still update EMA.
+  // this selection is fully resident.
   if (enable_full_lookup && needs_hot_resolver == 0) {
     if (tid == 0) {
       atomicAdd(&resolver_stats[rid * resolver_stats_stride + 1], full_resident_accesses);
-      if (observe && swap_status[rid] == 0) {
-        if (capacity_ema != nullptr) {
-          sglang::kvduo_update_capacity_ema(
-              segment_hot_hits,
-              0,
-              full_resident_accesses,
-              hot_buffer_size / page_size,
-              capacity_ema + rid * 9,
-              capacity_steps[rid]);
-        }
-      }
     }
     return;
   }
@@ -532,10 +516,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     if (is_hit) {
       s_top_k_tokens[my_found_top_k_idx] = TOKEN_HIT;
       req_top_k_device_locs[my_found_top_k_idx] = req_device_buffer_locs[buf_slot];
-      if (capacity_ema != nullptr && observe) {
-        const int segment = sglang::kvduo_lru_segment(hot_buffer_size, slot_idx, page_size);
-        atomicAdd(&segment_hot_hits[segment], 1);
-      }
+
     }
 
     int local_hit_offset = 0;
@@ -645,7 +626,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       // Replacing any occupied slot emits exactly one event for this request
       // and logical layer, regardless of the number of missed entries.
       if (hot_buffer_size < HOT_BUFFER_SIZE &&
-          sglang::kvduo_can_record_growth(enable_full_lookup, observe, hot_growth_events, swap_status, rid) &&
+          (enable_full_lookup && observe && hot_growth_events != nullptr && swap_status != nullptr && swap_status[rid] == 0) &&
           req_device_buffer_tokens[evict_slot] >= 0) {
         atomicExch(&needs_hot_growth, 1);
       }
@@ -668,16 +649,6 @@ __global__ void load_cache_to_device_buffer_kernel(
           &resolver_stats[rid * resolver_stats_stride + 1], total_misses + s_total_hits + s_full_hits + s_newest_hit);
       if (hot_growth_events != nullptr && needs_hot_growth) {
         atomicExch(&hot_growth_events[rid], 1);
-      }
-      const int accesses = total_misses + s_total_hits + s_full_hits + s_newest_hit;
-      if (capacity_ema != nullptr && observe && swap_status[rid] == 0) {
-        sglang::kvduo_update_capacity_ema(
-            segment_hot_hits,
-            total_misses,
-            accesses,
-            hot_buffer_size / page_size,
-            capacity_ema + rid * 9,
-            capacity_steps[rid]);
       }
     }
   }
@@ -788,7 +759,6 @@ void load_cache_to_device_buffer(
     uint64_t lru_slots_ptr,
     uint64_t num_real_reqs_ptr,
     uint64_t req_hot_buffer_sizes_ptr,
-    uint64_t capacity_ema_ptr,
     uint64_t req_to_logical_token_ptr,
     uint64_t full_to_device_loc_ptr,
     uint64_t full_last_touch_ptr,
@@ -803,7 +773,6 @@ void load_cache_to_device_buffer(
     int64_t host_stride,
     int64_t buffer_stride_0,
     int64_t lru_slot_stride_0,
-    uint64_t capacity_steps_ptr,
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t req_to_logical_stride,
@@ -878,7 +847,6 @@ void load_cache_to_device_buffer(
         reinterpret_cast<SlotT*>(static_cast<uintptr_t>(lru_slots_ptr)),
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(num_real_reqs_ptr)),
         reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(req_hot_buffer_sizes_ptr)),
-        reinterpret_cast<float*>(static_cast<uintptr_t>(capacity_ema_ptr)),
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(req_to_logical_token_ptr)),
         reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(full_to_device_loc_ptr)),
         reinterpret_cast<int64_t*>(static_cast<uintptr_t>(full_last_touch_ptr)),
@@ -895,7 +863,6 @@ void load_cache_to_device_buffer(
         buffer_stride_0,
         host_stride,
         lru_slot_stride_0,
-        reinterpret_cast<int64_t*>(static_cast<uintptr_t>(capacity_steps_ptr)),
         top_k_tokens_stride,
         top_k_device_locs_stride,
         page_size,

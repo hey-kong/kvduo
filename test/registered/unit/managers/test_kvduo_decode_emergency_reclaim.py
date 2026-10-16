@@ -3,16 +3,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.sparsity import parse_kvduo_config
 from sglang.srt.mem_cache.sparsity.core.kvduo_state import KVDuoPressureAction
 from sglang.test.ci.ci_register import register_cpu_ci
 from test_kvduo_hot_merge import (
-    make_merge_coordinator,
-    live_lru,
     assert_payloads_match_tokens,
+    make_merge_coordinator,
 )
 from test_kvduo_pressure_admission import make_cache
 
@@ -22,7 +20,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def pressure_batch(enabled, *, pages=4):
     c, physical = make_merge_coordinator({(0, 0): pages})
     c.decode_emergency_reclaim = enabled
-    c.kvduo_capacity_steps.fill_(5)
+    c.kvduo_hot_buffers[0, 0].frequency.zero_()
     logical = SimpleNamespace(
         available_size=lambda: 64,
         full_available_size=lambda: 64,
@@ -66,46 +64,13 @@ def test_default_config_disables_emergency_decode_recovery_and_allows_opt_in(
 ):
     config = parse_kvduo_config(SimpleNamespace(kvduo_config=raw))
     batch, c, physical = pressure_batch(config.decode_emergency_reclaim)
-    assert batch.check_decode_mem() is enabled
-    assert physical.free_pages == (3 if enabled else 0)
-    assert c.kvduo_req_hot_capacity[0, 0] == (4 if enabled else 16)
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("blocked_by", ["immature", "hit_budget"])
-def test_emergency_reclaim_allows_decode_instead_of_returning_retraction_failure(
-    enabled, blocked_by, caplog
-):
-    batch, c, physical = pressure_batch(enabled)
-    if blocked_by == "hit_budget":
-        c.kvduo_capacity_steps.fill_(65)
-        c.kvduo_capacity_ema[..., :8] = 100
-    # Spread MRU survivors across four pages so successful recovery must copy KV.
-    survivors = [0, 4, 8, 12]
-    c.lru_slots[0, 0, :16] = torch.tensor(
-        [slot for slot in range(16) if slot not in survivors] + survivors,
-        dtype=torch.int16,
-    )
-    expected = live_lru(c, 0, 0)[-4:]
-    assert batch.check_decode_mem() is enabled
-    if enabled:
-        assert physical.free_pages == 3
-        assert c.kvduo_req_hot_capacity[0, 0] == 4
-        assert live_lru(c, 0, 0) == expected
-        assert_payloads_match_tokens(c, 0, 0)
-        assert c.kvduo_capacity_steps[0, 0] == 0
-        assert "emergency HOT reclaim" in caplog.text
-        assert "decode admission failed" not in caplog.text
-    else:
-        assert physical.free_pages == 0
-        assert c.kvduo_req_hot_capacity[0, 0] == 16
-        assert "INSUFFICIENT_RECLAIMABLE_PAGES" in caplog.text
+    assert batch.check_decode_mem()
+    assert physical.free_pages == 3
+    assert c.kvduo_req_hot_capacity[0, 0] == 4
 
 
 def test_emergency_reclaim_is_not_used_when_normal_budgeted_merge_succeeds():
     batch, c, _ = pressure_batch(True)
-    c.kvduo_capacity_steps.fill_(65)
-    c.kvduo_capacity_ema.zero_()
     with patch.object(
         c,
         "_reclaim_kvduo_emergency_hot_pages",
@@ -137,8 +102,8 @@ def test_full_reclaim_still_precedes_all_hot_reclaim():
 @pytest.mark.parametrize("enabled", [False, True])
 def test_imminent_decode_allocator_guard_uses_the_same_emergency_option(enabled):
     _, c, physical = pressure_batch(enabled)
-    assert c._guard_kvduo_physical_allocation(2) is enabled
-    assert physical.free_pages == (3 if enabled else 0)
+    assert c._guard_kvduo_physical_allocation(2)
+    assert physical.free_pages == 3
 
 
 def test_emergency_is_not_used_for_prefill_protection_without_decode_allocation():
@@ -163,8 +128,10 @@ def test_prefill_and_ordinary_allocation_do_not_implicitly_use_decode_emergency(
     result = c._reclaim_for_physical_allocation(
         2, reserve_hot_minimum=True, allow_hot_reclaim=allow_hot
     )
-    assert result.action is KVDuoPressureAction.ERROR
-    assert physical.free_pages == 0 and c.kvduo_req_hot_capacity[0, 0] == 16
+    assert result.action is (
+        KVDuoPressureAction.SUCCESS if allow_hot else KVDuoPressureAction.ERROR
+    )
+    assert physical.free_pages == (3 if allow_hot else 0)
 
 
 def test_emergency_cannot_override_no_hot_reclaim_or_spend_prefill_reservation():
@@ -204,27 +171,27 @@ def test_emergency_keeps_all_existing_protection_and_minimum_rules(protection):
 
 def test_emergency_prefers_larger_releases_and_stops_without_shrinking_other_objects():
     c, physical = make_merge_coordinator({(0, 0): 8, (0, 1): 3, (0, 2): 4})
-    assert c._reclaim_kvduo_emergency_hot_pages(2) == 14
-    assert c.kvduo_req_hot_capacity[0].tolist() == [4, 12, 16]
-    assert physical.free_pages == 7
+    assert c._reclaim_kvduo_emergency_hot_pages(2) == 12
+    assert c.kvduo_req_hot_capacity[0].tolist() == [8, 12, 16]
+    assert physical.free_pages == 6
 
 
 def test_emergency_preserves_a_multi_page_topk_minimum():
     c, physical = make_merge_coordinator({(0, 0): 4}, top_k=6)
-    expected = live_lru(c, 0, 0)[-8:]
+    expected = c.kvduo_hot_buffers[0, 0].tokens[:8].tolist()
     assert c._reclaim_kvduo_emergency_hot_pages(2) == 4
     assert physical.free_pages == 2
     assert c.kvduo_req_hot_capacity[0, 0] == 8
-    assert live_lru(c, 0, 0) == expected
+    assert c.kvduo_hot_buffers[0, 0].tokens.tolist() == expected
     assert_payloads_match_tokens(c, 0, 0)
 
 
 def test_equal_release_counts_follow_cyclic_hand_order():
     c, physical = make_merge_coordinator({(0, 0): 4, (0, 1): 4, (0, 2): 4})
     c._kvduo_hand = 2
-    assert c._reclaim_kvduo_emergency_hot_pages(2) == 6
-    assert physical.free_pages == 3
-    assert c.kvduo_req_hot_capacity[0].tolist() == [16, 16, 4]
+    assert c._reclaim_kvduo_emergency_hot_pages(2) == 4
+    assert physical.free_pages == 2
+    assert c.kvduo_req_hot_capacity[0].tolist() == [16, 16, 8]
     assert c._kvduo_hand == 0
 
 

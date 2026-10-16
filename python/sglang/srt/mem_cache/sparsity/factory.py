@@ -4,7 +4,6 @@ import math
 from typing import Optional
 
 import torch
-
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.deepseek_dsa import DeepSeekDSAAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import QuestAlgorithm
@@ -147,7 +146,6 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         "logical_capacity_tokens",
         "swap_in_block_size",
         "tail_protected_pages",
-        "max_relative_miss_increase",
         "full_reclaim_policy",
         "decode_emergency_reclaim",
     }
@@ -190,11 +188,6 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
             f"swap_in_block_size ({block_size}) must be in the range [1, 1024]"
         )
 
-    from sglang.srt.mem_cache.sparsity.core.kvduo_hot_merge import (
-        KVDuoCapacityPolicy,
-    )
-
-    policy = KVDuoCapacityPolicy(values.get("max_relative_miss_increase", 0.10))
     full_reclaim_policy = values.get("full_reclaim_policy", "request")
     if not isinstance(full_reclaim_policy, str) or full_reclaim_policy not in (
         "request",
@@ -211,7 +204,6 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         logical_capacity_tokens=logical_tokens,
         swap_in_block_size=block_size,
         tail_protected_pages=tail_pages,
-        max_relative_miss_increase=policy.max_relative_miss_increase,
         full_reclaim_policy=full_reclaim_policy,
         decode_emergency_reclaim=decode_emergency_reclaim,
     )

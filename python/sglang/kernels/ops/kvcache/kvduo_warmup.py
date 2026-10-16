@@ -10,33 +10,24 @@ from sglang.kernels.ops.kvcache.kvduo_full_reclaim import (
     select_kvduo_full_requests,
     summarize_kvduo_full_pages,
 )
-from sglang.kernels.ops.kvcache.kvduo_hand_plan import (
-    allocate_kvduo_hand_workspace,
-    prepare_kvduo_hand,
-)
-from sglang.kernels.ops.kvcache.kvduo_hot_growth import publish_kvduo_hot_growth
-from sglang.kernels.ops.kvcache.kvduo_hot_merge import (
-    allocate_kvduo_merge_workspace,
-    execute_kvduo_hot_merge,
-    finish_kvduo_hot_merge,
-)
 
 logger = logging.getLogger(__name__)
 
 
 @torch.inference_mode()
-def warmup_kvduo_reclaim(*, backing, page_size, storage_layers, maximum, padded, paged):
+def warmup_kvduo_reclaim(
+    *, backing, page_size, storage_layers, top_k, paged, block_size=256
+):
     """Compile, load and execute reclamation before the worker becomes ready.
 
-    `backing` supplies only device/dtype/layout; no real payload, metadata or
-    allocator is mutated. Use the production maximum for merge specialization.
+    `backing` supplies only layout; real payload and allocator stay untouched.
     """
     if backing.device.type != "cuda":
         return
     started = time.perf_counter()
     logger.info("KVDuo reclamation kernel warmup started")
     with torch.cuda.device(backing.device):
-        _warmup(backing, page_size, storage_layers, maximum, padded, paged)
+        _warmup(backing, page_size, storage_layers, top_k, paged, block_size)
         torch.cuda.current_stream(backing.device).synchronize()
     logger.info(
         "KVDuo reclamation kernel warmup completed in %.2f s",
@@ -44,11 +35,9 @@ def warmup_kvduo_reclaim(*, backing, page_size, storage_layers, maximum, padded,
     )
 
 
-def _warmup(backing, page_size, storage_layers, maximum, padded, paged):
+def _warmup(backing, page_size, storage_layers, top_k, paged, block_size=256):
     device = backing.device
     k = page_size * storage_layers
-    if maximum != 8 * k or padded < maximum or k < 2 or (paged and page_size != 64):
-        raise ValueError("Invalid KVDuo warmup geometry")
     # Both FULL index types are supported by runtime callers. Exercise both
     # policies, including a nonzero mandatory HOT charge and protected page.
     indices = torch.arange(4 * page_size, dtype=torch.int64, device=device)
@@ -64,76 +53,87 @@ def _warmup(backing, page_size, storage_layers, maximum, padded, paged):
         if not select_kvduo_full_requests(valid, [0, 0, 1, 1], [0, 1], [0, 1], 1):
             raise RuntimeError("KVDuo FULL request warmup failed")
 
-    counts = torch.zeros((1, 2, 9), dtype=torch.float32, device=device)
-    steps = torch.full((1, 2), 65, dtype=torch.int64, device=device)
-    counts[:, :, 8] = 1
-    hand = allocate_kvduo_hand_workspace(counts)
-    hand.pages_host.fill_(2)
-    snapshot = prepare_kvduo_hand(counts, steps, hand, hand=0, minimum=1, rho=0.1)
-    if not snapshot.next(0, 1):
-        raise RuntimeError("KVDuo Hand warmup failed")
-
-    tokens = torch.full((padded,), -1, dtype=torch.int32, device=device)
-    locations = torch.full_like(tokens, -1)
-    slot_dtype = torch.int32 if maximum > 32767 else torch.int16
-    lru = torch.full((maximum,), -1, dtype=slot_dtype, device=device)
-    capacity = torch.zeros(1, dtype=torch.int32, device=device)
-    ema = torch.zeros(9, dtype=torch.float32, device=device)
-    observations = torch.zeros(1, dtype=torch.int64, device=device)
-    events = torch.ones(1, dtype=torch.int32, device=device)
-    # Three physical pages per storage layer: sentinel plus two HOT pages.
-    stride = 3 * page_size
-    for current in (0, k):
-        publish_kvduo_hot_growth(
-            torch.tensor(
-                [page_size * (current // k + 1)], dtype=torch.int64, device=device
-            ),
-            tokens,
-            locations,
-            lru,
-            lru.clone(),
-            capacity,
-            ema,
-            observations,
-            current=current,
-            target=current + k,
-            page_size=page_size,
-            storage_layers=storage_layers,
-            layer_stride=stride,
-        )
-    tokens[: 2 * k] = torch.arange(2 * k, dtype=torch.int32, device=device)
-    # Interleaving LRU retains entries on BOTH pages, forcing a real copy when
-    # one page is released instead of merely publishing a smaller capacity.
-    lru[: 2 * k] = (
-        torch.arange(2 * k, device=device).view(2, k).T.flatten().to(slot_dtype)
+    from sglang.kernels.ops.kvcache.kvduo_frequency import launch_resolve, merge
+    from sglang.srt.mem_cache.sparsity.core.kvduo_frequency import (
+        FrequencyBuffer,
+        pack_frequency,
     )
-    # C4 uses packed 64-token pages; generic DSA addresses individual rows.
-    rows = 3 * storage_layers if paged else stride * storage_layers
-    payload = torch.empty(
+
+    minimum = (top_k + k - 1) // k
+    capacity = (minimum + 1) * k
+    rows = (
+        (capacity + page_size + page_size - 1) // page_size
+        if paged
+        else capacity + page_size
+    )
+    payload = torch.zeros(
         (rows, *backing.shape[1:]), dtype=backing.dtype, device=device
     )
-    payload.copy_(
-        torch.arange(rows, device=device)
-        .remainder(251)
-        .view(rows, *([1] * (backing.ndim - 1)))
+    host_rows = (top_k + page_size - 1) // page_size if paged else top_k
+    host_payload = torch.ones(
+        (host_rows, *backing.shape[1:]), dtype=backing.dtype, pin_memory=True
     )
-    workspace = allocate_kvduo_merge_workspace(tokens, lru)
-    execute_kvduo_hot_merge(
-        tokens,
-        locations,
-        lru,
+    buffer = FrequencyBuffer.empty(
+        torch.arange(page_size, page_size + capacity, dtype=torch.int32, device=device)
+    )
+    pointers = torch.tensor([buffer.pointers()], dtype=torch.int64, device=device)
+    positions = torch.arange(top_k, dtype=torch.int64, device=device)
+    status = torch.zeros(1, dtype=torch.int32, device=device)
+    output = torch.empty((1, top_k), dtype=torch.int32, device=device)
+    stats = torch.zeros((1, 2), dtype=torch.int32, device=device)
+    i32 = lambda value: torch.tensor([value], dtype=torch.int32, device=device)
+    i64 = lambda value: torch.tensor([value], dtype=torch.int64, device=device)
+    published_capacity, growth = i32(capacity), i32(0)
+    launch_resolve(
+        top_k,
+        paged,
+        positions.int().view(1, -1),
+        i64(0),
+        i64(top_k),
+        pointers,
+        published_capacity,
+        i32(1),
+        positions.view(1, -1),
+        torch.zeros_like(positions),
+        torch.zeros_like(positions),
+        torch.ones_like(positions),
+        torch.ones_like(positions),
+        positions.view(1, -1),
+        host_payload,
         payload,
-        workspace,
-        capacity=2 * k,
-        k=k,
-        top_k=1,
-        target_pages=1,
-        paged=paged,
-        published_capacity=capacity,
-        capacity_ema=ema,
-        capacity_steps=observations,
-        growth_events=events,
+        backing[0].numel() * backing.element_size(),
+        0,
+        i64(1),
+        i32(1),
+        output,
+        status,
+        stats,
+        growth,
+        torch.empty((1, 9 * top_k), dtype=torch.int32, device=device),
+        block_size=block_size,
     )
-    kept, released = finish_kvduo_hot_merge(workspace, 2, 1, k)
-    if len(kept) != 1 or len(released) != 1 or int(workspace.summary_host[1]) <= 0:
-        raise RuntimeError("KVDuo merge warmup did not exercise payload movement")
+    if status.item() or stats[0, 0].item() != top_k:
+        raise RuntimeError("KVDuo frequency resolver warmup failed")
+    # Force survivors on both kept and released pages so merge warms copying.
+    buffer.tokens.copy_(torch.arange(capacity, dtype=torch.int32, device=device))
+    freq = [0] * capacity
+    survivors = [page * k for page in range(minimum + int(k > 1))]
+    for slot in survivors:
+        freq[slot] = 3
+    buffer.frequency.copy_(pack_frequency(freq, device=device))
+    merged, kept = merge(
+        buffer,
+        payload,
+        k=k,
+        minimum=minimum,
+        paged=paged,
+        top_k=top_k,
+        item_bytes=backing[0].numel() * backing.element_size(),
+        publication=(pointers[0], published_capacity, growth),
+    )
+    if (
+        int(published_capacity.item()) != minimum * k
+        or merged.tokens.numel() != minimum * k
+        or sorted(merged.tokens[merged.tokens >= 0].tolist()) != survivors
+    ):
+        raise RuntimeError("KVDuo frequency merge warmup failed")

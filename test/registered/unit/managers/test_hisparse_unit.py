@@ -14,7 +14,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import torch
-
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -504,93 +503,16 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
 
     def test_hot_growth_shrink_and_reuse_preserve_other_layer_metadata(self):
-        """HOT pages return to the physical allocator and can be acquired again."""
-        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from test_kvduo_hot_merge import make_merge_coordinator
 
-        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
-        coordinator.enable_mixed_residency = True
-        coordinator.decode_producer_stream = None
-        coordinator.device = "cpu"
-        coordinator.page_size = 4
-        coordinator.hot_storage_layers = 1
-        coordinator.hot_page_size = 4
-        coordinator.min_hot_pages = 1
-        coordinator.device_buffer_size = 32
-        coordinator.mem_pool_device = SimpleNamespace(layer_num=2)
-        coordinator._mixed_slots = [True]
-        coordinator.kvduo_req_hot_capacity = torch.zeros((2, 1), dtype=torch.int64)
-        coordinator.kvduo_req_hot_capacity_gpu = torch.zeros((2, 1), dtype=torch.int32)
-        coordinator._init_kvduo_capacity_state(1)
-        coordinator.kvduo_hot_growth_events = torch.zeros((2, 1), dtype=torch.int32)
-        coordinator._active_kvduo_reqs = {0: object()}
-        coordinator.req_device_buffer_token_locs = torch.full(
-            (2, 1, 32), -1, dtype=torch.int32
-        )
-        coordinator.req_device_buffer_tokens = torch.full(
-            (2, 1, 32), -1, dtype=torch.int32
-        )
-        coordinator.lru_slots = torch.arange(32, dtype=torch.int16).repeat(2, 1, 1)
-        coordinator._kvduo_req_layer_pages = {}
-        coordinator._kvduo_hot_page_owners = {}
-        coordinator._kvduo_pressure_protected = None
-        coordinator._kvduo_hot_pressure_protected = set()
-        coordinator.top_k = 2
-        coordinator._reclaim_for_physical_allocation = MagicMock(
-            return_value=SimpleNamespace(action=object())
-        )
-        coordinator._require_allocation_ready = MagicMock()
-        physical = SimpleNamespace(
-            available_size=MagicMock(return_value=4),
-            alloc=MagicMock(return_value=torch.arange(20, 24)),
-            device="cpu",
-            page_size=4,
-            _release_page_ids=MagicMock(),
-        )
-        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
-            hisparse_attn_allocator=physical, free_hisparse_indices=MagicMock()
-        )
-
-        coordinator._ensure_kvduo_hot_capacity_targets(1, {0: 4})
-        physical.alloc.assert_called_once_with(4)
-        self.assertEqual(coordinator._kvduo_hot_page_owners, {20: (1, 0)})
-        coordinator.req_device_buffer_tokens[1, 0, :4] = torch.tensor([2, 3, 6, 7])
-        physical.alloc.reset_mock()
-        physical.available_size.return_value = 0
-        coordinator._reclaim_for_physical_allocation.reset_mock()
-        coordinator._ensure_kvduo_hot_capacity_targets(1, {0: 8}, allow_reclaim=False)
-        physical.alloc.assert_not_called()
-        coordinator._reclaim_for_physical_allocation.assert_not_called()
-        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
-
-        physical.available_size.return_value = 4
-        physical.alloc.return_value = torch.arange(24, 28)
-        coordinator._ensure_kvduo_hot_capacity_targets(1, {0: 8}, allow_reclaim=False)
-        self.assertEqual(
-            coordinator.lru_slots[1, 0, :8].tolist(), [4, 5, 6, 7, 0, 1, 2, 3]
-        )
-        self.assertEqual(
-            coordinator.req_device_buffer_tokens[1, 0, :4].tolist(), [2, 3, 6, 7]
-        )
-        self.assertEqual(coordinator._kvduo_req_layer_pages[(1, 0)], [20, 24])
-
-        coordinator.kvduo_max_relative_miss_increase = 0.10
-        coordinator.kvduo_capacity_steps[1, 0] = 65
-        coordinator._merge_kvduo_hot_pages(1, 0)
-        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[1, 0]), 4)
-        returned = physical._release_page_ids.call_args.args[0]
-        self.assertEqual(returned.tolist(), [6])
-        physical.alloc.reset_mock()
-        coordinator._ensure_kvduo_hot_capacity_targets(1, {0: 8}, allow_reclaim=False)
-        physical.alloc.assert_called_once_with(4)
-        self.assertEqual(
-            coordinator.lru_slots[1, 0, :8].tolist(), [4, 5, 6, 7, 0, 1, 2, 3]
-        )
-        self.assertTrue(torch.all(coordinator.req_device_buffer_token_locs[0] == -1))
-        self.assertEqual(int(coordinator.kvduo_req_hot_capacity[0, 0]), 0)
-
-        coordinator._release_kvduo_layer_hot_pages(0)
-        self.assertFalse(coordinator._kvduo_hot_page_owners)
-        self.assertTrue(torch.all(coordinator.kvduo_req_hot_capacity == 0))
+        c, p = make_merge_coordinator({(0, 0): 2, (1, 0): 3}, layers=2)
+        untouched = c.kvduo_hot_buffers[0, 0]
+        c.kvduo_hot_buffers[1, 0].frequency.zero_()
+        assert c._merge_kvduo_hot_pages(1, 0) == 4
+        c._ensure_kvduo_hot_capacity_targets_batch({(1, 0): 12}, allow_reclaim=False)
+        assert c.kvduo_hot_buffers[0, 0] is untouched
+        assert c.kvduo_req_hot_capacity.tolist() == [[8], [12]]
+        assert len(c._kvduo_hot_page_owners) == 5
 
     def _make_graph_prepare_coordinator(self, layers=1, requests=1):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -668,7 +590,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         coordinator._ensure_kvduo_hot_capacity_targets_batch.assert_not_called()
         self.assertEqual(int(coordinator.kvduo_req_hot_capacity[0, 0]), 4)
 
-    def test_graph_prepare_grows_one_page_per_event_and_stops_at_8k(self):
+    def test_graph_prepare_grows_one_page_per_event_beyond_8k(self):
         coordinator = self._make_graph_prepare_coordinator()
         capacities = []
         for _ in range(9):
@@ -676,13 +598,11 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
             capacities.append(int(coordinator.kvduo_req_hot_capacity[0, 0]))
 
-        self.assertEqual(capacities, [8, 12, 16, 20, 24, 28, 32, 32, 32])
+        self.assertEqual(capacities, [8, 12, 16, 20, 24, 28, 32, 36, 40])
 
     def test_h2d_growth_without_free_pages_retains_current_capacity(self):
         coordinator = self._make_graph_prepare_coordinator()
-        coordinator.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size.return_value = (
-            0
-        )
+        coordinator.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size.return_value = 0
         coordinator.kvduo_hot_growth_events[0, 0] = 1
 
         coordinator.prepare_kvduo_graph_replay(torch.tensor([0]))
@@ -760,7 +680,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         )
         coordinator._require_allocation_ready = MagicMock()
         physical = SimpleNamespace(
-            alloc=MagicMock(return_value=torch.arange(42)),
+            alloc=MagicMock(return_value=torch.arange(1, 43)),
             available_size=MagicMock(return_value=42),
         )
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
@@ -768,6 +688,11 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             free_hisparse_indices=MagicMock(),
         )
 
+        coordinator.kvduo_hot_buffers = {}
+        coordinator.kvduo_hot_pointers = torch.zeros(
+            (*coordinator.kvduo_req_hot_capacity.shape, 4), dtype=torch.int64
+        )
+        coordinator.decode_producer_stream = None
         coordinator._init_kvduo_capacity_state(
             coordinator.kvduo_req_hot_capacity.shape[1]
         )
@@ -853,6 +778,11 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             hisparse_attn_allocator=allocator,
             free_hisparse_indices=MagicMock(),
         )
+        coordinator.kvduo_hot_buffers = {}
+        coordinator.kvduo_hot_pointers = torch.zeros(
+            (*coordinator.kvduo_req_hot_capacity.shape, 4), dtype=torch.int64
+        )
+        coordinator.decode_producer_stream = None
         coordinator._init_kvduo_capacity_state(
             coordinator.kvduo_req_hot_capacity.shape[1]
         )
@@ -870,6 +800,8 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
         self.assertEqual(coordinator._kvduo_hot_page_owners, {})
         self.assertTrue(torch.all(coordinator.kvduo_req_hot_capacity == 0))
         self.assertTrue(torch.all(coordinator.kvduo_req_hot_capacity_gpu == 0))
+        self.assertFalse(coordinator.kvduo_hot_pointers.any())
+        self.assertEqual(coordinator.kvduo_hot_buffers, {})
         self.assertTrue(torch.all(coordinator.req_device_buffer_token_locs == -1))
         self.assertTrue(torch.all(coordinator.req_device_buffer_tokens == -1))
         self.assertTrue(
@@ -896,7 +828,9 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
 
     def test_batched_hot_second_layer_staging_failure_frees_pages(self):
         coordinator, allocator, physical = self._make_batched_hot_failure_coordinator()
-        original_cat = torch.cat
+        from sglang.srt.mem_cache.sparsity.core.kvduo_frequency import FrequencyBuffer
+
+        original_cat = FrequencyBuffer.empty
         calls = 0
 
         def fail_second_cat(tensors):
@@ -907,7 +841,7 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
             return original_cat(tensors)
 
         with patch(
-            "sglang.srt.managers.hisparse_coordinator.torch.cat",
+            "sglang.srt.mem_cache.sparsity.core.kvduo_frequency.FrequencyBuffer.empty",
             side_effect=fail_second_cat,
         ):
             with self.assertRaisesRegex(
@@ -924,13 +858,14 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
     def test_batched_hot_second_owner_failure_rolls_back_first_pair(self):
         coordinator, allocator, physical = self._make_batched_hot_failure_coordinator()
 
-        class FailSecondOwner(dict):
-            def __setitem__(self, key, value):
-                if key == 2:
-                    raise RuntimeError("injected second owner failure")
-                super().__setitem__(key, value)
+        publish = coordinator._publish_kvduo_frequency_buffer
 
-        coordinator._kvduo_hot_page_owners = FailSecondOwner()
+        def fail_second(owner, buffer):
+            if owner == (1, 0) and buffer is not None:
+                raise RuntimeError("injected second owner failure")
+            publish(owner, buffer)
+
+        coordinator._publish_kvduo_frequency_buffer = fail_second
         with self.assertRaisesRegex(RuntimeError, "injected second owner failure"):
             coordinator._ensure_kvduo_hot_capacity_targets_batch(
                 {(0, 0): 1, (1, 0): 1}, allow_reclaim=False

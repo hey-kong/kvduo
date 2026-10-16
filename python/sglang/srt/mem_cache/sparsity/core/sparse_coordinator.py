@@ -3,7 +3,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
@@ -78,7 +77,6 @@ class KVDuoConfig:
     logical_capacity_tokens: int = 0
     swap_in_block_size: int = 960
     tail_protected_pages: int = 2
-    max_relative_miss_increase: float = 0.10
     full_reclaim_policy: str = "request"
     decode_emergency_reclaim: bool = False
 
