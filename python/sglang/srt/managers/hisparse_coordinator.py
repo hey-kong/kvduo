@@ -171,9 +171,6 @@ class HiSparseCoordinator:
         self._kvduo_shared_layout = getattr(
             token_to_kv_pool_allocator, "kvduo_shared_layout", None
         )
-        self._kvduo_waiting_history_tokens = 0
-        self._kvduo_waiting_full_pages = 0
-        self._kvduo_decode_history_tokens = 0
         self._kvduo_shared_trim_pending = False
         self.top_k = top_k
         self.device_buffer_size = device_buffer_size
@@ -1723,13 +1720,6 @@ class HiSparseCoordinator:
         with self.kvduo_decode_reservation_scope(requests, consume=False):
             return self._ensure_kvduo_decode_capacity(requests, tree_cache=tree_cache)
 
-    def note_kvduo_history_shortage(self, tokens, chunk_tokens):
-        if getattr(self, "_kvduo_shared_layout", None) is None:
-            return
-        self._kvduo_waiting_history_tokens = max(0, int(tokens))
-        page = self.page_size * self.compress_ratio
-        self._kvduo_waiting_full_pages = (max(0, int(chunk_tokens)) + page - 1) // page
-
     def maintain_kvduo_shared_backing(self):
         layout = getattr(self, "_kvduo_shared_layout", None)
         if layout is None or not self._kvduo_shared_trim_pending:
@@ -1761,57 +1751,67 @@ class HiSparseCoordinator:
         if tokens <= 0:
             return
         logical = self.token_to_kv_pool_allocator.logical_attn_allocator
-        if self._kvduo_common_available(logical.full_available_size()) >= tokens:
+        available = self._kvduo_common_available(logical.full_available_size())
+        if available >= tokens:
             return
         if self._kvduo_common_available(logical.swa_available_size()) < tokens:
             return
-        self._kvduo_decode_history_tokens = tokens
-        try:
-            # Decode history pressure is a real execution allocation demand.
-            # Prefill itself never triggers this active FULL reclaim.
-            self.reclaim_kvduo_full_pages(
-                max(self.page_size, tokens // self.compress_ratio),
-                reserve_hot_minimum=True,
-            )
-            if self._kvduo_common_available(logical.full_available_size()) < tokens:
-                # Once all eligible FULL is gone, an earlier reclaim can still
-                # have left enough free backing for this mandatory decode.
-                self._borrow_kvduo_history_after_full_reclaim(
-                    (tokens + self.page_size * self.compress_ratio - 1)
-                    // (self.page_size * self.compress_ratio)
-                )
-        finally:
-            self._kvduo_decode_history_tokens = 0
-
-    def _borrow_kvduo_history_after_full_reclaim(self, protected_pages):
-        layout = getattr(self, "_kvduo_shared_layout", None)
-        if layout is None:
-            return 0
         page = self.page_size * self.compress_ratio
-        mandatory = self._kvduo_decode_history_tokens > 0
-        tokens = (
-            self._kvduo_decode_history_tokens
-            if mandatory
-            else self._kvduo_waiting_history_tokens
-        )
+        required_pages = (tokens + page - 1) // page
+        if (
+            required_pages - available // page
+            > layout.maximum_pages - layout.current_pages
+        ):
+            return
         protected = (
-            protected_pages
+            (tokens + page - 1) // page
             + self._kvduo_mandatory_hot_pages()
             + self._kvduo_reserved_prefill_pages()
-            + (0 if mandatory else self._kvduo_waiting_full_pages)
         )
+        self._borrow_kvduo_history(tokens, protected)
+        if self._kvduo_common_available(logical.full_available_size()) >= tokens:
+            return
+        self.reclaim_kvduo_full_pages(
+            max(self.page_size, tokens // self.compress_ratio),
+            reserve_hot_minimum=True,
+        )
+        protected = (
+            (tokens + page - 1) // page
+            + self._kvduo_mandatory_hot_pages()
+            + self._kvduo_reserved_prefill_pages()
+        )
+        self._borrow_kvduo_history(tokens, protected)
+        available = self._kvduo_common_available(logical.full_available_size())
+        if available < tokens:
+            donors = layout.minimum_donor_pages(
+                (tokens + page - 1) // page, available // page
+            )
+            physical = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+            free = self._kvduo_common_available(
+                physical.available_size() // self.page_size
+            )
+            shortage = max(0, protected + donors - free)
+            if self._kvduo_consensus((shortage,)) and shortage:
+                self.reclaim_kvduo_hot_pages(shortage * self.page_size)
+                self._borrow_kvduo_history(tokens, protected)
+
+    def _borrow_kvduo_history(self, tokens, protected_pages):
+        layout = getattr(self, "_kvduo_shared_layout", None)
+        if layout is None or tokens <= 0:
+            return 0
+        logical = self.token_to_kv_pool_allocator.logical_attn_allocator
+        if self._kvduo_common_available(logical.full_available_size()) >= tokens:
+            return 0
+        page = self.page_size * self.compress_ratio
         kwargs = dict(
             required_free_pages=(tokens + page - 1) // page,
-            protected_full_pages=protected,
+            protected_full_pages=protected_pages,
             agree=self._kvduo_consensus,
             common_available=self._kvduo_common_available,
         )
+        self._wait_kvduo_hot_merge_boundary()
         borrowed = layout.grow(**kwargs)
-        if (
-            mandatory
-            and self._kvduo_common_available(layout.logical_allocator.available_size())
-            < tokens
-        ):
+        if self._kvduo_common_available(logical.full_available_size()) < tokens:
             borrowed += layout.grow(**kwargs, minimum_only=True)
         if borrowed:
             logger.info(
@@ -3254,6 +3254,7 @@ class HiSparseCoordinator:
         prefix_indices: torch.Tensor | None = None,
         prefill_req=None,
         prefill_end: int | None = None,
+        history_tokens: int = 0,
     ) -> int | None:
         self._wait_kvduo_hot_merge_boundary()
         prefill_key = (
@@ -3302,6 +3303,7 @@ class HiSparseCoordinator:
                 tree_cache=tree_cache,
                 prefix_indices=prefix_indices,
                 prefill_req=prefill_req,
+                history_tokens=history_tokens,
             )
             if token is not None and prefill_key is not None:
                 self._kvduo_prefill_reservations[token][0] = pages
@@ -3341,6 +3343,7 @@ class HiSparseCoordinator:
         tree_cache=None,
         prefix_indices: torch.Tensor | None = None,
         prefill_req=None,
+        history_tokens: int = 0,
     ) -> int | None:
         """Admit against actual free pages after mandatory capacity and holds.
 
@@ -3357,6 +3360,9 @@ class HiSparseCoordinator:
             + self._kvduo_mandatory_hot_pages()
             + self._kvduo_next_decode_pages()
         )
+        if getattr(self, "_kvduo_shared_layout", None) is not None and history_tokens:
+            page = self.page_size * self.compress_ratio
+            required = max(required, (history_tokens + page - 1) // page)
         self._reclaim_kvduo_radix_pages(required, tree_cache)
         shortage = max(
             0,
@@ -3368,6 +3374,14 @@ class HiSparseCoordinator:
         ready = shortage == 0
         if not self._kvduo_consensus((ready, required)) or not ready:
             return None
+        if getattr(self, "_kvduo_shared_layout", None) is not None and history_tokens:
+            self._borrow_kvduo_history(history_tokens, required)
+            logical = self.token_to_kv_pool_allocator.logical_attn_allocator
+            if (
+                self._kvduo_common_available(logical.full_available_size())
+                < history_tokens
+            ):
+                return None
         token = self._kvduo_prefill_next_reservation
         self._kvduo_prefill_next_reservation += 1
         if prefill_key is not None:
@@ -4004,10 +4018,6 @@ class HiSparseCoordinator:
         """
         if not self.enable_mixed_residency or num_tokens <= 0:
             return 0
-        free_before_reclaim = (
-            self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
-            // self.page_size
-        )
         if self.decode_producer_stream is not None:
             device_module.current_stream(self.device).wait_stream(
                 self.decode_producer_stream
@@ -4297,12 +4307,7 @@ class HiSparseCoordinator:
                 len(selected),
                 self.page_size,
             )
-        borrowed = 0
-        if request_policy and not tail_cleanup and not release_all:
-            borrowed = self._borrow_kvduo_history_after_full_reclaim(
-                free_before_reclaim + needed
-            )
-        return (len(selected) - borrowed) * self.page_size
+        return len(selected) * self.page_size
 
     def swap_in_selected_pages(
         self,

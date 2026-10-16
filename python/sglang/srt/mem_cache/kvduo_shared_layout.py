@@ -133,6 +133,27 @@ class KVDuoSharedLayout:
                 ~torch.isin(physical.free_pages, withheld)
             ]
 
+    def minimum_donor_pages(self, required_free_pages, available_pages):
+        """Byte lower bound for a mandatory history allocation, not feasibility.
+
+        Fragmentation/alignment are still checked transactionally by grow().
+        """
+        missing = max(0, required_free_pages - available_pages)
+        if not missing or self.current_pages + missing > self.maximum_pages:
+            return 0
+        destinations = (
+            self._blocks(
+                "history", self.current_pages + 1, self.current_pages + missing + 1
+            )
+            - self.backing.mappings.keys()
+        )
+        idle = self.backing.max_blocks - len(self.backing.mappings)
+        blocks = max(0, len(destinations) - idle)
+        full_bytes = sum(
+            r.row_bytes * r.layers for r in self.regions if r.kind == "full"
+        )
+        return ceil(blocks * self.block_bytes / full_bytes)
+
     def grow(
         self,
         *,

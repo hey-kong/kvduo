@@ -260,3 +260,38 @@ def test_committed_and_unmapped_capacity_follow_borrow_and_return(layout):
     assert allocator.committed_full_size == 64 * 256
     assert allocator.unmapped_full_size == 64 * 256
     assert allocator.size_full == 128 * 256
+
+
+def test_failed_coarse_loan_does_not_change_layout_before_minimum_retry(layout):
+    layout.chunk_bytes = 4096
+    original = dict(layout.backing.mappings)
+    physical = layout.physical_allocator.free_pages.clone()
+    assert (
+        layout.grow(
+            required_free_pages=10, protected_full_pages=52, agree=lambda value: True
+        )
+        == 0
+    )
+    assert layout.current_pages == 64
+    assert layout.backing.mappings == original
+    assert torch.equal(layout.physical_allocator.free_pages, physical)
+    assert (
+        layout.grow(
+            required_free_pages=10,
+            protected_full_pages=52,
+            agree=lambda value: True,
+            minimum_only=True,
+        )
+        > 0
+    )
+    assert layout.current_pages == 72
+    assert layout.physical_allocator.available_size() // 256 >= 52
+
+
+def test_minimum_donor_bound_is_read_only_and_respects_virtual_ceiling(layout):
+    original = dict(layout.backing.mappings)
+    assert layout.minimum_donor_pages(10, 2) > 0
+    assert layout.minimum_donor_pages(2, 2) == 0
+    assert layout.minimum_donor_pages(200, 2) == 0
+    assert layout.backing.mappings == original
+    assert layout.current_pages == 64

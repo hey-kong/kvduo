@@ -31,6 +31,7 @@ import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
+from math import ceil
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
@@ -552,7 +553,6 @@ class PrefillAdder:
         self.kvduo_prefill_reservations = []
         if getattr(kvduo_coordinator, "_kvduo_shared_layout", None) is not None:
             kvduo_coordinator.maintain_kvduo_shared_backing()
-            kvduo_coordinator.note_kvduo_history_shortage(0, 0)
 
     def _kvduo_prefill_enabled(self) -> bool:
         coordinator = getattr(self, "kvduo_coordinator", None)
@@ -563,12 +563,23 @@ class PrefillAdder:
         if not self._kvduo_prefill_enabled():
             return True, None
         pages = coordinator.kvduo_prefill_pages(len(req.prefix_indices), end)
+        history_kwargs = {}
+        if getattr(coordinator, "_kvduo_shared_layout", None) is not None:
+            # Materialize backing only for this execution interval. The early
+            # virtual-capacity gate still checks the request's admission budget.
+            history_kwargs["history_tokens"] = ceil(
+                end
+                - len(req.prefix_indices)
+                + self.page_size
+                + self.rem_total_token_offset
+            )
         token = coordinator.reserve_kvduo_prefill(
             pages,
             tree_cache=self.tree_cache,
             prefix_indices=req.prefix_indices,
             prefill_req=req,
             prefill_end=end,
+            **history_kwargs,
         )
         if token is None:
             self.kvduo_prefill_blocked = True
@@ -642,6 +653,21 @@ class PrefillAdder:
             # uses the ordinary scheduler budget and allows retries after decode
             # reclaims pages, without making batch_is_full sticky.
             allocator = allocator.logical_attn_allocator
+        layout = getattr(
+            getattr(self, "kvduo_coordinator", None), "_kvduo_shared_layout", None
+        )
+        if layout is not None:
+            if include_physical:
+                available = (
+                    allocator.hisparse_attn_allocator.available_size()
+                    * allocator.compress_ratio
+                )
+            else:
+                available = (
+                    allocator.full_available_size()
+                    + (layout.maximum_pages - layout.current_pages) * self.page_size
+                )
+            return available + self.tree_cache.full_evictable_size()
         if self.is_all_swa:
             return allocator.swa_available_size() + self.tree_cache.swa_evictable_size()
         elif self.is_hybrid_swa:
@@ -950,21 +976,6 @@ class PrefillAdder:
                 if self.is_hybrid_swa or self._kvduo_prefill_enabled():
                     if self._kvduo_prefill_enabled():
                         self.kvduo_prefill_blocked = True
-                        if (
-                            getattr(
-                                self.kvduo_coordinator, "_kvduo_shared_layout", None
-                            )
-                            is not None
-                        ):
-                            chunk = min(
-                                self.rem_chunk_tokens,
-                                len(req.full_untruncated_fill_ids)
-                                - len(req.prefix_indices),
-                            )
-                            self.kvduo_coordinator.note_kvduo_history_shortage(
-                                chunk + self.rem_total_token_offset + self.page_size,
-                                chunk + self.page_size,
-                            )
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 
@@ -1189,19 +1200,6 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
-            if (
-                self._kvduo_prefill_enabled()
-                and getattr(self.kvduo_coordinator, "_kvduo_shared_layout", None)
-                is not None
-            ):
-                self.kvduo_coordinator.note_kvduo_history_shortage(
-                    total_tokens + self.rem_total_token_offset + 1,
-                    min(
-                        cand_extend_input_len,
-                        self.rem_chunk_tokens or cand_extend_input_len,
-                    )
-                    + self.page_size,
-                )
             return AddReqResult.NO_TOKEN
         if self._kvduo_scheduler_physical_blocked(req, total_tokens):
             return AddReqResult.OTHER
