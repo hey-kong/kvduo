@@ -19,8 +19,9 @@ class TestKVDuoConfig(unittest.TestCase):
             )
             self.assertEqual(config.decode_emergency_reclaim, expected)
         for raw in ("1", "0", "null", '"true"', "[]"):
-            with self.subTest(raw=raw), self.assertRaisesRegex(
-                ValueError, "decode_emergency_reclaim"
+            with (
+                self.subTest(raw=raw),
+                self.assertRaisesRegex(ValueError, "decode_emergency_reclaim"),
             ):
                 parse_kvduo_config(
                     SimpleNamespace(
@@ -40,8 +41,9 @@ class TestKVDuoConfig(unittest.TestCase):
 
     def test_rejects_invalid_full_reclaim_policy(self):
         for value in ('"batch"', '"PAGE"', "true", "1", "null", "[]", "{}"):
-            with self.subTest(value=value), self.assertRaisesRegex(
-                ValueError, "full_reclaim_policy"
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "full_reclaim_policy"),
             ):
                 parse_kvduo_config(
                     SimpleNamespace(kvduo_config=f'{{"full_reclaim_policy": {value}}}')
@@ -79,17 +81,11 @@ class TestKVDuoConfig(unittest.TestCase):
 
 
 class TestKVDuoPrefillConfig(unittest.TestCase):
-    def test_relative_miss_default_and_override(self):
-        self.assertEqual(
+    def test_removed_relative_miss_option_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unknown kvduo_config"):
             parse_kvduo_config(
-                SimpleNamespace(kvduo_config=None)
-            ).max_relative_miss_increase,
-            0.10,
-        )
-        config = parse_kvduo_config(
-            SimpleNamespace(kvduo_config='{"max_relative_miss_increase": 0.25}')
-        )
-        self.assertEqual(config.max_relative_miss_increase, 0.25)
+                SimpleNamespace(kvduo_config='{"max_relative_miss_increase": 0.25}')
+            )
 
     def test_invalid_relative_miss_values_and_removed_absolute_thresholds(self):
         for raw in [

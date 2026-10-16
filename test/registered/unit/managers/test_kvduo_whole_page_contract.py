@@ -43,7 +43,7 @@ def test_owner_keys_keep_asymmetric_requests_and_layers_separate():
 
     c, _ = make_merge_coordinator({(3, 17): 3, (17, 3): 3}, layers=18)
     untouched = c._kvduo_req_layer_pages[17, 3].copy()
-    c.kvduo_capacity_ema[3, 17] = 0
+    c.kvduo_hot_buffers[3, 17].frequency.zero_()
     assert c._merge_kvduo_hot_pages(3, 17) == 2 * c.page_size
     assert len(c._kvduo_req_layer_pages[3, 17]) == 1
     assert c._kvduo_req_layer_pages[17, 3] == untouched
@@ -51,11 +51,12 @@ def test_owner_keys_keep_asymmetric_requests_and_layers_separate():
 
 
 def test_merge_returns_whole_allocator_pages_after_payload_copy_completion():
-    import torch
     from unittest.mock import MagicMock
+
+    import torch
     from test_kvduo_hot_merge import (
-        make_merge_coordinator,
         assert_payloads_match_tokens,
+        make_merge_coordinator,
     )
 
     c, physical = make_merge_coordinator({(0, 0): 4})
@@ -73,41 +74,29 @@ def test_merge_returns_whole_allocator_pages_after_payload_copy_completion():
         free(page_ids)
 
     physical._release_page_ids = MagicMock(side_effect=free_after_copy)
-    assert c._merge_kvduo_hot_pages(0, 0, 2) == 2 * c.page_size
+    assert c._merge_kvduo_hot_pages(0, 0) == 2 * c.page_size
     physical._release_page_ids.assert_called_once()
     assert physical.free_pages == 2
 
 
 def test_batched_addresses_match_the_per_slot_reference_for_many_requests():
-    storage_layers, page_size, stride = 3, 4, 64
-    starts = [8, 20, 32]
-    reference = [
-        storage_layer * stride + start + offset
-        for start in starts
-        for storage_layer in range(storage_layers)
-        for offset in range(page_size)
-    ]
-    broadcast_shape_order = [
-        start + storage_offset + offset
-        for start in starts
-        for storage_offset in range(0, storage_layers * stride, stride)
-        for offset in range(page_size)
-    ]
-    assert broadcast_shape_order == reference
-    # Request 17 receives two pages, request 29 the next page, in allocator order.
-    k = storage_layers * page_size
-    assert broadcast_shape_order[: 2 * k] == reference[: 2 * k]
-    assert broadcast_shape_order[2 * k :] == reference[2 * k :]
+    from test_kvduo_hot_growth import make_coordinator
 
-    growth = _method_source(
-        COORDINATOR, "HiSparseCoordinator", "_materialize_kvduo_hot_growth_batch"
-    )
-    assert "int(page[0])" not in growth
-    assert 'to(device="cpu").tolist()' in growth
-    assert "page_starts_device[:, None, None]" in growth
-    assert "storage_offsets[None, :, None]" in growth
-    assert "within_page[None, None, :]" in growth
-    assert "next_page" in growth
+    c, physical = make_coordinator(layers=3, requests=30)
+    c.hot_storage_layers = 3
+    c.hot_page_size = 6
+    c._ensure_kvduo_hot_capacity_targets_batch({(2, 17): 12, (1, 29): 6})
+    physical.alloc.assert_called_once_with(6)
+    for owner, capacity in [((2, 17), 12), ((1, 29), 6)]:
+        pages = c._kvduo_req_layer_pages[owner]
+        expected = [
+            p + layer * c.mem_pool_device.flat_layer_slot_stride + offset
+            for p in pages
+            for layer in range(3)
+            for offset in range(2)
+        ]
+        assert c.kvduo_hot_buffers[owner].locations.tolist() == expected
+        assert c.kvduo_hot_buffers[owner].tokens.numel() == capacity
 
 
 def test_graph_prepare_batches_a_whole_capacity_round():
@@ -124,8 +113,8 @@ def test_graph_prepare_batches_a_whole_capacity_round():
     )
     # One allocation and one page-number D2H read serve all request/layer pairs.
     assert batch.count("allocator.alloc(physical_slots)") == 1
-    assert batch.count('to(device="cpu").tolist()') == 1
-    assert "for layer_id, req_idx, current, target, grow in requests" in batch
+    assert batch.count("cpu().tolist()") == 1
+    assert "for layer, req, current, target, grow in requests" in batch
 
 
 def test_cuda_streams_are_bound_to_the_tensor_parallel_device():

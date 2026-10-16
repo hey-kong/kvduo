@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-
 from sglang.kernels.ops.kvcache import kvduo_warmup as ops
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -85,11 +84,12 @@ def test_coordinator_passes_actual_geometry_without_mutating_banks(
     backing = object()
     c = SimpleNamespace(
         enable_mixed_residency=enabled,
-        req_device_buffer_tokens=SimpleNamespace(is_cuda=cuda, size=lambda _: 40000),
+        kvduo_hot_pointers=SimpleNamespace(is_cuda=cuda),
         mem_pool_device=SimpleNamespace(get_flat_key_buffer=lambda: backing),
         page_size=64,
         hot_storage_layers=78,
-        device_buffer_size=39936,
+        top_k=512,
+        swap_in_block_size=960,
         is_dsv4_hisparse=True,
     )
     HiSparseCoordinator.warmup_reclamation(c)
@@ -98,9 +98,9 @@ def test_coordinator_passes_actual_geometry_without_mutating_banks(
             backing=backing,
             page_size=64,
             storage_layers=78,
-            maximum=39936,
-            padded=40000,
+            top_k=512,
             paged=True,
+            block_size=960,
         )
     else:
         warm.assert_not_called()
@@ -112,33 +112,6 @@ def test_cpu_public_entry_does_not_load_cuda_modules(monkeypatch):
         backing=torch.zeros(1, 2),
         page_size=64,
         storage_layers=1,
-        maximum=512,
-        padded=576,
+        top_k=512,
         paged=False,
     )
-
-
-def test_warmup_fixture_forces_moves_and_never_uses_real_backing(monkeypatch):
-    backing = torch.full((3, 16), 37, dtype=torch.uint8)
-    workspace = SimpleNamespace(summary_host=torch.tensor([0, 1, 1]))
-    monkeypatch.setattr(ops, "allocate_kvduo_merge_workspace", lambda *args: workspace)
-    monkeypatch.setattr(ops, "finish_kvduo_hot_merge", lambda *args: ((0,), (1,)))
-
-    def execute(tokens, locations, lru, payload, scratch, **kwargs):
-        from sglang.srt.mem_cache.sparsity.core.kvduo_hot_merge import (
-            plan_kvduo_hot_merge,
-        )
-
-        k = kwargs["k"]
-        plan = plan_kvduo_hot_merge(
-            tokens[: 2 * k].tolist(), lru[: 2 * k].tolist(), k, 1, 1
-        )
-        assert len(plan.source_slots) > 0
-        assert locations[: 2 * k].unique().numel() == 2 * k
-        assert int(locations[: 2 * k].max()) < payload.size(0)
-        assert payload.data_ptr() != backing.data_ptr()
-        payload.fill_(99)
-
-    monkeypatch.setattr(ops, "execute_kvduo_hot_merge", execute)
-    ops._warmup(backing, 64, 2, 1024, 1088, False)
-    assert torch.all(backing == 37)

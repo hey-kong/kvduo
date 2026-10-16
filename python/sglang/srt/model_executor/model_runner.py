@@ -820,7 +820,6 @@ class ModelRunner:
         hisparse_cfg = parse_hisparse_config(self.server_args)
         tail_protected_pages = 0
         kvduo_host_size = None
-        max_relative_miss_increase = 0.10
         full_reclaim_policy = "page"
         decode_emergency_reclaim = False
         if self.server_args.enable_kvduo:
@@ -831,7 +830,6 @@ class ModelRunner:
             tail_protected_pages = kvduo_cfg.tail_protected_pages
             full_reclaim_policy = kvduo_cfg.full_reclaim_policy
             decode_emergency_reclaim = kvduo_cfg.decode_emergency_reclaim
-            max_relative_miss_increase = kvduo_cfg.max_relative_miss_increase
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
@@ -850,7 +848,6 @@ class ModelRunner:
             kvduo_host_size=kvduo_host_size,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
             tail_protected_pages=tail_protected_pages,
-            max_relative_miss_increase=max_relative_miss_increase,
             full_reclaim_policy=full_reclaim_policy,
             decode_emergency_reclaim=decode_emergency_reclaim,
         )
