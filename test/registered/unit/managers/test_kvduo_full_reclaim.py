@@ -759,3 +759,35 @@ def test_equal_net_gain_prefers_mixed_even_when_full_owner_started_earlier():
         1,
         mixed_owners=[False, True],
     ) == [3, 4]
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_full_reclaim_skips_released_intervals_but_retries_host_blocked_page(ratio):
+    c, physical, width = make_request_reclaim_coordinator([6], ratio=ratio)
+    c.full_host_version[: c.page_size] = 0
+    translate = c.mem_pool_device.translate_loc_from_full_to_compressed
+    c.mem_pool_device.translate_loc_from_full_to_compressed = MagicMock(wraps=translate)
+    assert c.reclaim_kvduo_full_pages(c.page_size) == 5 * c.page_size
+    c.mem_pool_device.translate_loc_from_full_to_compressed.reset_mock()
+    assert c.reclaim_kvduo_full_pages(c.page_size) == 0
+    args = c.mem_pool_device.translate_loc_from_full_to_compressed.call_args.args[0]
+    assert args.numel() == c.page_size * ratio
+    c.full_host_version[: c.page_size] = c.full_data_version[: c.page_size]
+    assert c.reclaim_kvduo_full_pages(c.page_size) == c.page_size
+    c.mem_pool_device.translate_loc_from_full_to_compressed.reset_mock()
+    for _ in range(5):
+        assert c.reclaim_kvduo_full_pages(c.page_size) == 0
+    c.mem_pool_device.translate_loc_from_full_to_compressed.assert_not_called()
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_full_reclaim_released_intervals_are_generation_bound(ratio):
+    c, physical, width = make_request_reclaim_coordinator([6], ratio=ratio)
+    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
+    original = mapping.clone()
+    assert c.reclaim_kvduo_full_pages(c.page_size) == 6 * c.page_size
+    # Simulate a new slot incarnation with FULL backing restored.
+    c._kvduo_request_generation[0] += 1
+    mapping.copy_(original)
+    assert c.reclaim_kvduo_full_pages(c.page_size) == 6 * c.page_size
+    assert c._kvduo_released_full_offsets[0][0] == c._kvduo_request_generation[0]

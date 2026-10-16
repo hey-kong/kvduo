@@ -201,6 +201,7 @@ def test_physical_admission_preserves_logical_and_swa_budget_rejections(path, po
     else:
         assert adder.add_chunked_req(req) is req
     coordinator.reserve_kvduo_prefill.assert_not_called()
+    assert coordinator._kvduo_prefill_plan_uncovered_pages() == 0
     assert physical.free_pages == 0
     assert not adder.can_run_list and not hasattr(req, "extend_range")
 
@@ -379,10 +380,28 @@ def test_admission_retries_real_surplus_and_does_not_hold_hot_growth_after_cance
     assert c._kvduo_reserved_prefill_pages() == 2
     c.kvduo_hot_growth_events[0, 0] = 1
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
-    assert c.kvduo_req_hot_capacity[0, 0] == 28
+    # Hand may now shrink an applicant, but cannot consume the admitted hold.
+    capacity = int(c.kvduo_req_hot_capacity[0, 0])
+    assert capacity == c.min_hot_pages * c.hot_page_size
+    assert physical.free_pages >= c._kvduo_reserved_prefill_pages() == 2
+    free_before_growth = physical.free_pages
     c.finish_kvduo_prefill_reservation(token, cancelled=True)
     assert c._kvduo_reserved_prefill_pages() == 0
     c.kvduo_hot_growth_events[0, 0] = 1
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
-    assert c.kvduo_req_hot_capacity[0, 0] == 32
-    assert physical.free_pages == 1
+    assert c.kvduo_req_hot_capacity[0, 0] == capacity + c.hot_page_size
+    assert physical.free_pages == free_before_growth - 1
+
+
+@pytest.mark.parametrize("path", ["new", "chunk"])
+def test_host_rejected_prefill_does_not_protect_physical_pages(path):
+    c, physical = ready_coordinator()
+    adder, req = adder_and_req(c, chunk=16 if path == "chunk" else None)
+    c._reserve_kvduo_prefill_host = MagicMock(return_value=False)
+    if path == "chunk":
+        assert adder.add_chunked_req(req) is req
+    else:
+        adder.add_one_req(req, False, None)
+    assert c._reserve_kvduo_prefill_host.called
+    assert c._kvduo_optional_protected_pages() == 0
+    assert not adder.can_run_list

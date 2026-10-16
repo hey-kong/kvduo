@@ -858,14 +858,18 @@ class TestKVDuoPhysicalReclaim(unittest.TestCase):
     def test_batched_hot_second_owner_failure_rolls_back_first_pair(self):
         coordinator, allocator, physical = self._make_batched_hot_failure_coordinator()
 
-        publish = coordinator._publish_kvduo_frequency_buffer
+        publish = coordinator._publish_kvduo_frequency_buffers
+        failed = False
 
-        def fail_second(owner, buffer):
-            if owner == (1, 0) and buffer is not None:
+        def fail_second(updates):
+            nonlocal failed
+            if not failed:
+                failed = True
+                publish(updates[:1])
                 raise RuntimeError("injected second owner failure")
-            publish(owner, buffer)
+            publish(updates)
 
-        coordinator._publish_kvduo_frequency_buffer = fail_second
+        coordinator._publish_kvduo_frequency_buffers = fail_second
         with self.assertRaisesRegex(RuntimeError, "injected second owner failure"):
             coordinator._ensure_kvduo_hot_capacity_targets_batch(
                 {(0, 0): 1, (1, 0): 1}, allow_reclaim=False

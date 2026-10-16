@@ -1,6 +1,6 @@
 """Saturating-frequency HOT metadata and page compaction (no entry LRU)."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -27,14 +27,31 @@ class FrequencyBuffer:
     frequency: torch.Tensor
     selected: torch.Tensor
 
+    _storage: tuple | None = field(default=None, repr=False)
+
     @classmethod
-    def empty(cls, locations):
+    def empty(cls, locations, *, reserve=None):
         n = locations.numel()
+        capacity = max(n, reserve or n)
+        storage = (
+            torch.full((capacity,), -1, dtype=torch.int32, device=locations.device),
+            torch.empty(capacity, dtype=torch.int32, device=locations.device),
+            torch.zeros(
+                (capacity + 15) // 16, dtype=torch.int32, device=locations.device
+            ),
+            torch.zeros(capacity, dtype=torch.uint8, device=locations.device),
+        )
+        storage[1][:n].copy_(locations)
+        return cls._view(storage, n)
+
+    @classmethod
+    def _view(cls, storage, n):
         return cls(
-            torch.full((n,), -1, dtype=torch.int32, device=locations.device),
-            locations.to(torch.int32),
-            torch.zeros((n + 15) // 16, dtype=torch.int32, device=locations.device),
-            torch.zeros(n, dtype=torch.uint8, device=locations.device),
+            storage[0][:n],
+            storage[1][:n],
+            storage[2][: (n + 15) // 16],
+            storage[3][:n],
+            storage,
         )
 
     def pointers(self):
@@ -44,10 +61,29 @@ class FrequencyBuffer:
         ]
 
     def grown(self, locations):
-        result = self.empty(torch.cat((self.locations, locations.to(torch.int32))))
         n = self.tokens.numel()
-        result.tokens[:n].copy_(self.tokens)
-        result.frequency[: self.frequency.numel()].copy_(self.frequency)
+        target = n + locations.numel()
+        storage = self._storage or (
+            self.tokens,
+            self.locations,
+            self.frequency,
+            self.selected,
+        )
+        if storage[0].numel() < target:
+            result = self.empty(
+                self.locations, reserve=max(target, storage[0].numel() * 2)
+            )
+            result.tokens.copy_(self.tokens)
+            result.frequency.copy_(self.frequency)
+            storage = result._storage
+        result = self._view(storage, target)
+        result.locations[n:].copy_(locations)
+        result.tokens[n:].fill_(-1)
+        result.selected[n:].zero_()
+        # Clear only newly visible bits, including after a failed publication.
+        if n % 16:
+            result.frequency[n // 16].bitwise_and_((1 << (2 * (n % 16))) - 1)
+        result.frequency[(n + 15) // 16 :].zero_()
         return result
 
 
