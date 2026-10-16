@@ -98,7 +98,7 @@ def test_prefill_evicts_host_cache_and_keeps_complete_prompt_hold_after_chunk(
     path, slots
 ):
     c, physical = ready_coordinator(extra=4 if path == "chunk" else 3)
-    physical.free_pages = 4 if path == "chunk" else 3
+    physical.free_pages = 4
     adder, req = actual_budget_adder_and_req(c, path=path)
     c.is_dsv4_hisparse = True
     pool = host_inventory(c, 256)

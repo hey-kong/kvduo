@@ -146,7 +146,7 @@ def test_prefill_evicts_idle_radix_without_reclaiming_hot(path):
     adder, req = actual_budget_adder_and_req(coordinator, path=path)
     # Both paths now evict only the next execution footprint.
     pages = 2
-    adder.tree_cache.full_evictable_size.return_value = pages * 8
+    adder.tree_cache.full_evictable_size.return_value = 4 * 8
 
     def evict(params):
         assert params.num_tokens == pages * 8 and params.swa_num_tokens == 0
