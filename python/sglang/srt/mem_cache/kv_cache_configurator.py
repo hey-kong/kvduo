@@ -1838,6 +1838,15 @@ class KVCacheConfigurator:
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 max_tokens, get_schedule().page_size
             )
+        if config.kvduo_logical_tokens is not None and self.server_args.pp_size > 1:
+            # Logical backing is independent of the physical-token PP minimum.
+            logical = torch.tensor(config.kvduo_logical_tokens, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                logical,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_world_group().cpu_group,
+            )
+            config.kvduo_logical_tokens = int(logical.item())
         return config
 
     def _handle_max_mamba_cache(self, total_rest_memory):

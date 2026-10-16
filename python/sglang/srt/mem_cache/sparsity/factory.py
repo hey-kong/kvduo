@@ -144,6 +144,7 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         "top_k",
         "host_size",
         "logical_capacity_ratio",
+        "logical_capacity_tokens",
         "swap_in_block_size",
         "tail_protected_pages",
         "max_relative_miss_increase",
@@ -156,6 +157,13 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
 
     top_k = values.get("top_k", DEFAULT_TOP_K)
     logical_ratio = values.get("logical_capacity_ratio", 2)
+    logical_tokens = values.get("logical_capacity_tokens", 0)
+    if (
+        isinstance(logical_tokens, bool)
+        or not isinstance(logical_tokens, int)
+        or logical_tokens < 0
+    ):
+        raise ValueError("logical_capacity_tokens must be a non-negative integer")
     host_size = values.get("host_size", 0)
     if (
         isinstance(host_size, bool)
@@ -200,6 +208,7 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         top_k=top_k,
         host_size=host_size,
         logical_capacity_ratio=logical_ratio,
+        logical_capacity_tokens=logical_tokens,
         swap_in_block_size=block_size,
         tail_protected_pages=tail_pages,
         max_relative_miss_increase=policy.max_relative_miss_increase,
