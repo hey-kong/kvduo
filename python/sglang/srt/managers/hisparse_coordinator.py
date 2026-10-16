@@ -3125,6 +3125,7 @@ class HiSparseCoordinator:
         # Remaining FULL footprint of admitted chunks, including first decode.
         self._kvduo_prefill_future_pages = {}
         self._kvduo_prefill_previous_future = {}
+        self._kvduo_prefill_new_host_reservations = set()
         self._kvduo_prefill_generation = 0
         self._kvduo_prefill_reservation_requests = {}
         self._kvduo_hand = 0
@@ -3388,12 +3389,14 @@ class HiSparseCoordinator:
             return
         prefill_key = self._kvduo_prefill_reservation_requests.pop(token, None)
         previous = self._kvduo_prefill_previous_future.pop(token, 0)
+        new_host = token in self._kvduo_prefill_new_host_reservations
+        self._kvduo_prefill_new_host_reservations.discard(token)
         if cancelled and prefill_key is not None:
             if previous:
                 self._kvduo_prefill_future_pages[prefill_key] = previous
             else:
                 self._kvduo_prefill_future_pages.pop(prefill_key, None)
-        if cancelled and prefill_key is not None and not previous:
+        if cancelled and prefill_key is not None and new_host:
             self._release_kvduo_prefill_host(prefill_key)
             request = self._kvduo_prefill_lifecycle[prefill_key]
             if getattr(request, "kvduo_prefill_generation", None) == prefill_key[1]:
@@ -3412,6 +3415,7 @@ class HiSparseCoordinator:
         tree_cache=None,
         prefix_indices: torch.Tensor | None = None,
         prefill_req=None,
+        prefill_end: int | None = None,
     ) -> int | None:
         self._wait_kvduo_hot_merge_boundary()
         prefill_key = (
@@ -3429,13 +3433,17 @@ class HiSparseCoordinator:
             full_end = len(prefill_req.full_untruncated_fill_ids) + int(
                 remaining_output > 1
             )
-            total = max(
-                pages,
-                self.kvduo_prefill_pages(
-                    len(prefill_req.prefix_indices),
-                    full_end,
-                ),
-            )
+            prompt_end = len(prefill_req.full_untruncated_fill_ids)
+            execution_end = prompt_end if prefill_end is None else prefill_end
+            if not len(prefill_req.prefix_indices) <= execution_end <= prompt_end:
+                raise ValueError("Invalid KVDuo prefill execution boundary")
+            # Intermediate chunks reserve only their execution footprint. The
+            # last chunk additionally holds the first decode allocation.
+            if execution_end == prompt_end:
+                total = max(
+                    pages,
+                    self.kvduo_prefill_pages(len(prefill_req.prefix_indices), full_end),
+                )
             capacity = (
                 self.token_to_kv_pool_allocator.hisparse_attn_allocator.size
                 // self.page_size
@@ -3467,6 +3475,8 @@ class HiSparseCoordinator:
                 self._kvduo_prefill_reservations[token][0] = pages
                 future[prefill_key] = total - pages
                 self._kvduo_prefill_previous_future[token] = previous
+                if new_host_reservation or (not needs_host and not previous):
+                    self._kvduo_prefill_new_host_reservations.add(token)
             return token
         finally:
             if token is None:
@@ -3474,6 +3484,23 @@ class HiSparseCoordinator:
                     future[prefill_key] = previous
                 if new_host_reservation:
                     self._release_kvduo_prefill_host(prefill_key)
+
+    def _kvduo_next_decode_pages(self) -> int:
+        pages = 0
+        for req in self._active_kvduo_reqs.values():
+            length = getattr(req, "kv_committed_len", None)
+            if length is None or getattr(req, "hisparse_staging", False):
+                continue
+            if callable(getattr(req, "finished", None)) and req.finished():
+                continue
+            key = (
+                getattr(req, "rid", None),
+                getattr(req, "kvduo_prefill_generation", None),
+            )
+            # First-decode holds are already included in reserved prefill pages.
+            held = self._kvduo_prefill_future_pages.get(key, 0)
+            pages += max(0, self.kvduo_prefill_pages(length, length + 1) - held)
+        return pages
 
     def _reserve_kvduo_prefill_physical(
         self,
@@ -3496,6 +3523,7 @@ class HiSparseCoordinator:
             pages
             + self._kvduo_reserved_prefill_pages()
             + self._kvduo_mandatory_hot_pages()
+            + self._kvduo_next_decode_pages()
         )
         self._reclaim_kvduo_radix_pages(required, tree_cache)
         shortage = max(
@@ -4396,6 +4424,14 @@ class HiSparseCoordinator:
         )
         if tail_cleanup:
             self._publish_kvduo_tail_progress(progress)
+        elif request_policy:
+            logger.info(
+                "KVDuo FULL request reclaim completed: requests=%d, "
+                "released_physical_blocks=%d, physical_block_tokens=%d",
+                len(first_holes),
+                len(selected),
+                self.page_size,
+            )
         return len(selected) * self.page_size
 
     def swap_in_selected_pages(

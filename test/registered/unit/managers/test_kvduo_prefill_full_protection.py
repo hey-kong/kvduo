@@ -1,4 +1,4 @@
-"""Prefill borrows HOT only and preserves FULL through the first decode."""
+"""Prefill preserves active FULL and holds only admitted execution credit."""
 
 from array import array
 from types import MethodType, SimpleNamespace
@@ -16,7 +16,7 @@ from test_kvduo_prefill_admission import adder_and_req, ready_coordinator
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def test_whole_prompt_hold_survives_chunks_and_protects_first_decode():
+def test_chunk_holds_are_released_between_chunks_and_protect_first_decode():
     c, physical = ready_coordinator()
     _, req = adder_and_req(c)
     physical.free_pages = 8
@@ -28,26 +28,23 @@ def test_whole_prompt_hold_survives_chunks_and_protects_first_decode():
         req.prefix_indices = torch.arange(start)
         pages = c.kvduo_prefill_pages(start, end)
         before = c._kvduo_prefill_future_pages.get(key, 0)
-        token = c.reserve_kvduo_prefill(pages, prefill_req=req)
+        token = c.reserve_kvduo_prefill(pages, prefill_req=req, prefill_end=end)
         assert token is not None
         c.protect_kvduo_prefill_plan(req, end)
         assert c._kvduo_prefill_plan_uncovered_pages() == 0
-        assert c._kvduo_reserved_prefill_pages() == physical.free_pages
+        assert c._kvduo_reserved_prefill_pages() == pages + int(end == 16)
         if start == 6:
-            # Cancellation before allocation restores the previous chunk's hold.
+            # Cancellation restores the previous hold without losing progress.
             c.finish_kvduo_prefill_reservation(token, cancelled=True)
-            assert c._kvduo_prefill_future_pages[key] == before
+            assert c._kvduo_prefill_future_pages.get(key, 0) == before
             assert c._kvduo_prefill_lifecycle[key] is req
             assert req.kvduo_prefill_generation == key[1]
-            token = c.reserve_kvduo_prefill(pages, prefill_req=req)
+            token = c.reserve_kvduo_prefill(pages, prefill_req=req, prefill_end=end)
             assert token is not None
         physical.alloc(pages * c.page_size)
         c.kvduo_prefill_batch_allocated()
         c.finish_kvduo_prefill_reservation(token, cancelled=False)
-        assert c._kvduo_reserved_prefill_pages() == physical.free_pages
-        assert (
-            c.reserve_kvduo_prefill(1, prefill_req=SimpleNamespace(rid="other")) is None
-        )
+        assert c._kvduo_reserved_prefill_pages() == int(end == 16)
     assert physical.free_pages == c._kvduo_reserved_prefill_pages() == 1
     assert not c._kvduo_prefill_previous_future
     c._end_kvduo_prefill_lifecycle(None, req)
