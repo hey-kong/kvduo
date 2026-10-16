@@ -1,6 +1,7 @@
 """Physical-first GPU sizing, logical backing and safe extra headroom."""
 
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -284,3 +285,19 @@ def test_dsv4_request_state_budget_uses_aligned_logical_target():
     config = planner.calculate_pool_sizes(1 << 28, 256)
     state_budget.assert_called_once_with(config.full_max_total_num_tokens)
     assert config.full_max_total_num_tokens == 16640
+
+
+def test_physical_reduction_reports_missing_headroom_without_shrinking_logical(caplog):
+    caplog.set_level(
+        logging.INFO, logger="sglang.srt.mem_cache.sparsity.core.kvduo_gpu_budget"
+    )
+    result = plan_gpu_budget(1000, 100, 8, 2, 10, 2, 1)
+    assert result.logical_tokens == 200
+    assert "target=100, allocated=87, logical=200" in caplog.text
+    assert "extra_required_bytes=200" in caplog.text
+    assert "additional_headroom_needed_bytes=100" in caplog.text
+    caplog.clear()
+    restored = plan_gpu_budget(1000, 200, 8, 2, 10, 2, 1)
+    assert restored.physical_tokens == 100
+    assert restored.logical_tokens == 200
+    assert not caplog.records
