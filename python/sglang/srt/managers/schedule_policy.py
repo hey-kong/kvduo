@@ -570,6 +570,7 @@ class PrefillAdder:
             tree_cache=self.tree_cache,
             prefix_indices=req.prefix_indices,
             prefill_req=req,
+            prefill_end=end,
         )
         if token is None:
             self.kvduo_prefill_blocked = True
@@ -935,6 +936,8 @@ class PrefillAdder:
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 if self.is_hybrid_swa or self._kvduo_prefill_enabled():
+                    if self._kvduo_prefill_enabled():
+                        self.kvduo_prefill_blocked = True
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 

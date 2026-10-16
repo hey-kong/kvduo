@@ -3248,6 +3248,13 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            # KVDuo admits one unfinished prompt at a time. If its next chunk
+            # is blocked, decode progresses instead of accumulating partial KV
+            # from other waiting prompts.
+            if adder._kvduo_prefill_enabled() and (
+                self.chunked_req is not None or adder.new_chunked_req is not None
+            ):
+                break
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 

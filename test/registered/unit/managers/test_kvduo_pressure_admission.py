@@ -144,7 +144,8 @@ def test_prefill_evicts_idle_radix_without_reclaiming_hot(path):
     coordinator, physical = ready_coordinator()
     coordinator.is_dsv4_hisparse = True
     adder, req = actual_budget_adder_and_req(coordinator, path=path)
-    pages = 2 if path == "new" else 4
+    # Both paths now evict only the next execution footprint.
+    pages = 2
     adder.tree_cache.full_evictable_size.return_value = pages * 8
 
     def evict(params):
