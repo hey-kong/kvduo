@@ -28,6 +28,10 @@ class PoolStats:
     full_available_size: int
     full_evictable_size: int
 
+    full_committed_capacity: Optional[int] = None
+    full_virtual_capacity: Optional[int] = None
+    full_unmapped_capacity: int = 0
+
     is_hybrid_swa: bool = False
     is_hybrid_ssm: bool = False
     is_hisparse: bool = False
@@ -83,6 +87,12 @@ class PoolStats:
             parts.append(f"mamba usage: {self.mamba_usage:.2f}")
         if not parts:
             parts.append(f"token usage: {self.full_token_usage:.2f}")
+        if self.full_committed_capacity is not None:
+            parts += [
+                f"history committed tokens: {self.full_committed_capacity}",
+                f"history virtual tokens: {self.full_virtual_capacity}",
+                f"history unmapped tokens: {self.full_unmapped_capacity}",
+            ]
         return parts
 
     def get_decode_usage_msg_parts(self) -> List[str]:
@@ -115,6 +125,12 @@ class PoolStats:
             parts.append(
                 f"#token: {self.full_num_used}, token usage: {self.full_token_usage:.2f}"
             )
+        if self.full_committed_capacity is not None:
+            parts += [
+                f"history committed tokens: {self.full_committed_capacity}",
+                f"history virtual tokens: {self.full_virtual_capacity}",
+                f"history unmapped tokens: {self.full_unmapped_capacity}",
+            ]
         return parts
 
     def update_scheduler_stats(self, stats: SchedulerStats) -> None:
@@ -283,13 +299,20 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_swa_token_info(self) -> PoolStats:
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        allocator = self.token_to_kv_pool_allocator
+        elastic = getattr(allocator, "kvduo_elastic_history", None) is not None
+        full_capacity = (
+            allocator.committed_full_size if elastic else self.full_tokens_per_layer
+        )
+        full_available_size = (
+            allocator.logical_attn_allocator.full_available_size()
+            if elastic
+            else allocator.full_available_size()
+        )
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
-        full_num_used = self.full_tokens_per_layer - (
-            full_available_size + full_evictable_size
-        )
+        full_num_used = full_capacity - (full_available_size + full_evictable_size)
         swa_num_used = self.swa_tokens_per_layer - (
             swa_available_size + swa_evictable_size
         )
@@ -300,16 +323,19 @@ class SchedulerPoolStatsObserver:
         if self.enable_hisparse:
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
-        if not self.full_tokens_per_layer:
+        if not full_capacity:
             full_num_used = 0
             full_available_size = 0
             full_token_usage = 0.0
         else:
-            full_token_usage = full_num_used / self.full_tokens_per_layer
+            full_token_usage = full_num_used / full_capacity
         swa_token_usage = swa_num_used / self.swa_tokens_per_layer
 
         return PoolStats(
             is_hybrid_swa=True,
+            full_committed_capacity=full_capacity if elastic else None,
+            full_virtual_capacity=allocator.size_full if elastic else None,
+            full_unmapped_capacity=allocator.unmapped_full_size if elastic else 0,
             full_num_used=full_num_used,
             full_token_usage=full_token_usage,
             full_available_size=full_available_size,

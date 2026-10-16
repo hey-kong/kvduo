@@ -385,12 +385,26 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.hisparse_kvcache.register_mapping(
             weakref.proxy(self.full_to_hisparse_device_index_mapping)
         )
-        self.kvduo_shared_layout = getattr(self._kvcache, "kvduo_shared_layout", None)
-        if self.kvduo_shared_layout is not None:
-            self.kvduo_shared_layout.bind(
+        self.kvduo_elastic_history = getattr(
+            self._kvcache, "kvduo_elastic_history", None
+        )
+        if self.kvduo_elastic_history is not None:
+            self.kvduo_elastic_history.bind(
                 self.logical_attn_allocator.full_attn_allocator,
-                self.hisparse_attn_allocator,
             )
+
+    @property
+    def committed_full_size(self) -> int:
+        history = getattr(self, "kvduo_elastic_history", None)
+        return (
+            self._size_full
+            if history is None
+            else history.current_pages * self.page_size
+        )
+
+    @property
+    def unmapped_full_size(self) -> int:
+        return self._size_full - self.committed_full_size
 
     @property
     def size_full(self) -> int:
@@ -791,9 +805,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.logical_attn_allocator.clear()
         self.hisparse_attn_allocator.clear()
 
-        shared = getattr(self, "kvduo_shared_layout", None)
-        if shared is not None:
-            shared.reset_free_lists()
+        history = getattr(self, "kvduo_elastic_history", None)
+        if history is not None:
+            history.reset_free_lists()
 
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True

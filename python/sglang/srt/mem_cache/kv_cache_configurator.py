@@ -174,6 +174,8 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
 @dataclass(slots=True, kw_only=True)
 class KVCacheConfigurator:
     kvduo_extra_budget_bytes: int = 0
+    kvduo_runtime_reserve_bytes: int = 0
+    kvduo_initial_history_tokens: int = 0
     device: str
     gpu_id: int
     ps: ParallelState
@@ -247,6 +249,7 @@ class KVCacheConfigurator:
         else:
             config = self._resolve_memory_pool_config(pre_model_load_memory)
 
+        self.kvduo_initial_history_tokens = config.kvduo_initial_history_tokens
         sizes = self._derive_pool_sizes(config=config)
 
         pools = self._init_pools(
@@ -1005,17 +1008,19 @@ class KVCacheConfigurator:
             pool_cls = DeepSeekV4TokenToKVPool
             c4_state_pool_size = c4_state_pool_size
             c128_state_pool_size = c128_state_pool_size
-        shared_kwargs = {}
+        history_kwargs = {}
         if getattr(self.server_args, "enable_kvduo", False):
             from sglang.srt.mem_cache.sparsity import parse_kvduo_config
 
             config = parse_kvduo_config(self.server_args)
-            if config.shared_hbm:
+            if config.elastic_history:
                 if _is_npu:
-                    raise ValueError("shared_hbm requires CUDA")
-                shared_kwargs = dict(
-                    kvduo_shared_hbm=True,
-                    hbm_borrow_chunk_mb=config.hbm_borrow_chunk_mb,
+                    raise ValueError("elastic_history requires CUDA")
+                history_kwargs = dict(
+                    kvduo_elastic_history=True,
+                    initial_history_tokens=self.kvduo_initial_history_tokens,
+                    history_reserve_bytes=self.kvduo_runtime_reserve_bytes,
+                    history_growth_chunk_mb=config.history_growth_chunk_mb,
                 )
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
@@ -1046,7 +1051,7 @@ class KVCacheConfigurator:
             online_mtp_max_draft_tokens=(
                 self.server_args.max_speculative_num_draft_tokens or 0
             ),
-            **shared_kwargs,
+            **history_kwargs,
         )
         return token_to_kv_pool
 
@@ -1662,6 +1667,7 @@ class KVCacheConfigurator:
                 + self.server_args.reserve_for_graph_mb()
                 + self.server_args.reserve_for_deepep_a2a_mb()
             )
+            self.kvduo_runtime_reserve_bytes = int(runtime_mb * (1 << 20))
             self.kvduo_extra_budget_bytes = int(
                 max(0, slack_gb - runtime_mb / 1024) * (1 << 30)
             )

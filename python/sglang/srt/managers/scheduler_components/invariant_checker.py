@@ -13,7 +13,6 @@ from typing import (
 )
 
 import torch
-
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -87,7 +86,14 @@ class SchedulerInvariantChecker:
         if self.is_hybrid_swa:
             protected = self.tree_cache.full_protected_size()
             session_held = self.pool_stats_observer.session_held_full_tokens()
-            total = self.full_tokens_per_layer
+            total = (
+                ps.full_committed_capacity
+                if ps.full_committed_capacity is not None
+                else self.full_tokens_per_layer
+            )
+            if ps.full_committed_capacity is not None:
+                assert total + ps.full_unmapped_capacity == ps.full_virtual_capacity
+                assert ps.full_unmapped_capacity >= 0
         elif self.is_hybrid_ssm:
             # Branch on cache type for the protected accessor (MambaRadixCache
             # splits full/mamba; ChunkCache only has the single protected_size).

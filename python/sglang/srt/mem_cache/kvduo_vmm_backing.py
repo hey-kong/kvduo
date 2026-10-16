@@ -30,7 +30,7 @@ class BackingExchange:
     destinations: tuple[int, ...]
 
 
-class SharedHBMBlocks:
+class VMMBacking:
     """A fixed byte budget shared by independently reserved virtual buffers.
 
     Addresses passed here are block aligned, reserved VAs owned by the caller.
@@ -41,7 +41,7 @@ class SharedHBMBlocks:
 
     def __init__(self, backend: MappingBackend, *, block_bytes: int, budget_bytes: int):
         if block_bytes <= 0 or budget_bytes < block_bytes:
-            raise ValueError("shared HBM budget must fit at least one block")
+            raise ValueError("history VMM budget must fit at least one block")
         self.backend = backend
         self.block_bytes = block_bytes
         self.max_blocks = budget_bytes // block_bytes
@@ -57,7 +57,7 @@ class SharedHBMBlocks:
     def _check(self):
         if self._closed or self._poisoned:
             raise RuntimeError(
-                "shared HBM manager is closed or has an incomplete unmap"
+                "history VMM manager is closed or has an incomplete unmap"
             )
 
     @property
@@ -67,7 +67,7 @@ class SharedHBMBlocks:
     def plan(self, *, donors=(), destinations=()) -> BackingExchange:
         self._check()
         if self._pending is not None:
-            raise RuntimeError("another shared HBM exchange is pending")
+            raise RuntimeError("another history VMM exchange is pending")
         donors, destinations = tuple(donors), tuple(destinations)
         for addresses in (donors, destinations):
             if len(set(addresses)) != len(addresses):
@@ -80,7 +80,7 @@ class SharedHBMBlocks:
             raise ValueError("destination already has physical backing")
         available = self.max_blocks - len(self.mappings) + len(donors)
         if len(destinations) > available:
-            raise MemoryError("shared HBM exchange exceeds physical budget")
+            raise MemoryError("history VMM exchange exceeds physical budget")
         return BackingExchange(self._epoch, donors, destinations)
 
     def prepare(self, plan: BackingExchange, *, accesses_complete: bool):
@@ -88,10 +88,10 @@ class SharedHBMBlocks:
         if not accesses_complete:
             raise RuntimeError("previous GPU accesses have not completed")
         if plan.epoch != self._epoch:
-            raise RuntimeError("stale shared HBM plan")
+            raise RuntimeError("stale history VMM plan")
         # Validate again: callers may have retained a plan while other work ran.
         if self.plan(donors=plan.donors, destinations=plan.destinations) != plan:
-            raise RuntimeError("invalid shared HBM plan")
+            raise RuntimeError("invalid history VMM plan")
         transaction = PreparedExchange(self, plan)
         self._pending = transaction
         try:
@@ -100,6 +100,18 @@ class SharedHBMBlocks:
             transaction.abort()
             raise
         return transaction
+
+    def release_idle(self):
+        """Return unmapped allocations to CUDA rather than retaining a reserve."""
+        self._check()
+        if self._pending is not None:
+            raise RuntimeError("cannot release handles during a mapping transaction")
+        while self._idle:
+            handle = self._idle[-1]
+            self.backend.release(handle)
+            self._idle.pop()
+            self._handles.remove(handle)
+            self._allocated -= 1
 
     def close(self, *, accesses_complete: bool):
         if self._closed:
@@ -122,7 +134,7 @@ class SharedHBMBlocks:
 
 
 class PreparedExchange:
-    def __init__(self, pool: SharedHBMBlocks, plan: BackingExchange):
+    def __init__(self, pool: VMMBacking, plan: BackingExchange):
         self.pool, self.plan = pool, plan
         self.aliases: dict[int, object] = {}
         self._borrowed_idle: list[object] = []
@@ -168,7 +180,7 @@ class PreparedExchange:
 
     def commit(self):
         if self._done:
-            raise RuntimeError("shared HBM transaction already finished")
+            raise RuntimeError("history VMM transaction already finished")
         pool = self.pool
         pool._check()
         try:

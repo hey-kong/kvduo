@@ -73,14 +73,14 @@ class KVDuoConfig:
 
     top_k: int = 2048
     host_size: float = 0
-    logical_capacity_ratio: int = 2
+    logical_capacity_ratio: int = 1
     logical_capacity_tokens: int = 0
     swap_in_block_size: int = 960
     tail_protected_pages: int = 2
     full_reclaim_policy: str = "request"
     decode_emergency_reclaim: bool = False
-    shared_hbm: bool = True
-    hbm_borrow_chunk_mb: int = 128
+    elastic_history: bool = True
+    history_growth_chunk_mb: int = 128
 
 
 class SparseCoordinator:

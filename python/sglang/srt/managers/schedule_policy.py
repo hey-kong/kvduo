@@ -550,9 +550,10 @@ class PrefillAdder:
         self.waiting_queue_len = waiting_queue_len
         self.kvduo_coordinator = kvduo_coordinator
         self.kvduo_prefill_reservations = []
-        if getattr(kvduo_coordinator, "_kvduo_shared_layout", None) is not None:
-            kvduo_coordinator.maintain_kvduo_shared_backing()
-            kvduo_coordinator.note_kvduo_history_shortage(0, 0)
+        if getattr(kvduo_coordinator, "_kvduo_elastic_history", None) is not None:
+            kvduo_coordinator.maintain_kvduo_history_backing()
+            kvduo_coordinator.grow_kvduo_history()
+            kvduo_coordinator.note_kvduo_history_shortage(0)
 
     def _kvduo_prefill_enabled(self) -> bool:
         coordinator = getattr(self, "kvduo_coordinator", None)
@@ -952,7 +953,7 @@ class PrefillAdder:
                         self.kvduo_prefill_blocked = True
                         if (
                             getattr(
-                                self.kvduo_coordinator, "_kvduo_shared_layout", None
+                                self.kvduo_coordinator, "_kvduo_elastic_history", None
                             )
                             is not None
                         ):
@@ -963,7 +964,6 @@ class PrefillAdder:
                             )
                             self.kvduo_coordinator.note_kvduo_history_shortage(
                                 chunk + self.rem_total_token_offset + self.page_size,
-                                chunk + self.page_size,
                             )
                     return req
                 _rem_tokens = self.rem_chunk_tokens
@@ -1191,16 +1191,11 @@ class PrefillAdder:
         if total_tokens >= self.rem_total_tokens:
             if (
                 self._kvduo_prefill_enabled()
-                and getattr(self.kvduo_coordinator, "_kvduo_shared_layout", None)
+                and getattr(self.kvduo_coordinator, "_kvduo_elastic_history", None)
                 is not None
             ):
                 self.kvduo_coordinator.note_kvduo_history_shortage(
                     total_tokens + self.rem_total_token_offset + 1,
-                    min(
-                        cand_extend_input_len,
-                        self.rem_chunk_tokens or cand_extend_input_len,
-                    )
-                    + self.page_size,
                 )
             return AddReqResult.NO_TOKEN
         if self._kvduo_scheduler_physical_blocked(req, total_tokens):
