@@ -636,14 +636,12 @@ class PrefillAdder:
             * self.new_token_ratio
         )
 
-    def _available_and_evictable_tokens(self):
+    def _available_and_evictable_tokens(self, *, include_physical=False):
         allocator = self.token_to_kv_pool_allocator
-        if self._kvduo_prefill_enabled():
-            # KVDuo checks/reserves the exact physical pages only after the
-            # logical/SWA gates and chunk plan. The composite's min(logical,
-            # physical * compression) would reject before the physical admission
-            # check can account for the selected chunk. Actual allocation still checks
-            # every pool.
+        if self._kvduo_prefill_enabled() and not include_physical:
+            # Keep the independent logical check. The separate physical gate
+            # uses the ordinary scheduler budget and allows retries after decode
+            # reclaims pages, without making batch_is_full sticky.
             allocator = allocator.logical_attn_allocator
         if self.is_all_swa:
             return allocator.swa_available_size() + self.tree_cache.swa_evictable_size()
@@ -655,6 +653,23 @@ class PrefillAdder:
             return allocator.available_size() + self.tree_cache.full_evictable_size()
         else:
             return allocator.available_size() + self.tree_cache.evictable_size()
+
+    def _kvduo_scheduler_physical_budget(self):
+        available = self._available_and_evictable_tokens(include_physical=True)
+        # Radix eviction may leave different physical inventories across TP.
+        # Agree before any rank can skip the collective reservation path.
+        available = self.kvduo_coordinator._kvduo_common_available(available)
+        return available - self.rem_total_token_offset
+
+    def _kvduo_scheduler_physical_blocked(self, req, total_tokens):
+        if (
+            self._kvduo_prefill_enabled()
+            and total_tokens >= self._kvduo_scheduler_physical_budget()
+        ):
+            self.kvduo_coordinator.check_kvduo_prefill_total_capacity(req)
+            self.kvduo_prefill_blocked = True
+            return True
+        return False
 
     @property
     def rem_total_tokens(self):
@@ -920,6 +935,10 @@ class PrefillAdder:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+            if self._kvduo_prefill_enabled():
+                _rem_tokens = min(
+                    _rem_tokens, int(self._kvduo_scheduler_physical_budget())
+                )
             if self.is_hybrid_swa:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM
@@ -1157,6 +1176,8 @@ class PrefillAdder:
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
+        if self._kvduo_scheduler_physical_blocked(req, total_tokens):
+            return AddReqResult.OTHER
 
         if self.is_hybrid_swa:
             # host-hit prefix is loaded back, not re-prefilled, so the SWA peak is
@@ -1189,6 +1210,8 @@ class PrefillAdder:
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
+            if self._kvduo_scheduler_physical_blocked(req, total_tokens):
+                return AddReqResult.OTHER
 
             if self.is_hybrid_swa:
                 # self.rem_swa_tokens may decrease after the lock acquisition

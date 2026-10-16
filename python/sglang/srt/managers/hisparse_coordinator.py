@@ -3111,6 +3111,33 @@ class HiSparseCoordinator:
             raise RuntimeError("KVDuo prefill allocation exceeds its reservation")
         reservation[0] -= pages
 
+    def check_kvduo_prefill_total_capacity(self, req) -> bool:
+        """Reject impossible prompts even when scheduler headroom blocks admission."""
+        prompt_end = len(req.full_untruncated_fill_ids)
+        remaining = getattr(
+            getattr(req, "sampling_params", None), "max_new_tokens", 2
+        ) - len(getattr(req, "output_ids", ()))
+        full_end = prompt_end + int(remaining > 1)
+        physical = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        if self.kvduo_prefill_pages(0, full_end) > physical.size // self.page_size:
+            req.set_finish_with_abort(
+                "KVDuo FULL prefill and first decode exceed physical pool capacity; "
+                "reduce the prompt length or increase KV pool capacity"
+            )
+            return False
+        host_slots = prompt_end // self.compress_ratio
+        host_slots = (
+            (host_slots + self.page_size - 1) // self.page_size * self.page_size
+        )
+        if host_slots > self.mem_pool_host.size:
+            req.set_finish_with_abort(
+                "KVDuo prompt exceeds total Host main-KV capacity "
+                f"(required={host_slots}, capacity={self.mem_pool_host.size} slots); "
+                "reduce the prompt length or increase kvduo host_size"
+            )
+            return False
+        return True
+
     def reserve_kvduo_prefill(
         self,
         pages: int,
@@ -3147,15 +3174,7 @@ class HiSparseCoordinator:
                     pages,
                     self.kvduo_prefill_pages(len(prefill_req.prefix_indices), full_end),
                 )
-            capacity = (
-                self.token_to_kv_pool_allocator.hisparse_attn_allocator.size
-                // self.page_size
-            )
-            if self.kvduo_prefill_pages(0, full_end) > capacity:
-                prefill_req.set_finish_with_abort(
-                    "KVDuo FULL prefill and first decode exceed physical pool capacity; "
-                    "reduce the prompt length or increase KV pool capacity"
-                )
+            if not self.check_kvduo_prefill_total_capacity(prefill_req):
                 return None
         new_host_reservation = (
             needs_host and prefill_key not in self._kvduo_prefill_host_reservations

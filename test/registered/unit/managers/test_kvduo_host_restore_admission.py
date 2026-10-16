@@ -110,14 +110,14 @@ def test_generic_prefill_reservation_funds_restore_and_keeps_fresh_tail_quota(
 ):
     c, physical, adder, req = restore_setup(dsv4=False, cache_type=cache_type, extra=3)
     req.sampling_params.max_new_tokens = 2
-    physical.free_pages = 3
+    physical.free_pages = 5
     assert adder.token_to_kv_pool_allocator.available_size() > 0
 
     assert adder.add_one_req(req, False, None) is AddReqResult.CONTINUE
 
     assert adder.can_run_list == [req]
     assert req.extend_range == Range(2 * adder.page_size, 3 * adder.page_size)
-    assert physical.free_pages == 2
+    assert physical.free_pages == 4
     assert c._kvduo_reserved_prefill_pages() == 2
     assert c._kvduo_mandatory_hot_pages() == 0
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_called_once()
@@ -148,6 +148,7 @@ def test_waiting_chunk_protects_hbm_only_after_independent_budgets(dsv4, blocked
     reserve = MagicMock(wraps=c.reserve_kvduo_prefill)
     c.reserve_kvduo_prefill = reserve
     if blocked_by == "host":
+        physical.free_pages = 4
         assert c.mem_pool_host.alloc(c.mem_pool_host.available_size()) is not None
     elif blocked_by == "logical":
         logical = adder.token_to_kv_pool_allocator.logical_attn_allocator
@@ -159,14 +160,12 @@ def test_waiting_chunk_protects_hbm_only_after_independent_budgets(dsv4, blocked
     assert result is (
         AddReqResult.NO_TOKEN if blocked_by == "logical" else AddReqResult.OTHER
     )
-    assert c._kvduo_prefill_plan_uncovered_pages() == (
-        2 if blocked_by == "physical" else 0
-    )
-    if blocked_by == "logical":
+    assert c._kvduo_prefill_plan_uncovered_pages() == 0
+    if blocked_by != "host":
         reserve.assert_not_called()
     else:
         assert reserve.call_args.args[0] == 2
-    assert physical.free_pages == 0
+    assert physical.free_pages == (4 if blocked_by == "host" else 0)
     assert not adder.can_run_list
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_not_called()
 
@@ -177,6 +176,8 @@ def test_waiting_plan_uses_the_aligned_chunk_end(dsv4):
     page = adder.page_size
     req.full_untruncated_fill_ids = list(range(6 * page))
     adder.rem_chunk_tokens = 3 * page + 1
+    physical.free_pages = 7
+    assert c.reserve_kvduo_prefill(5) is not None
     reserve = MagicMock(wraps=c.reserve_kvduo_prefill)
     c.reserve_kvduo_prefill = reserve
 
@@ -185,7 +186,7 @@ def test_waiting_plan_uses_the_aligned_chunk_end(dsv4):
     # One restored page and two freshly computed pages fit this execution.
     assert reserve.call_args.args[0] == 3
     assert c._kvduo_prefill_plan_uncovered_pages() == 3
-    assert physical.free_pages == 0 and not adder.can_run_list
+    assert physical.free_pages == 7 and not adder.can_run_list
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_not_called()
 
 
@@ -197,6 +198,8 @@ def test_swa_limited_plan_updates_protection_before_host_admission():
     # Leave SWA room for one compute page plus the allocator's page slack.
     swa = adder.token_to_kv_pool_allocator.logical_attn_allocator.swa_attn_allocator
     assert swa.alloc(swa.available_size() - 2 * page) is not None
+    physical.free_pages = 7
+    assert c.reserve_kvduo_prefill(6) is not None
     reserve = MagicMock(wraps=c.reserve_kvduo_prefill)
     c.reserve_kvduo_prefill = reserve
 
@@ -204,7 +207,7 @@ def test_swa_limited_plan_updates_protection_before_host_admission():
 
     assert reserve.call_args.args[0] == 2
     assert c._kvduo_prefill_plan_uncovered_pages() == 2
-    assert physical.free_pages == 0 and not adder.can_run_list
+    assert physical.free_pages == 7 and not adder.can_run_list
 
 
 @pytest.mark.parametrize("protected", ["fresh_tail", "other_prefill", "hot_minimum"])
@@ -288,14 +291,14 @@ def test_restore_rejects_invalid_reservation_without_reclaim(invalid):
 
 def test_failed_restore_cancels_prefill_quota_and_limits_without_spending_pages():
     c, physical, adder, req = restore_setup(dsv4=False, extra=3)
-    physical.free_pages = 3
+    physical.free_pages = 5
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.return_value = None
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.side_effect = None
 
     assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
 
     c.token_to_kv_pool_allocator.alloc_kvduo_restore.assert_called_once()
-    assert physical.free_pages == 3
+    assert physical.free_pages == 5
     assert not c._kvduo_prefill_reservations
     assert not adder.can_run_list
     assert len(req.prefix_indices) == adder.page_size
