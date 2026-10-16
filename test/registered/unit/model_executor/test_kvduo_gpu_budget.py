@@ -24,7 +24,7 @@ def dsv4(*, kvduo=True, ratio=2, extra=0, logical_tokens=0, shared=False):
                 {
                     "logical_capacity_ratio": ratio,
                     "logical_capacity_tokens": logical_tokens,
-                    "elastic_history": shared,
+                    "shared_hbm": shared,
                 }
             )
             if kvduo
@@ -53,25 +53,21 @@ def dsv4(*, kvduo=True, ratio=2, extra=0, logical_tokens=0, shared=False):
     return DSV4PoolConfigurator(kvc)
 
 
-def test_elastic_history_initial_target_and_virtual_ceiling():
-    planner = dsv4(shared=True, ratio=1)
+def test_shared_backing_commits_one_times_history_with_larger_address_ceiling():
+    planner = dsv4(shared=True)
     config = planner.calculate_pool_sizes(1 << 30, 256)
     physical = config.c4_max_total_num_tokens * 4
-    initial = config.kvduo_initial_history_tokens
     assert physical > 0
-    baseline = dsv4(kvduo=False).calculate_pool_sizes(1 << 30, 256)
-    assert initial == baseline.full_max_total_num_tokens
-    assert initial >= physical
-    assert config.full_max_total_num_tokens == initial * 2
-    assert config.c128_max_total_num_tokens * 128 == initial * 2
+    assert config.full_max_total_num_tokens == physical * 2
+    assert config.c128_max_total_num_tokens * 128 == physical * 2
+    assert config.swa_max_total_num_tokens == int(physical * 0.1) // 256 * 256
     capped = planner.calculate_pool_sizes_from_max_tokens(physical, 256)
-    assert capped.kvduo_initial_history_tokens == physical
+    assert capped.c4_max_total_num_tokens * 4 == physical
 
 
-def test_elastic_explicit_initial_target_is_preserved():
-    config = dsv4(shared=True, logical_tokens=256).calculate_pool_sizes(1 << 30, 256)
-    assert config.kvduo_initial_history_tokens == 256
-    assert config.full_max_total_num_tokens == 512
+def test_shared_explicit_ceiling_must_cover_initial_pool():
+    with pytest.raises(ValueError, match="logical metadata"):
+        dsv4(shared=True, logical_tokens=256).calculate_pool_sizes(1 << 30, 256)
 
 
 def test_extra_headroom_preserves_physical_baseline():
@@ -188,11 +184,7 @@ def test_generic_planning_preserves_distinct_physical_and_logical_sizes(logical_
     kvc.model_config.hf_config.get_text_config = lambda: kvc.model_config.hf_config
     kvc.server_args.enable_kvduo = kvc.server_args.enable_hisparse = True
     kvc.server_args.kvduo_config = json.dumps(
-        {
-            "logical_capacity_tokens": logical_tokens,
-            "logical_capacity_ratio": 2,
-            "elastic_history": False,
-        }
+        {"logical_capacity_tokens": logical_tokens, "shared_hbm": False}
     )
     kvc.server_args.hisparse_config = '{"host_to_device_ratio":2}'
     kvc.server_args.dsa_prefill_backend = kvc.server_args.dsa_decode_backend = (
@@ -326,30 +318,3 @@ def test_physical_reduction_reports_missing_headroom_without_shrinking_logical(c
     assert restored.physical_tokens == 100
     assert restored.logical_tokens == 200
     assert not caplog.records
-
-
-def test_elastic_history_is_not_attached_to_full_or_swa(monkeypatch):
-    from unittest.mock import Mock
-    from sglang.srt.mem_cache import deepseek_v4_memory_pool as module
-
-    pool = object.__new__(module.DeepSeekV4TokenToKVPool)
-    pool.kvduo_elastic_history = object()
-    pool.qk_nope_head_dim = 448
-    pool.qk_rope_head_dim = 64
-    full_cls = Mock()
-    monkeypatch.setattr(module, "HiSparseC4DevicePool", full_cls)
-    args = dict(
-        size=1024,
-        dtype=torch.uint8,
-        layer_num=2,
-        device="cpu",
-        enable_memory_saver=False,
-    )
-    pool._make_kv_pool(**args, page_size=64, global_page_size=256, cls=full_cls)
-    assert "elastic_history" not in full_cls.call_args.kwargs
-    swa_cls = Mock()
-    pool._make_kv_pool(**args, page_size=256, global_page_size=256, cls=swa_cls)
-    assert "elastic_history" not in swa_cls.call_args.kwargs
-    c128_cls = Mock()
-    pool._make_kv_pool(**args, page_size=2, global_page_size=256, cls=c128_cls)
-    assert c128_cls.call_args.kwargs["elastic_history"] is pool.kvduo_elastic_history

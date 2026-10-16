@@ -2768,7 +2768,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             logical = self.token_to_kv_pool_allocator.logical_attn_allocator
             evict_from_tree_cache(self.tree_cache, num_tokens, allocator=logical)
             if (
-                getattr(self.hisparse_coordinator, "_kvduo_elastic_history", None)
+                getattr(self.hisparse_coordinator, "_kvduo_shared_layout", None)
                 is not None
             ):
                 self.hisparse_coordinator.ensure_kvduo_decode_history(num_tokens)

@@ -58,7 +58,6 @@ class MemoryPoolConfig:
     c128_state_pool_size: int = 0
 
     kvduo_logical_tokens: Optional[int] = None
-    kvduo_initial_history_tokens: int = 0
 
     mem_fraction_static: Optional[float] = None
 
@@ -142,10 +141,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             self._kvduo_ratio = parse_kvduo_config(
                 kvc.server_args
             ).logical_capacity_ratio
-            if parse_kvduo_config(kvc.server_args).elastic_history:
-                raise ValueError(
-                    "elastic_history currently supports CUDA DeepSeek-V4 only"
-                )
+            if parse_kvduo_config(kvc.server_args).shared_hbm:
+                raise ValueError("shared_hbm currently supports CUDA DeepSeek-V4 only")
             self._kvduo_logical_target = parse_kvduo_config(
                 kvc.server_args
             ).logical_capacity_tokens
@@ -755,17 +752,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 kvc.server_args
             ).logical_capacity_tokens
             self._kvduo_ratio = self.c4_shrink_factor
-            self._kvduo_elastic_history = parse_kvduo_config(
-                kvc.server_args
-            ).elastic_history
-            if self._kvduo_elastic_history and (
+            self._kvduo_shared_hbm = parse_kvduo_config(kvc.server_args).shared_hbm
+            if self._kvduo_shared_hbm and (
                 self.is_speculative
                 or self.disaggregation_mode != "null"
                 or kvc.ps.pp_size != 1
                 or getattr(kvc.server_args, "enable_mixed_chunk", False)
             ):
                 raise ValueError(
-                    "elastic_history requires non-speculative, non-P/D DeepSeek-V4 with PP=1 and mixed-chunk disabled"
+                    "shared_hbm requires non-speculative, non-P/D DeepSeek-V4 with PP=1 and mixed-chunk disabled"
                 )
             self._kvduo_extra_budget = getattr(kvc, "kvduo_extra_budget_bytes", 0)
             old = self.c4_shrink_factor
@@ -967,8 +962,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                     * self._kvduo_ratio
                 )
                 full_token = (full_token + page_size - 1) // page_size * page_size
-            if getattr(self, "_kvduo_elastic_history", False):
-                full_token *= 2
             c128_state_fixed_bytes = (
                 self._get_c128_state_fixed_bytes_for_token_capacity(full_token)
             )
@@ -979,56 +972,41 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 plan_gpu_budget,
             )
 
-            if getattr(self, "_kvduo_elastic_history", False):
-                # Initial history follows the ordinary physical TARGET, not the
-                # reduced final physical pool. Only metadata for a 2x virtual
-                # ceiling is committed in addition to the initial payload.
-                target = int(available_bytes_for_tokens // self._kvduo_baseline_bytes)
-                target = target // page_size * page_size
-                initial = self._kvduo_logical_target or target * self._kvduo_ratio
-                initial = ceil_div(initial, page_size) * page_size
-                ceiling = initial * 2
-                rounding = (self.num_layers_ca4 + self.num_layers_ca128) * (4 << 20)
+            if getattr(self, "_kvduo_shared_hbm", False):
+                # One-times history is committed initially. The larger logical
+                # ceiling reserves VA/metadata, not indexer/C128 payload.
+                # Reserve worst-case VMM rounding at both ends of each layer.
+                rounding = (self.num_layers_ca4 * 2 + self.num_layers_ca128) * (4 << 20)
+                ratio = max(2, self._kvduo_ratio)
+                metadata = self._kvduo_logical_target * LOGICAL_METADATA_BYTES
                 c4_row = ceil_div((page_size // 4) * 584, 576) * 576
                 c128_row = ceil_div((page_size // 128) * 584, 576) * 576
                 swa_row = ceil_div(self.swa_page_size * 584, 576) * 576
-                physical_bytes = self._kvduo_physical_bytes + (
+                padding = (
                     (c4_row / page_size - 584 / 4) * self.num_layers_ca4
+                    + (c128_row / page_size - 584 / 128) * self.num_layers_ca128
                     + (swa_row / self.swa_page_size - 584)
                     * self.swa_ratio
                     * self.num_layers_total
                 )
-                history_bytes = (
-                    self._kvduo_logical_bytes
-                    + (c128_row / page_size - 584 / 128) * self.num_layers_ca128
+                per_token = (
+                    self._kvduo_baseline_bytes
+                    + padding
+                    + ratio * LOGICAL_METADATA_BYTES
                 )
-                limit = available_bytes_for_tokens + self._kvduo_extra_budget
-                remaining = (
-                    limit
-                    - rounding
-                    - initial * history_bytes
-                    - (ceiling - initial) * LOGICAL_METADATA_BYTES
+                physical = int(
+                    max(0, available_bytes_for_tokens - rounding - metadata)
+                    // per_token
                 )
-                physical = min(target, initial, int(remaining // physical_bytes))
                 physical = physical // page_size * page_size
-                if physical <= 0 or initial <= 0:
+                logical = self._kvduo_logical_target or physical * ratio
+                logical = (logical + page_size - 1) // page_size * page_size
+                if physical <= 0 or logical < physical:
                     raise ValueError(
-                        "elastic history budget cannot fit initial backing and logical metadata"
+                        "shared HBM budget cannot fit initial backing and logical metadata"
                     )
                 self._kvduo_profiled_physical = physical
-                self._kvduo_initial_history_tokens = initial
-                config = self._to_config(
-                    self._kvduo_sizes(physical, ceiling, page_size)
-                )
-                config.kvduo_initial_history_tokens = initial
-                logger.info(
-                    "KVDuo elastic GPU capacity: physical_target=%d, physical_tokens=%d, initial_history_tokens=%d, virtual_history_tokens=%d",
-                    target,
-                    physical,
-                    initial,
-                    ceiling,
-                )
-                return config
+                return self._to_config(self._kvduo_sizes(physical, logical, page_size))
             plan = plan_gpu_budget(
                 available_bytes_for_tokens,
                 self._kvduo_extra_budget,
@@ -1077,21 +1055,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 ),
                 max_total_num_tokens,
             )
-            config = self._to_config(
+            return self._to_config(
                 self._kvduo_sizes(physical, max_total_num_tokens, page_size)
             )
-            if getattr(self, "_kvduo_elastic_history", False):
-                config.kvduo_initial_history_tokens = (
-                    min(
-                        getattr(
-                            self, "_kvduo_initial_history_tokens", max_total_num_tokens
-                        ),
-                        max_total_num_tokens,
-                    )
-                    // page_size
-                    * page_size
-                )
-            return config
         sizes = self._compute_dsv4_sizes(max_total_num_tokens, page_size)
         return self._to_config(sizes)
 

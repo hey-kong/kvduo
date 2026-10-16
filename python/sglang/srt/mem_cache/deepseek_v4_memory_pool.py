@@ -60,7 +60,8 @@ class DeepSeekV4SingleKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        elastic_history=None,
+        shared_hbm=None,
+        shared_kind=None,
     ):
         super().__init__(
             size,
@@ -74,7 +75,8 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
-        self.elastic_history = elastic_history
+        self.shared_hbm = shared_hbm
+        self.shared_kind = shared_kind
 
         self.scale_pad = 1
         self.quantize_block_size = 64
@@ -128,11 +130,12 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         assert self.store_dtype == torch.uint8
 
-        if self.elastic_history is not None:
-            return self.elastic_history.allocate(
+        if self.shared_hbm is not None:
+            return self.shared_hbm.allocate(
                 rows=num_pages // self.layer_num,
                 layers=self.layer_num,
                 row_bytes=self.bytes_per_page_padded,
+                kind=self.shared_kind,
             )
         return torch.zeros(
             num_pages,
@@ -197,6 +200,8 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         enable_memory_saver: bool,
         start_layer: int | None = None,
         end_layer: int | None = None,
+        shared_hbm=None,
+        shared_kind=None,
     ):
         super().__init__(
             size,
@@ -209,6 +214,8 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
             enable_memory_saver,
             start_layer,
             end_layer,
+            shared_hbm=shared_hbm,
+            shared_kind=shared_kind,
         )
 
         self.data_ptrs = torch.tensor(
@@ -281,7 +288,7 @@ class DeepSeekV4IndexerPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        elastic_history=None,
+        shared_hbm=None,
     ):
         super().__init__(
             size,
@@ -294,7 +301,7 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
-        self.elastic_history = elastic_history
+        self.shared_hbm = shared_hbm
         self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
 
         self._create_buffer()
@@ -306,12 +313,13 @@ class DeepSeekV4IndexerPool(KVCache):
 
     def _create_buffer(self):
         page_bytes = self.page_size * self.get_bytes_per_token()
-        if self.elastic_history is not None:
+        if self.shared_hbm is not None:
             self.index_k_with_scale_buffer = list(
-                self.elastic_history.allocate(
+                self.shared_hbm.allocate(
                     rows=(self.size + self.page_size + 1) // self.page_size,
                     layers=self.layer_num,
                     row_bytes=page_bytes,
+                    kind="history",
                 ).view(self.layer_num, -1, page_bytes)
             )
             return
@@ -507,10 +515,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
-        kvduo_elastic_history: bool = False,
-        history_growth_chunk_mb: int = 128,
-        initial_history_tokens: int = 0,
-        history_reserve_bytes: int = 0,
+        kvduo_shared_hbm: bool = False,
+        hbm_borrow_chunk_mb: int = 128,
     ):
         super().__init__(
             swa_size,
@@ -601,8 +607,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self._unified_kv = is_unified_kv_triton()
-        self.kvduo_elastic_history = None
-        if kvduo_elastic_history:
+        self.kvduo_shared_layout = None
+        if kvduo_shared_hbm:
             if (
                 self._unified_kv
                 or not enable_hisparse
@@ -610,16 +616,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 or enable_memory_saver
             ):
                 raise ValueError(
-                    "elastic_history requires CUDA paged KVDuo without memory saver"
+                    "shared_hbm requires CUDA paged KVDuo without memory saver"
                 )
-            from sglang.srt.mem_cache.kvduo_elastic_history import KVDuoElasticHistory
+            from sglang.srt.mem_cache.kvduo_shared_layout import KVDuoSharedLayout
 
-            self.kvduo_elastic_history = KVDuoElasticHistory(
+            self.kvduo_shared_layout = KVDuoSharedLayout(
                 device=device,
-                initial_pages=initial_history_tokens // page_size,
+                initial_pages=c4_size // c4_page_size,
                 maximum_pages=c128_size // c128_page_size,
-                chunk_mb=history_growth_chunk_mb,
-                reserve_bytes=history_reserve_bytes,
+                chunk_mb=hbm_borrow_chunk_mb,
             )
 
         if self._unified_kv:
@@ -694,8 +699,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             device,
             enable_memory_saver,
         )
-        if self.kvduo_elastic_history is not None:
-            self.kvduo_elastic_history.initialize()
+        if self.kvduo_shared_layout is not None:
+            self.kvduo_shared_layout.initialize()
 
         self._init_compressed_layer_mapping()
 
@@ -891,14 +896,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         for the per-ratio c4/c128 pools); the default CUDA pool ignores it.
         Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the NPU bf16
         PA_ND variant, which needs ``global_page_size`` for its kernel view."""
-        history = getattr(self, "kvduo_elastic_history", None)
+        shared = getattr(self, "kvduo_shared_layout", None)
         kwargs = {}
-        if (
-            history is not None
-            and global_page_size != page_size
-            and cls is not HiSparseC4DevicePool
-        ):
-            kwargs = dict(elastic_history=history)
+        if shared is not None and global_page_size != page_size:
+            kwargs = dict(
+                shared_hbm=shared,
+                shared_kind="full" if cls is HiSparseC4DevicePool else "history",
+            )
         return cls(
             size,
             page_size,
@@ -932,7 +936,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             layer_num,
             device,
             enable_memory_saver,
-            elastic_history=getattr(self, "kvduo_elastic_history", None),
+            shared_hbm=getattr(self, "kvduo_shared_layout", None),
         )
 
     def _state_pool_size(self, ratio: int) -> int:

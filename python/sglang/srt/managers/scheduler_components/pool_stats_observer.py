@@ -300,7 +300,7 @@ class SchedulerPoolStatsObserver:
 
     def _get_swa_token_info(self) -> PoolStats:
         allocator = self.token_to_kv_pool_allocator
-        elastic = getattr(allocator, "kvduo_elastic_history", None) is not None
+        elastic = getattr(allocator, "kvduo_shared_layout", None) is not None
         full_capacity = (
             allocator.committed_full_size if elastic else self.full_tokens_per_layer
         )

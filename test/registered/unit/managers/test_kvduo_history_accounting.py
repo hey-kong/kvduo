@@ -20,7 +20,7 @@ def test_committed_history_stats_and_strict_busy_check(committed, used, monkeypa
     allocator._size_full = 131072
     allocator.page_size = 256
     allocator.compress_ratio = 4
-    allocator.kvduo_elastic_history = SimpleNamespace(current_pages=committed // 256)
+    allocator.kvduo_shared_layout = SimpleNamespace(current_pages=committed // 256)
     allocator.logical_attn_allocator = SimpleNamespace(
         full_available_size=lambda: committed - used,
         swa_available_size=lambda: 1024 - used,

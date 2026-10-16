@@ -1,5 +1,5 @@
 import pytest
-from sglang.srt.mem_cache.kvduo_vmm_backing import VMMBacking
+from sglang.srt.mem_cache.kvduo_shared_hbm import SharedHBMBlocks
 
 
 class Backend:
@@ -41,7 +41,7 @@ def populate(pool, addresses):
 
 def setup_pool(blocks=3):
     backend = Backend()
-    return backend, VMMBacking(backend, block_bytes=64, budget_bytes=blocks * 64)
+    return backend, SharedHBMBlocks(backend, block_bytes=64, budget_bytes=blocks * 64)
 
 
 def test_exchange_and_return_without_extra_physical_memory():

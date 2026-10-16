@@ -11,28 +11,28 @@ class TestKVDuoConfig(unittest.TestCase):
         self.assertEqual(config.tail_protected_pages, 2)
         self.assertEqual(config.full_reclaim_policy, "request")
         self.assertFalse(config.decode_emergency_reclaim)
-        self.assertEqual(config.logical_capacity_ratio, 1)
-        self.assertTrue(config.elastic_history)
-        self.assertEqual(config.history_growth_chunk_mb, 128)
+        self.assertTrue(config.shared_hbm)
+        self.assertEqual(config.hbm_borrow_chunk_mb, 128)
 
-    def test_elastic_history_explicit_disable(self):
+    def test_shared_hbm_explicit_disable(self):
         config = parse_kvduo_config(
-            SimpleNamespace(kvduo_config='{"elastic_history":false}')
+            SimpleNamespace(kvduo_config='{"shared_hbm":false}')
         )
-        self.assertFalse(config.elastic_history)
+        self.assertFalse(config.shared_hbm)
 
-    def test_elastic_history_config(self):
+    def test_shared_hbm_config(self):
         config = parse_kvduo_config(
             SimpleNamespace(
-                kvduo_config='{"elastic_history":true,"history_growth_chunk_mb":256}'
+                kvduo_config='{"shared_hbm":true,"hbm_borrow_chunk_mb":256}'
             )
         )
-        self.assertTrue(config.elastic_history)
-        self.assertEqual(config.history_growth_chunk_mb, 256)
+        self.assertTrue(config.shared_hbm)
+        self.assertEqual(config.hbm_borrow_chunk_mb, 256)
         for raw in (
-            '{"elastic_history":1}',
-            '{"history_growth_chunk_mb":0}',
-            '{"history_growth_chunk_mb":true}',
+            '{"shared_hbm":1}',
+            '{"hbm_borrow_chunk_mb":0}',
+            '{"hbm_borrow_chunk_mb":true}',
+            '{"shared_hbm":true,"full_reclaim_policy":"page"}',
         ):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 parse_kvduo_config(SimpleNamespace(kvduo_config=raw))
@@ -59,7 +59,7 @@ class TestKVDuoConfig(unittest.TestCase):
             with self.subTest(policy=policy):
                 config = parse_kvduo_config(
                     SimpleNamespace(
-                        kvduo_config=f'{{"full_reclaim_policy": "{policy}", "elastic_history": false}}'
+                        kvduo_config=f'{{"full_reclaim_policy": "{policy}", "shared_hbm": false}}'
                     )
                 )
                 self.assertEqual(config.full_reclaim_policy, policy)
