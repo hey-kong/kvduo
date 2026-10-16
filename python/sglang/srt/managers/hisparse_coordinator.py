@@ -3,6 +3,7 @@
 import hashlib
 import logging
 from contextlib import contextmanager
+from time import perf_counter
 from typing import List, NamedTuple, Sequence, Union
 
 import torch
@@ -1828,6 +1829,7 @@ class HiSparseCoordinator:
         logical = self.token_to_kv_pool_allocator.logical_attn_allocator
         if self._kvduo_common_available(logical.full_available_size()) >= tokens:
             return 0
+        started = perf_counter()
         page = self.page_size * self.compress_ratio
         kwargs = dict(
             required_free_pages=(tokens + page - 1) // page,
@@ -1841,10 +1843,11 @@ class HiSparseCoordinator:
             borrowed += layout.grow(**kwargs, minimum_only=True)
         if borrowed:
             logger.info(
-                "KVDuo FULL/history capacity loan: physical_blocks=%d, logical_pages=%d, mapped_bytes=%d",
+                "KVDuo FULL/history capacity loan: physical_blocks=%d, logical_pages=%d, mapped_bytes=%d, elapsed_ms=%.3f",
                 borrowed,
                 layout.current_pages,
                 layout.backing.allocated_bytes,
+                (perf_counter() - started) * 1000,
             )
         return borrowed
 
@@ -4046,6 +4049,7 @@ class HiSparseCoordinator:
         """
         if not self.enable_mixed_residency or num_tokens <= 0:
             return 0
+        started = perf_counter()
         if self.decode_producer_stream is not None:
             device_module.current_stream(self.device).wait_stream(
                 self.decode_producer_stream
@@ -4330,10 +4334,11 @@ class HiSparseCoordinator:
         elif request_policy:
             logger.info(
                 "KVDuo FULL request reclaim completed: requests=%d, "
-                "released_physical_blocks=%d, physical_block_tokens=%d",
+                "released_physical_blocks=%d, physical_block_tokens=%d, elapsed_ms=%.3f",
                 len(first_holes),
                 len(selected),
                 self.page_size,
+                (perf_counter() - started) * 1000,
             )
         return len(selected) * self.page_size
 
