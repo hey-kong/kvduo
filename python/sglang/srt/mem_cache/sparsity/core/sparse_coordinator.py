@@ -79,7 +79,7 @@ class KVDuoConfig:
     tail_protected_pages: int = 2
     full_reclaim_policy: str = "request"
     decode_emergency_reclaim: bool = False
-    shared_hbm: bool = False
+    shared_hbm: bool = True
     hbm_borrow_chunk_mb: int = 128
 
 

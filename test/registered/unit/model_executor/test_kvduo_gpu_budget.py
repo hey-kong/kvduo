@@ -184,7 +184,7 @@ def test_generic_planning_preserves_distinct_physical_and_logical_sizes(logical_
     kvc.model_config.hf_config.get_text_config = lambda: kvc.model_config.hf_config
     kvc.server_args.enable_kvduo = kvc.server_args.enable_hisparse = True
     kvc.server_args.kvduo_config = json.dumps(
-        {"logical_capacity_tokens": logical_tokens}
+        {"logical_capacity_tokens": logical_tokens, "shared_hbm": False}
     )
     kvc.server_args.hisparse_config = '{"host_to_device_ratio":2}'
     kvc.server_args.dsa_prefill_backend = kvc.server_args.dsa_decode_backend = (

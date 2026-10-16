@@ -158,7 +158,7 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
     top_k = values.get("top_k", DEFAULT_TOP_K)
     logical_ratio = values.get("logical_capacity_ratio", 2)
     logical_tokens = values.get("logical_capacity_tokens", 0)
-    shared_hbm = values.get("shared_hbm", False)
+    shared_hbm = values.get("shared_hbm", True)
     if not isinstance(shared_hbm, bool):
         raise ValueError("shared_hbm must be a boolean")
     borrow_chunk = values.get("hbm_borrow_chunk_mb", 128)

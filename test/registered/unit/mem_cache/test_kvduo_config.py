@@ -11,8 +11,14 @@ class TestKVDuoConfig(unittest.TestCase):
         self.assertEqual(config.tail_protected_pages, 2)
         self.assertEqual(config.full_reclaim_policy, "request")
         self.assertFalse(config.decode_emergency_reclaim)
-        self.assertFalse(config.shared_hbm)
+        self.assertTrue(config.shared_hbm)
         self.assertEqual(config.hbm_borrow_chunk_mb, 128)
+
+    def test_shared_hbm_explicit_disable(self):
+        config = parse_kvduo_config(
+            SimpleNamespace(kvduo_config='{"shared_hbm":false}')
+        )
+        self.assertFalse(config.shared_hbm)
 
     def test_shared_hbm_config(self):
         config = parse_kvduo_config(
@@ -53,7 +59,7 @@ class TestKVDuoConfig(unittest.TestCase):
             with self.subTest(policy=policy):
                 config = parse_kvduo_config(
                     SimpleNamespace(
-                        kvduo_config=f'{{"full_reclaim_policy": "{policy}"}}'
+                        kvduo_config=f'{{"full_reclaim_policy": "{policy}", "shared_hbm": false}}'
                     )
                 )
                 self.assertEqual(config.full_reclaim_policy, policy)
