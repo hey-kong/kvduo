@@ -1693,6 +1693,24 @@ class HiSparseCoordinator:
             if self._kvduo_common_available(evicted.num_tokens_evicted) <= 0:
                 break
 
+    def _reclaim_kvduo_radix_history(self, tokens, tree_cache):
+        """Recover committed history slots before lending physical backing."""
+        logical = self.token_to_kv_pool_allocator.logical_attn_allocator
+        available = self._kvduo_common_available(logical.full_available_size())
+        if tree_cache is None:
+            return available
+        while available < tokens:
+            evictable = self._kvduo_common_available(tree_cache.full_evictable_size())
+            if evictable <= 0:
+                break
+            self._wait_kvduo_hot_merge_boundary()
+            tree_cache.evict(EvictParams(num_tokens=min(tokens - available, evictable)))
+            after = self._kvduo_common_available(logical.full_available_size())
+            if after <= available:
+                break
+            available = after
+        return available
+
     @contextmanager
     def kvduo_decode_reservation_scope(self, requests, *, consume=True):
         # Admission only borrows credit; actual decode allocation consumes it.
@@ -1763,37 +1781,45 @@ class HiSparseCoordinator:
             > layout.maximum_pages - layout.current_pages
         ):
             return
-        protected = (
-            (tokens + page - 1) // page
-            + self._kvduo_mandatory_hot_pages()
-            + self._kvduo_reserved_prefill_pages()
-        )
-        self._borrow_kvduo_history(tokens, protected)
-        if self._kvduo_common_available(logical.full_available_size()) >= tokens:
-            return
-        self.reclaim_kvduo_full_pages(
-            max(self.page_size, tokens // self.compress_ratio),
-            reserve_hot_minimum=True,
-        )
-        protected = (
-            (tokens + page - 1) // page
-            + self._kvduo_mandatory_hot_pages()
-            + self._kvduo_reserved_prefill_pages()
-        )
-        self._borrow_kvduo_history(tokens, protected)
-        available = self._kvduo_common_available(logical.full_available_size())
-        if available < tokens:
-            donors = layout.minimum_donor_pages(
-                (tokens + page - 1) // page, available // page
+
+        def protected_pages():
+            return (
+                required_pages
+                + self._kvduo_mandatory_hot_pages()
+                + self._kvduo_reserved_prefill_pages()
             )
+
+        def reclaim_shortfall(available):
+            donors = layout.minimum_donor_pages(required_pages, available // page)
             physical = self.token_to_kv_pool_allocator.hisparse_attn_allocator
             free = self._kvduo_common_available(
                 physical.available_size() // self.page_size
             )
-            shortage = max(0, protected + donors - free)
-            if self._kvduo_consensus((shortage,)) and shortage:
-                self.reclaim_kvduo_hot_pages(shortage * self.page_size)
-                self._borrow_kvduo_history(tokens, protected)
+            # Use a common target even if mapping alignment/idle blocks differ
+            # across ranks. Failed borrowing with enough bytes can still require
+            # another FULL request to supply a contiguous donor block.
+            shortage = max(1, protected_pages() + donors - free)
+            return -self._kvduo_common_available(-shortage)
+
+        self._borrow_kvduo_history(tokens, protected_pages())
+        while True:
+            available = self._kvduo_common_available(logical.full_available_size())
+            if available >= tokens:
+                return
+            shortage = reclaim_shortfall(available)
+            released = self.reclaim_kvduo_full_pages(
+                shortage * self.page_size,
+                reserve_hot_minimum=True,
+            )
+            if self._kvduo_common_available(released) <= 0:
+                break
+            # Demotion can create additional mandatory HOT obligations.
+            self._borrow_kvduo_history(tokens, protected_pages())
+
+        # Only exhausted/unreclaimable FULL candidates allow HOT shrinking.
+        shortage = reclaim_shortfall(available)
+        self.reclaim_kvduo_hot_pages(shortage * self.page_size)
+        self._borrow_kvduo_history(tokens, protected_pages())
 
     def _borrow_kvduo_history(self, tokens, protected_pages):
         layout = getattr(self, "_kvduo_shared_layout", None)
@@ -3375,13 +3401,15 @@ class HiSparseCoordinator:
         if not self._kvduo_consensus((ready, required)) or not ready:
             return None
         if getattr(self, "_kvduo_shared_layout", None) is not None and history_tokens:
-            self._borrow_kvduo_history(history_tokens, required)
-            logical = self.token_to_kv_pool_allocator.logical_attn_allocator
-            if (
-                self._kvduo_common_available(logical.full_available_size())
-                < history_tokens
-            ):
-                return None
+            available = self._reclaim_kvduo_radix_history(history_tokens, tree_cache)
+            if available < history_tokens:
+                self._borrow_kvduo_history(history_tokens, required)
+                logical = self.token_to_kv_pool_allocator.logical_attn_allocator
+                if (
+                    self._kvduo_common_available(logical.full_available_size())
+                    < history_tokens
+                ):
+                    return None
         token = self._kvduo_prefill_next_reservation
         self._kvduo_prefill_next_reservation += 1
         if prefill_key is not None:

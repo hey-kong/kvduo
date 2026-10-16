@@ -266,3 +266,136 @@ def test_first_chunk_does_not_borrow_backing_for_unexecuted_prompt():
     assert adder.can_run_list == [req]
     assert req.extend_range.length == 16
     layout.grow.assert_not_called()
+
+
+@pytest.mark.parametrize("progress", [True, False])
+def test_prefill_reclaims_committed_radix_history_before_borrow_at_virtual_limit(
+    progress,
+):
+    import torch
+    from test_kvduo_prefill_admission import (
+        actual_budget_adder_and_req,
+        ready_coordinator,
+    )
+
+    coordinator, physical = ready_coordinator()
+    physical.free_pages = 600
+    adder, _ = actual_budget_adder_and_req(coordinator, logical_size=6400)
+    coordinator.token_to_kv_pool_allocator = adder.token_to_kv_pool_allocator
+    logical = (
+        adder.token_to_kv_pool_allocator.logical_attn_allocator.full_attn_allocator
+    )
+    page = logical.page_size
+    allocated = logical.free_pages[100:400].clone()
+    logical.free_pages = logical.free_pages[:100]
+    assert len(allocated) == 300
+    layout = attach(coordinator, borrowed=0)
+    layout.maximum_pages = layout.current_pages = 400
+    adder.tree_cache.full_evictable_size.return_value = 300 * page
+
+    def evict(params):
+        assert params.num_tokens == 101 * page
+        if progress:
+            logical.free_pages = torch.cat((logical.free_pages, allocated[:101]))
+
+    adder.tree_cache.evict.side_effect = evict
+    token = coordinator._reserve_kvduo_prefill_physical(
+        1, history_tokens=201 * page, tree_cache=adder.tree_cache
+    )
+    assert (token is not None) == progress
+    adder.tree_cache.evict.assert_called_once()
+    assert physical.free_pages == 600
+    if progress:
+        layout.grow.assert_not_called()
+        assert logical.available_size() == 201 * page
+    else:
+        # A stale evictable count cannot cause an endless eviction loop.
+        assert layout.grow.call_count == 2
+        assert logical.available_size() == 100 * page
+
+
+@pytest.mark.parametrize("per_request_pages", [2, 6])
+def test_decode_reclaim_includes_donors_and_retries_full_before_hot(per_request_pages):
+    batch, physical = make_decode_batch([256], logical_size=0, free_pages=0)
+    coordinator = batch.hisparse_coordinator
+    logical = coordinator.token_to_kv_pool_allocator.logical_attn_allocator
+    layout = attach(coordinator, borrowed=0)
+    layout.minimum_donor_pages = lambda *args: 5
+    targets = []
+
+    def reclaim(tokens, **kwargs):
+        targets.append(tokens // coordinator.page_size)
+        physical.free_pages += per_request_pages
+        return per_request_pages * coordinator.page_size
+
+    def grow(**kwargs):
+        if physical.free_pages >= kwargs["protected_full_pages"] + 5:
+            physical.free_pages -= 5
+            logical.full_available_size = lambda: 256
+            return 5
+        return 0
+
+    coordinator.reclaim_kvduo_full_pages.side_effect = reclaim
+    layout.grow.side_effect = grow
+    coordinator.ensure_kvduo_decode_history(256)
+    assert targets == ([6, 4, 2] if per_request_pages == 2 else [6])
+    assert physical.free_pages == 1
+    assert logical.full_available_size() == 256
+    coordinator.reclaim_kvduo_hot_pages.assert_not_called()
+
+
+def test_decode_retries_full_when_free_bytes_are_fragmented():
+    batch, physical = make_decode_batch([256], logical_size=0, free_pages=10)
+    coordinator = batch.hisparse_coordinator
+    logical = coordinator.token_to_kv_pool_allocator.logical_attn_allocator
+    layout = attach(coordinator, borrowed=0)
+    layout.minimum_donor_pages = lambda *args: 5
+    calls = []
+
+    def reclaim(tokens, **kwargs):
+        calls.append(tokens)
+        physical.free_pages += 1
+        return coordinator.page_size
+
+    def grow(**kwargs):
+        if len(calls) == 2:
+            logical.full_available_size = lambda: 256
+            return 5
+        return 0
+
+    coordinator.reclaim_kvduo_full_pages.side_effect = reclaim
+    layout.grow.side_effect = grow
+    coordinator.ensure_kvduo_decode_history(256)
+    assert calls == [coordinator.page_size, coordinator.page_size]
+    coordinator.reclaim_kvduo_hot_pages.assert_not_called()
+
+
+def test_decode_reclaim_recomputes_new_hot_minimum_before_next_loan():
+    batch, physical = make_decode_batch([256], logical_size=0, free_pages=0)
+    coordinator = batch.hisparse_coordinator
+    logical = coordinator.token_to_kv_pool_allocator.logical_attn_allocator
+    layout = attach(coordinator, borrowed=0)
+    layout.minimum_donor_pages = lambda *args: 5
+    coordinator._kvduo_mandatory_hot_pages = MagicMock(return_value=0)
+    targets = []
+
+    def reclaim(tokens, **kwargs):
+        targets.append(tokens // coordinator.page_size)
+        coordinator._kvduo_mandatory_hot_pages.return_value = 1
+        released = 6 if len(targets) == 1 else 1
+        physical.free_pages += released
+        return released * coordinator.page_size
+
+    def grow(**kwargs):
+        if physical.free_pages >= kwargs["protected_full_pages"] + 5:
+            logical.full_available_size = lambda: 256
+            physical.free_pages -= 5
+            return 5
+        return 0
+
+    coordinator.reclaim_kvduo_full_pages.side_effect = reclaim
+    layout.grow.side_effect = grow
+    coordinator.ensure_kvduo_decode_history(256)
+    assert targets == [6, 1]
+    assert physical.free_pages == 2  # One decode page and one new HOT minimum.
+    coordinator.reclaim_kvduo_hot_pages.assert_not_called()
