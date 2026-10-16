@@ -148,3 +148,63 @@ def test_frequency_plan_randomized(seed):
     assert all(freq[s] == 3 and tokens[s] >= 0 for s in plan.sources)
     assert all(tokens[d] < 0 or freq[d] != 3 for d in plan.destinations)
     assert unpack_frequency(pack_frequency(freq), len(freq)) == freq
+
+
+@pytest.mark.parametrize("state", ["minimum", "protected", "empty"])
+def test_hand_batches_ineligible_tp_scan(monkeypatch, state):
+    c, _ = make_coordinator(layers=21, requests=32)
+    c.tp_world_size = 4
+    c.tp_group = object()
+    if state == "empty":
+        c._kvduo_hot_request_order = []
+    for req in range(32):
+        for layer in range(21):
+            owner = (layer, req)
+            c._kvduo_req_layer_pages[owner] = [2] * (
+                c.min_hot_pages + (state == "protected")
+            )
+            c._kvduo_hot_generation[owner] = c._kvduo_request_generation[req]
+            if state == "protected":
+                c._kvduo_hot_pressure_protected.add((layer, req, 0))
+
+    def gather(values, value, **kwargs):
+        values[:] = [value] * 4
+
+    collective = MagicMock(side_effect=gather)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", collective)
+    c._merge_kvduo_hot_pages = MagicMock()
+    assert c.reclaim_kvduo_hot_pages(2) == 0
+    assert collective.call_count == 1
+    c._merge_kvduo_hot_pages.assert_not_called()
+
+
+def test_hand_batches_scan_but_retains_each_merge_consensus(monkeypatch):
+    c, _ = make_merge_coordinator({(0, 0): 2, (0, 1): 2})
+    c.tp_world_size = 4
+    c.tp_group = object()
+
+    def gather(values, value, **kwargs):
+        values[:] = [value] * 4
+
+    collective = MagicMock(side_effect=gather)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", collective)
+    # First rotation ages both objects without releasing pages; the second
+    # releases one page from the first object and stops at the original Hand.
+    assert c.reclaim_kvduo_hot_pages(2) == 2
+    assert collective.call_count == 4  # One snapshot plus three merge plans.
+    assert c._kvduo_hand == 1
+
+
+def test_hand_snapshot_disagreement_does_not_mutate_or_merge(monkeypatch):
+    c, _ = make_merge_coordinator({(0, 0): 2})
+    c.tp_world_size = 2
+    c.tp_group = object()
+
+    def gather(values, value, **kwargs):
+        values[:] = [value, (0, 0, 1, ())]  # Other rank has no candidates.
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    c._merge_kvduo_hot_pages = MagicMock()
+    assert c.reclaim_kvduo_hot_pages(2) == 0
+    c._merge_kvduo_hot_pages.assert_not_called()
+    assert c._kvduo_hand == 0

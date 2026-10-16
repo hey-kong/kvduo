@@ -2752,7 +2752,23 @@ class HiSparseCoordinator:
             for req in self._kvduo_hot_request_order
             for layer in range(layers)
         ]
-        if not owners:
+        hand = self._kvduo_hand % len(owners) if owners else 0
+        eligible = [self._kvduo_can_merge(owner) for owner in owners]
+        # Agree once on the complete scan, including empty/ineligible ranks.
+        # No request lifecycle or decode updates interleave at this boundary.
+        snapshot = tuple(
+            (
+                owner,
+                self._kvduo_request_generation[owner[1]],
+                len(self._kvduo_req_layer_pages.get(owner, ())),
+                can_merge,
+            )
+            for owner, can_merge in zip(owners, eligible)
+        )
+        if not self._kvduo_consensus((hand, target, self.min_hot_pages, snapshot)):
+            return 0
+        candidate_count = sum(eligible)
+        if not candidate_count:
             return 0
         # No decode interleaves: a first rotation decays threes to ones; the
         # second can reduce every eligible object to its minimum. Further
@@ -2760,14 +2776,18 @@ class HiSparseCoordinator:
         reclaimed = 0
         for _ in range(2 * len(owners)):
             self._kvduo_hand %= len(owners)
-            owner = owners[self._kvduo_hand]
-            self._kvduo_hand = (self._kvduo_hand + 1) % len(owners)
-            eligible = self._kvduo_can_merge(owner)
-            if not self._kvduo_consensus((owner, eligible)):
-                return reclaimed
-            if eligible:
+            index = self._kvduo_hand
+            owner = owners[index]
+            self._kvduo_hand = (index + 1) % len(owners)
+            if eligible[index]:
                 reclaimed += self._merge_kvduo_hot_pages(*owner)
-            if allocator.available_size() >= target:
+                # Merge retains its TP plan check; agreed capacity changes are
+                # the only eligibility changes possible during this scan.
+                eligible[index] = (
+                    len(self._kvduo_req_layer_pages[owner]) > self.min_hot_pages
+                )
+                candidate_count -= not eligible[index]
+            if allocator.available_size() >= target or not candidate_count:
                 break
         return reclaimed
 

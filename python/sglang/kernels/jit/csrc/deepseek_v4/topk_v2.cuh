@@ -9,7 +9,6 @@
  * DarkSharpness never took a detailed look at these 2 implementation, but his claude code did.
  * So we add credit to the reference implementations.
  */
-#include <sgl_kernel/kvduo_cache_observation.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
