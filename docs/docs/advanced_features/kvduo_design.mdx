@@ -147,6 +147,8 @@ python3 -m sglang.launch_server \
 | `swap_in_block_size` | `960` | Resolver CUDA block 线程数，须为 32 的倍数且不超过设备上限，通常为 32–1024 |
 | `tail_protected_pages` | `2` | 每请求保护的最新 FULL 页数 |
 | `full_reclaim_policy` | `"request"` | `"request"` 按请求批量释放全部合格 FULL 页；`"page"` 按页 LRU 回收 |
+| `shared_hbm` | `false` | 实验性 CUDA DeepSeek-V4 FULL/HOT 与 indexer/C128 后备共享 |
+| `hbm_borrow_chunk_mb` | `128` | 每次借用的历史后备容量目标，单位 MiB，须为正整数 |
 | `decode_emergency_reclaim` | `false` | 兼容旧配置；频次 Hand 不再区分普通与应急缩容权限 |
 
 `top_k`、`logical_capacity_ratio`、`swap_in_block_size` 和 `tail_protected_pages` 须为正整数，`logical_capacity_tokens` 须为非负整数，`host_size` 须为有限非负数，回收策略只接受 `"request"` 或 `"page"`，应急开关须为布尔值；未知字段报错。`--kvduo-config` 必须配合 `--enable-kvduo`。旧 `max_relative_miss_increase` 字段已移除。
@@ -155,4 +157,15 @@ KVDuo 要求 RadixTree，不能与 HiSparse、HiCache 或 speculative decoding �
 
 KVDuo 的 `--swa-full-tokens-ratio` 默认值沿用对应模型，不再减半；DeepSeek-V4 为 `0.1`。显式设置仍优先。
 
-`host_size` 覆盖主 KV、indexer、C128、SWA 和前缀恢复所需压缩状态的 Host 数据池；固定预算按页向下对齐，不包括控制元数据和临时搬运缓冲区。它不决定 HBM 分池或 logical 容量。KVDuo 以普通路径的物理缓存容量为目标，先确定独立的 logical 目标，再核算配套 indexer、映射和历史状态开销；DeepSeek-V4 的 SWA 按物理容量规划，不随 logical 超配扩大。`mem_fraction_static` 提供基础预算，KVDuo 允许额外使用运行余量中超过现有 activation、CUDA Graph 和 DeepEP 预留估计的部分；余量不足时降低物理容量，保持 logical 目标不变；目标的实际后备与至少一页物理存储都无法容纳时启动报错，不静默缩小 logical 或跳过预算检查。逻辑张量在启动时分配，运行中地址和形状保持固定；这不是无限地址或运行时动态扩容。扩大 logical 仍可能减少 FULL/HOT 空间，且不自动扩大 Host；准入继续检查各池实际容量。启动日志报告预算与容量，不能保证与普通路径容量完全相同。单请求所需主 KV 后备超过 Host 主池总容量时明确拒绝；仅因临时占用不足时等待。启动日志报告各 Host 池实际分配字节数。KVDuo 不再接受 `host_to_device_ratio`，旧命令需删除该字段并改用 `host_size`；HiSparse 的配置保持不变。
+`host_size` 覆盖主 KV、indexer、C128、SWA 和前缀恢复所需压缩状态的 Host 数据池；固定预算按页向下对齐，不包括控制元数据和临时搬运缓冲区。它不决定 HBM 分池或 logical 容量。默认未开启 `shared_hbm` 时，KVDuo 以普通路径的物理缓存容量为目标，先确定独立的 logical 目标，再核算配套 indexer、映射和历史状态开销；DeepSeek-V4 的 SWA 按物理容量规划，不随 logical 超配扩大。`mem_fraction_static` 提供基础预算，KVDuo 允许额外使用运行余量中超过现有 activation、CUDA Graph 和 DeepEP 预留估计的部分；余量不足时降低物理容量，保持 logical 目标不变；目标的实际后备与至少一页物理存储都无法容纳时启动报错，不静默缩小 logical 或跳过预算检查。逻辑张量在启动时分配，运行中地址和形状保持固定；这不是无限地址或运行时动态扩容。扩大 logical 仍可能减少 FULL/HOT 空间，且不自动扩大 Host；准入继续检查各池实际容量。启动日志报告预算与容量，不能保证与普通路径容量完全相同。单请求所需主 KV 后备超过 Host 主池总容量时明确拒绝；仅因临时占用不足时等待。启动日志报告各 Host 池实际分配字节数。KVDuo 不再接受 `host_to_device_ratio`，旧命令需删除该字段并改用 `host_size`；HiSparse 的配置保持不变。
+
+
+### 实验性动态 HBM 借还
+
+设置 `"shared_hbm": true` 后，indexer/C128 初始只提交与 FULL/HOT 物理容量匹配的后备。`logical_capacity_ratio`（至少按 2 计算）或显式 `logical_capacity_tokens` 决定固定虚拟地址上限，不再要求启动时提交全部历史后备；Host 预算保持原有规则。
+
+按请求回收 FULL 后，若等待的 prefill 缺少历史容量，则从空闲 FULL/HOT 后备借用，默认每次以 128 MiB 历史容量为目标，并按映射粒度对齐。借用保留 decode 必需空间、最低 HOT 和已有预留；decode 必需分配也可触发借用，大粒度放不下时尝试满足必需缺口。Prefill 仍检查所有内存池，不为借用主动回收活跃 FULL。
+
+整笔借用的逻辑页全部闲置后，按借用逆序归还后备。结束请求的闲置 GPU 前缀可以清理，Host 前缀副本继续保留；不移动仍在使用的 KV。张量地址、形状保持固定，实际映射更新在安全边界执行。碎片化可能阻止借用，即使总空闲字节数足够。
+
+该模式仅支持 CUDA DeepSeek-V4、PP=1、按请求 FULL 回收，不支持 P/D、speculative decoding、mixed-chunk 或 memory-saver。默认关闭；启用前须验证目标 GPU 上的 Graph replay、TP 借还一致性和性能。

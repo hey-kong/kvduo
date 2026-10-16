@@ -11,6 +11,25 @@ class TestKVDuoConfig(unittest.TestCase):
         self.assertEqual(config.tail_protected_pages, 2)
         self.assertEqual(config.full_reclaim_policy, "request")
         self.assertFalse(config.decode_emergency_reclaim)
+        self.assertFalse(config.shared_hbm)
+        self.assertEqual(config.hbm_borrow_chunk_mb, 128)
+
+    def test_shared_hbm_config(self):
+        config = parse_kvduo_config(
+            SimpleNamespace(
+                kvduo_config='{"shared_hbm":true,"hbm_borrow_chunk_mb":256}'
+            )
+        )
+        self.assertTrue(config.shared_hbm)
+        self.assertEqual(config.hbm_borrow_chunk_mb, 256)
+        for raw in (
+            '{"shared_hbm":1}',
+            '{"hbm_borrow_chunk_mb":0}',
+            '{"hbm_borrow_chunk_mb":true}',
+            '{"shared_hbm":true,"full_reclaim_policy":"page"}',
+        ):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                parse_kvduo_config(SimpleNamespace(kvduo_config=raw))
 
     def test_decode_emergency_reclaim_requires_boolean(self):
         for raw, expected in (("true", True), ("false", False)):

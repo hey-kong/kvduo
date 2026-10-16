@@ -103,7 +103,12 @@ class KvVmmArena:
     # Per-instance suffix source -> isolated allocator symbols/state (see _stub_source).
     _instance_count = 0
 
-    def __init__(self, device_id: int, reserve_bytes: int = _DEFAULT_RESERVE_BYTES):
+    def __init__(
+        self,
+        device_id: int,
+        reserve_bytes: int = _DEFAULT_RESERVE_BYTES,
+        allocation_alignment: int | None = None,
+    ):
         self.device_id = int(device_id)
         # Unique per (process, arena instance): the stub .so lives in a host-shared
         # tempdir, so co-located engine processes must not build the same-named .so
@@ -118,6 +123,12 @@ class KvVmmArena:
             self._prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
             self._prop.location.id = self.device_id
             self.granularity = query_granularity(self.device_id)
+            if allocation_alignment is not None:
+                if allocation_alignment % self.granularity:
+                    raise ValueError(
+                        "VMM alignment must be a multiple of CUDA granularity"
+                    )
+                self.granularity = allocation_alignment
             self._access = drv.CUmemAccessDesc()
             self._access.location.type = (
                 drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
@@ -368,9 +379,9 @@ class KvVmmBufferOwner:
             self.ensure_prefix(self.page_size)
 
         for t in self.tensors:
-            assert (
-                t.is_cuda and t.device.index == self.device_id
-            ), f"post-capture KV buffer landed on {t.device}, expected cuda:{self.device_id}"
+            assert t.is_cuda and t.device.index == self.device_id, (
+                f"post-capture KV buffer landed on {t.device}, expected cuda:{self.device_id}"
+            )
 
     # -- backing --------------------------------------------------------------
 

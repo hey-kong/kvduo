@@ -34,7 +34,6 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
-
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
@@ -443,7 +442,6 @@ class AddReqResult(Enum):
 
 
 class PrefillAdder:
-
     def __init__(
         self,
         page_size: int,
@@ -534,9 +532,7 @@ class PrefillAdder:
         # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
         self.rem_mamba_slots = None
         if self._mamba_slot_cost:
-            self.rem_mamba_slots = (
-                self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
-            )
+            self.rem_mamba_slots = self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
             if self.is_hybrid_ssm_cache:
                 self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
 
@@ -554,6 +550,9 @@ class PrefillAdder:
         self.waiting_queue_len = waiting_queue_len
         self.kvduo_coordinator = kvduo_coordinator
         self.kvduo_prefill_reservations = []
+        if getattr(kvduo_coordinator, "_kvduo_shared_layout", None) is not None:
+            kvduo_coordinator.maintain_kvduo_shared_backing()
+            kvduo_coordinator.note_kvduo_history_shortage(0, 0)
 
     def _kvduo_prefill_enabled(self) -> bool:
         coordinator = getattr(self, "kvduo_coordinator", None)
@@ -951,6 +950,21 @@ class PrefillAdder:
                 if self.is_hybrid_swa or self._kvduo_prefill_enabled():
                     if self._kvduo_prefill_enabled():
                         self.kvduo_prefill_blocked = True
+                        if (
+                            getattr(
+                                self.kvduo_coordinator, "_kvduo_shared_layout", None
+                            )
+                            is not None
+                        ):
+                            chunk = min(
+                                self.rem_chunk_tokens,
+                                len(req.full_untruncated_fill_ids)
+                                - len(req.prefix_indices),
+                            )
+                            self.kvduo_coordinator.note_kvduo_history_shortage(
+                                chunk + self.rem_total_token_offset + self.page_size,
+                                chunk + self.page_size,
+                            )
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 
@@ -1175,6 +1189,19 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
+            if (
+                self._kvduo_prefill_enabled()
+                and getattr(self.kvduo_coordinator, "_kvduo_shared_layout", None)
+                is not None
+            ):
+                self.kvduo_coordinator.note_kvduo_history_shortage(
+                    total_tokens + self.rem_total_token_offset + 1,
+                    min(
+                        cand_extend_input_len,
+                        self.rem_chunk_tokens or cand_extend_input_len,
+                    )
+                    + self.page_size,
+                )
             return AddReqResult.NO_TOKEN
         if self._kvduo_scheduler_physical_blocked(req, total_tokens):
             return AddReqResult.OTHER
@@ -1242,9 +1269,9 @@ class PrefillAdder:
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
-                assert (
-                    truncation_align_size is None
-                ), "truncation_align_size is not supported for dllm prefill"
+                assert truncation_align_size is None, (
+                    "truncation_align_size is not supported for dllm prefill"
+                )
 
             # Negotiate only after every KV-budget gate and before load-back.
             if (self.prefill_delayer_single_pass is not None) and (

@@ -1,7 +1,6 @@
 import weakref
 
 import torch
-
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -179,9 +178,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extra_indices = self.hisparse_attn_allocator.alloc(
                 need_size - len(hisparse_indices)
             )
-            assert (
-                extra_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer"
+            assert extra_indices is not None, (
+                "Hisparse allocation failed in alloc_device_buffer"
+            )
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
         return buffer_indices
 
@@ -239,9 +238,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             len(logical_indices),
             num_new_pages=num_new_pages,
         )
-        assert (
-            hisparse_indices is not None
-        ), "Hisparse allocation failed in alloc_extend"
+        assert hisparse_indices is not None, (
+            "Hisparse allocation failed in alloc_extend"
+        )
         self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
         return logical_indices
 
@@ -331,7 +330,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
-
     def __init__(
         self,
         logical_attn_allocator: BaseTokenToKVPoolAllocator,
@@ -387,6 +385,12 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.hisparse_kvcache.register_mapping(
             weakref.proxy(self.full_to_hisparse_device_index_mapping)
         )
+        self.kvduo_shared_layout = getattr(self._kvcache, "kvduo_shared_layout", None)
+        if self.kvduo_shared_layout is not None:
+            self.kvduo_shared_layout.bind(
+                self.logical_attn_allocator.full_attn_allocator,
+                self.hisparse_attn_allocator,
+            )
 
     @property
     def size_full(self) -> int:
@@ -554,9 +558,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extra_indices = self.hisparse_attn_allocator.alloc(
                 need_size - len(hisparse_indices)
             )
-            assert (
-                extra_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer"
+            assert extra_indices is not None, (
+                "Hisparse allocation failed in alloc_device_buffer"
+            )
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
         return buffer_indices
 
@@ -624,9 +628,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             hisparse_last_loc,
             len(compressed_logical_indices),
         )
-        assert (
-            hisparse_indices is not None
-        ), "Hisparse allocation failed in alloc_extend"
+        assert hisparse_indices is not None, (
+            "Hisparse allocation failed in alloc_extend"
+        )
 
         self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
             hisparse_indices.to(torch.int64)
@@ -786,6 +790,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         self.logical_attn_allocator.clear()
         self.hisparse_attn_allocator.clear()
+
+        shared = getattr(self, "kvduo_shared_layout", None)
+        if shared is not None:
+            shared.reset_free_lists()
 
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True

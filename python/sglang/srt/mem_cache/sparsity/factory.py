@@ -148,6 +148,8 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         "tail_protected_pages",
         "full_reclaim_policy",
         "decode_emergency_reclaim",
+        "shared_hbm",
+        "hbm_borrow_chunk_mb",
     }
     unknown = set(values) - known
     if unknown:
@@ -156,6 +158,10 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
     top_k = values.get("top_k", DEFAULT_TOP_K)
     logical_ratio = values.get("logical_capacity_ratio", 2)
     logical_tokens = values.get("logical_capacity_tokens", 0)
+    shared_hbm = values.get("shared_hbm", False)
+    if not isinstance(shared_hbm, bool):
+        raise ValueError("shared_hbm must be a boolean")
+    borrow_chunk = values.get("hbm_borrow_chunk_mb", 128)
     if (
         isinstance(logical_tokens, bool)
         or not isinstance(logical_tokens, int)
@@ -173,6 +179,7 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
     block_size = values.get("swap_in_block_size", DEFAULT_SWAP_IN_BLOCK_SIZE)
     tail_pages = values.get("tail_protected_pages", DEFAULT_TAIL_PROTECTED_PAGES)
     fields = {
+        "hbm_borrow_chunk_mb": borrow_chunk,
         "logical_capacity_ratio": logical_ratio,
         "top_k": top_k,
         "swap_in_block_size": block_size,
@@ -194,6 +201,8 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         "page",
     ):
         raise ValueError("full_reclaim_policy must be 'request' or 'page'")
+    if shared_hbm and full_reclaim_policy != "request":
+        raise ValueError("shared_hbm requires full_reclaim_policy='request'")
     decode_emergency_reclaim = values.get("decode_emergency_reclaim", False)
     if not isinstance(decode_emergency_reclaim, bool):
         raise ValueError("decode_emergency_reclaim must be a boolean")
@@ -206,6 +215,8 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         tail_protected_pages=tail_pages,
         full_reclaim_policy=full_reclaim_policy,
         decode_emergency_reclaim=decode_emergency_reclaim,
+        shared_hbm=shared_hbm,
+        hbm_borrow_chunk_mb=borrow_chunk,
     )
 
 

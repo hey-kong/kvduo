@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
-
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
@@ -142,6 +141,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             self._kvduo_ratio = parse_kvduo_config(
                 kvc.server_args
             ).logical_capacity_ratio
+            if parse_kvduo_config(kvc.server_args).shared_hbm:
+                raise ValueError("shared_hbm currently supports CUDA DeepSeek-V4 only")
             self._kvduo_logical_target = parse_kvduo_config(
                 kvc.server_args
             ).logical_capacity_tokens
@@ -416,9 +417,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._full_layers_num = len(model_config.full_attention_layer_ids)
         self._swa_layers_num = len(model_config.swa_attention_layer_ids)
-        assert (
-            self._swa_layers_num > 0
-        ), "Hybrid SWA model must have at least one SWA layer"
+        assert self._swa_layers_num > 0, (
+            "Hybrid SWA model must have at least one SWA layer"
+        )
 
         self._swa_full_tokens_ratio = kvc.server_args.swa_full_tokens_ratio
         self._sliding_window_size = kvc.sliding_window_size
@@ -751,6 +752,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 kvc.server_args
             ).logical_capacity_tokens
             self._kvduo_ratio = self.c4_shrink_factor
+            self._kvduo_shared_hbm = parse_kvduo_config(kvc.server_args).shared_hbm
+            if self._kvduo_shared_hbm and (
+                self.is_speculative
+                or self.disaggregation_mode != "null"
+                or kvc.ps.pp_size != 1
+                or getattr(kvc.server_args, "enable_mixed_chunk", False)
+            ):
+                raise ValueError(
+                    "shared_hbm requires non-speculative, non-P/D DeepSeek-V4 with PP=1 and mixed-chunk disabled"
+                )
             self._kvduo_extra_budget = getattr(kvc, "kvduo_extra_budget_bytes", 0)
             old = self.c4_shrink_factor
             self.c4_shrink_factor = 1
@@ -934,9 +945,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
 
         if self.requested_max_running_requests_per_worker is not None:
             c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
@@ -961,6 +972,41 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 plan_gpu_budget,
             )
 
+            if getattr(self, "_kvduo_shared_hbm", False):
+                # One-times history is committed initially. The larger logical
+                # ceiling reserves VA/metadata, not indexer/C128 payload.
+                # Reserve worst-case VMM rounding at both ends of each layer.
+                rounding = (self.num_layers_ca4 * 2 + self.num_layers_ca128) * (4 << 20)
+                ratio = max(2, self._kvduo_ratio)
+                metadata = self._kvduo_logical_target * LOGICAL_METADATA_BYTES
+                c4_row = ceil_div((page_size // 4) * 584, 576) * 576
+                c128_row = ceil_div((page_size // 128) * 584, 576) * 576
+                swa_row = ceil_div(self.swa_page_size * 584, 576) * 576
+                padding = (
+                    (c4_row / page_size - 584 / 4) * self.num_layers_ca4
+                    + (c128_row / page_size - 584 / 128) * self.num_layers_ca128
+                    + (swa_row / self.swa_page_size - 584)
+                    * self.swa_ratio
+                    * self.num_layers_total
+                )
+                per_token = (
+                    self._kvduo_baseline_bytes
+                    + padding
+                    + ratio * LOGICAL_METADATA_BYTES
+                )
+                physical = int(
+                    max(0, available_bytes_for_tokens - rounding - metadata)
+                    // per_token
+                )
+                physical = physical // page_size * page_size
+                logical = self._kvduo_logical_target or physical * ratio
+                logical = (logical + page_size - 1) // page_size * page_size
+                if physical <= 0 or logical < physical:
+                    raise ValueError(
+                        "shared HBM budget cannot fit initial backing and logical metadata"
+                    )
+                self._kvduo_profiled_physical = physical
+                return self._to_config(self._kvduo_sizes(physical, logical, page_size))
             plan = plan_gpu_budget(
                 available_bytes_for_tokens,
                 self._kvduo_extra_budget,
@@ -997,9 +1043,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
         if self._kvduo_ratio is not None:
             physical = min(
                 getattr(

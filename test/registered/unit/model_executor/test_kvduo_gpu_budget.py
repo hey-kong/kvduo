@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-
 from sglang.srt.mem_cache.sparsity.core.kvduo_gpu_budget import plan_gpu_budget
 from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 from sglang.srt.server_args import ServerArgs
@@ -16,7 +15,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def dsv4(*, kvduo=True, ratio=2, extra=0, logical_tokens=0):
+def dsv4(*, kvduo=True, ratio=2, extra=0, logical_tokens=0, shared=False):
     args = ServerArgs(
         model_path="dummy",
         enable_kvduo=kvduo,
@@ -25,6 +24,7 @@ def dsv4(*, kvduo=True, ratio=2, extra=0, logical_tokens=0):
                 {
                     "logical_capacity_ratio": ratio,
                     "logical_capacity_tokens": logical_tokens,
+                    "shared_hbm": shared,
                 }
             )
             if kvduo
@@ -51,6 +51,23 @@ def dsv4(*, kvduo=True, ratio=2, extra=0, logical_tokens=0):
         ps=SimpleNamespace(pp_size=1, attn_dp_size=1),
     )
     return DSV4PoolConfigurator(kvc)
+
+
+def test_shared_backing_commits_one_times_history_with_larger_address_ceiling():
+    planner = dsv4(shared=True)
+    config = planner.calculate_pool_sizes(1 << 30, 256)
+    physical = config.c4_max_total_num_tokens * 4
+    assert physical > 0
+    assert config.full_max_total_num_tokens == physical * 2
+    assert config.c128_max_total_num_tokens * 128 == physical * 2
+    assert config.swa_max_total_num_tokens == int(physical * 0.1) // 256 * 256
+    capped = planner.calculate_pool_sizes_from_max_tokens(physical, 256)
+    assert capped.c4_max_total_num_tokens * 4 == physical
+
+
+def test_shared_explicit_ceiling_must_cover_initial_pool():
+    with pytest.raises(ValueError, match="logical metadata"):
+        dsv4(shared=True, logical_tokens=256).calculate_pool_sizes(1 << 30, 256)
 
 
 def test_extra_headroom_preserves_physical_baseline():
@@ -153,10 +170,10 @@ def test_profile_only_borrows_above_runtime_headroom(
 
 @pytest.mark.parametrize("logical_tokens", [0, 1000])
 def test_generic_planning_preserves_distinct_physical_and_logical_sizes(logical_tokens):
-    from test_pool_configurator import _make_model_runner, mock_cpu_env
-    from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
     from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+    from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+    from test_pool_configurator import _make_model_runner, mock_cpu_env
 
     kvc = _make_model_runner(use_mla_backend=True, num_layers=2)
     kvc.kv_cache_dtype = torch.bfloat16
@@ -249,9 +266,9 @@ def test_dsv4_absolute_logical_capacity_drives_all_history_pools():
 
 
 def test_generic_pp_synchronizes_independent_logical_capacity(monkeypatch):
-    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
     import sglang.srt.mem_cache.kv_cache_configurator as module
     import sglang.srt.model_executor.pool_configurator as planners
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
     config = planners.MemoryPoolConfig(
         max_total_num_tokens=64, kvduo_logical_tokens=256

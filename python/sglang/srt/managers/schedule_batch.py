@@ -64,7 +64,6 @@ from typing import (
 import msgspec
 import numpy as np
 import torch
-
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -2254,9 +2253,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert (
-            len(self.out_cache_loc) == self.extend_num_tokens
-        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        assert len(self.out_cache_loc) == self.extend_num_tokens, (
+            f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        )
 
         if self.extend_input_logprob_token_ids is not None:
             new_token_ids_parts = []
@@ -2768,6 +2767,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             logical = self.token_to_kv_pool_allocator.logical_attn_allocator
             evict_from_tree_cache(self.tree_cache, num_tokens, allocator=logical)
+            if (
+                getattr(self.hisparse_coordinator, "_kvduo_shared_layout", None)
+                is not None
+            ):
+                self.hisparse_coordinator.ensure_kvduo_decode_history(num_tokens)
             if logical.available_size() < num_tokens:
                 if selected_indices is None:
                     self.hisparse_coordinator.log_kvduo_decode_pressure(
