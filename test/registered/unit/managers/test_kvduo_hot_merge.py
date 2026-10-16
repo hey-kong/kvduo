@@ -208,3 +208,75 @@ def test_hand_snapshot_disagreement_does_not_mutate_or_merge(monkeypatch):
     assert c.reclaim_kvduo_hot_pages(2) == 0
     c._merge_kvduo_hot_pages.assert_not_called()
     assert c._kvduo_hand == 0
+
+
+def test_all_growth_applicants_can_donate_and_shrunk_event_is_cancelled():
+    c, p = make_merge_coordinator({(0, 0): 4, (0, 1): 4})
+    for b in c.kvduo_hot_buffers.values():
+        b.frequency.zero_()
+    c.kvduo_hot_growth_events.fill_(1)
+    c.prepare_kvduo_graph_replay(torch.tensor([0, 1]))
+    assert c.kvduo_req_hot_capacity.tolist() == [[4, 20]]
+    assert p.free_pages == 2
+    assert c._kvduo_hand == 1
+
+
+def test_growth_respects_actual_inflight_protection():
+    c, p = make_merge_coordinator({(0, 0): 4, (0, 1): 4})
+    c._kvduo_hot_pressure_protected = {(0, 0, 0), (0, 1, 0)}
+    c.kvduo_hot_growth_events.fill_(1)
+    c.prepare_kvduo_graph_replay(torch.tensor([0, 1]))
+    assert c.kvduo_req_hot_capacity.tolist() == [[16, 16]]
+    assert p.free_pages == 0
+
+
+def test_geometric_metadata_reuses_storage_and_clears_retried_suffix():
+    from sglang.srt.mem_cache.sparsity.core.kvduo_frequency import FrequencyBuffer
+
+    b = FrequencyBuffer.empty(torch.arange(16, dtype=torch.int32))
+    b.tokens.copy_(torch.arange(16, dtype=torch.int32))
+    b.frequency.copy_(pack_frequency([3] * 16))
+    grown = b.grown(torch.arange(16, 20, dtype=torch.int32))
+    assert grown._storage[0].numel() == 32
+    pointers = grown.pointers()
+    next_buffer = grown.grown(torch.arange(20, 24, dtype=torch.int32))
+    assert next_buffer.pointers() == pointers
+    assert next_buffer.tokens[:16].tolist() == list(range(16))
+    assert unpack_frequency(next_buffer.frequency, 24) == [3] * 16 + [0] * 8
+    # A rolled-back growth can leave stale data beyond the published capacity.
+    next_buffer.tokens[20:].fill_(99)
+    next_buffer.frequency.copy_(pack_frequency([3] * 24))
+    retried = grown.grown(torch.arange(40, 44, dtype=torch.int32))
+    assert retried.tokens[20:].tolist() == [-1] * 4
+    assert retried.locations[20:].tolist() == list(range(40, 44))
+    assert unpack_frequency(retried.frequency, 24) == [3] * 20 + [0] * 4
+
+
+def test_growth_publishes_all_owners_once_and_reuses_reserved_arrays(monkeypatch):
+    from sglang.srt.mem_cache.sparsity.core.kvduo_frequency import FrequencyBuffer
+
+    c, p = make_merge_coordinator(
+        {(l, r): 2 for l in range(2) for r in range(2)}, layers=2
+    )
+    p.free_pages = 16
+    publish = MagicMock(wraps=c._publish_kvduo_frequency_buffers)
+    c._publish_kvduo_frequency_buffers = publish
+    c._ensure_kvduo_hot_capacity_targets_batch(
+        {owner: 12 for owner in c.kvduo_hot_buffers}, allow_reclaim=False
+    )
+    assert publish.call_count == 1
+    assert len(publish.call_args.args[0]) == 4
+    pointers = {owner: b.pointers() for owner, b in c.kvduo_hot_buffers.items()}
+    monkeypatch.setattr(
+        FrequencyBuffer,
+        "empty",
+        MagicMock(side_effect=AssertionError("unnecessary metadata allocation")),
+    )
+    c._ensure_kvduo_hot_capacity_targets_batch(
+        {owner: 16 for owner in c.kvduo_hot_buffers}, allow_reclaim=False
+    )
+    assert publish.call_count == 2
+    for owner, b in c.kvduo_hot_buffers.items():
+        assert b.pointers() == pointers[owner]
+        assert c.kvduo_hot_pointers[owner].tolist() == b.pointers()
+        assert c.kvduo_req_hot_capacity_gpu[owner].item() == 16

@@ -563,7 +563,6 @@ class PrefillAdder:
         coordinator = getattr(self, "kvduo_coordinator", None)
         if not self._kvduo_prefill_enabled():
             return True, None
-        coordinator.protect_kvduo_prefill_plan(req, end)
         pages = coordinator.kvduo_prefill_pages(len(req.prefix_indices), end)
         token = coordinator.reserve_kvduo_prefill(
             pages,
@@ -642,8 +641,9 @@ class PrefillAdder:
         if self._kvduo_prefill_enabled():
             # KVDuo checks/reserves the exact physical pages only after the
             # logical/SWA gates and chunk plan. The composite's min(logical,
-            # physical * compression) would reject before HOT rollback can
-            # supply those pages. Keep actual allocator checks unchanged.
+            # physical * compression) would reject before the physical admission
+            # check can account for the selected chunk. Actual allocation still checks
+            # every pool.
             allocator = allocator.logical_attn_allocator
         if self.is_all_swa:
             return allocator.swa_available_size() + self.tree_cache.swa_evictable_size()
@@ -916,12 +916,6 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
-        if self._kvduo_prefill_enabled():
-            end = min(
-                len(req.full_untruncated_fill_ids),
-                len(req.prefix_indices) + max(0, self.rem_chunk_tokens),
-            )
-            self.kvduo_coordinator.protect_kvduo_prefill_plan(req, end)
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -1150,12 +1144,6 @@ class PrefillAdder:
         )
         prospective_prefix_len = len(req.prefix_indices) + req.host_hit_length
         chunk_tokens_limit = self.rem_chunk_tokens
-        if self._kvduo_prefill_enabled():
-            prefill_plan = self._plan_prefill_after_prefix(
-                req, prospective_prefix_len, chunk_tokens_limit, truncation_align_size
-            )
-            if prefill_plan is not None:
-                self.kvduo_coordinator.protect_kvduo_prefill_plan(req, prefill_plan[2])
 
         total_tokens = cand_extend_input_len + max_new + self.page_size
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
@@ -1227,8 +1215,6 @@ class PrefillAdder:
             if prefill_plan is None:
                 return AddReqResult.OTHER
             input_tokens, trunc_len, planned_end = prefill_plan
-            if self._kvduo_prefill_enabled():
-                self.kvduo_coordinator.protect_kvduo_prefill_plan(req, planned_end)
 
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:

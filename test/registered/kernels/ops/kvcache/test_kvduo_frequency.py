@@ -310,3 +310,38 @@ def test_parallel_victim_selection_matches_stable_frequency_order(block_size):
         assert c.kvduo_resolver_stats[0, 1].tolist() == [256, 512]
         assert c.kvduo_hot_growth_events[0, 1].item() == 1
         assert torch.equal(backing[output[1].long()].cpu(), host[256:768])
+
+
+def test_graph_replay_after_batched_publication_and_metadata_reuse():
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+    c, buffers, selected, requests, lengths, output, backing, host = fixture()
+    c.device = "cuda"
+    run = lambda: resolve(c, 0, requests, lengths, selected, output)
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    table_address = c.kvduo_hot_pointers.data_ptr()
+    first_pointers = None
+    for start in (3584, 3648):
+        buffers[1] = buffers[1].grown(
+            torch.arange(start, start + 64, dtype=torch.int32, device="cuda")
+        )
+        if first_pointers is None:
+            first_pointers = buffers[1].pointers()
+        else:
+            assert buffers[1].pointers() == first_pointers
+        HiSparseCoordinator._publish_kvduo_frequency_buffers(
+            c, [((0, r), b) for r, b in enumerate(buffers)]
+        )
+        buffers[1].tokens.fill_(-1)
+        buffers[1].frequency.zero_()
+        c.kvduo_resolver_stats.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert c.kvduo_hot_pointers.data_ptr() == table_address
+        assert c.kvduo_req_hot_capacity_gpu[0, 1].item() == buffers[1].tokens.numel()
+        assert c.kvduo_resolver_stats[0, 1].tolist() == [512, 512]
+        assert torch.equal(backing[output[1].long()].cpu(), host[512:])

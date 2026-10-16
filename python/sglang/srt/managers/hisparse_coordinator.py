@@ -2185,14 +2185,16 @@ class HiSparseCoordinator:
                 torch.arange(self.hot_storage_layers, device=self.device) * layer_stride
             )
             within = torch.arange(self.page_size, device=self.device)
+            all_locations = (
+                physical.view(-1, self.page_size)[:, 0, None, None]
+                + storage[None, :, None]
+                + within
+            ).flatten()
             for layer, req, current, target, grow in requests:
                 owner = (layer, req)
                 pages = starts[offset : offset + grow // K]
+                locations = all_locations[offset * K : (offset + len(pages)) * K]
                 offset += len(pages)
-                page_tensor = torch.tensor(pages, dtype=torch.int64, device=self.device)
-                locations = (
-                    page_tensor[:, None, None] + storage[None, :, None] + within
-                ).flatten()
                 old = self.kvduo_hot_buffers.get(owner)
                 if (old.tokens.numel() if old is not None else 0) != current:
                     raise RuntimeError("KVDuo HOT metadata/capacity mismatch")
@@ -2202,13 +2204,18 @@ class HiSparseCoordinator:
                     else FrequencyBuffer.empty(locations)
                 )
                 staged.append((owner, old, new, pages, current, target))
-            for owner, old, new, pages, current, target in staged:
-                published.append((owner, old, current))
-                self._publish_kvduo_frequency_buffer(owner, new)
+            published = [
+                (owner, old, current)
+                for owner, old, new, pages, current, target in staged
+            ]
+            self._publish_kvduo_frequency_buffers(
+                [(owner, new) for owner, _, new, *_ in staged]
+            )
             self._finish_kvduo_metadata_update()
         except Exception:
-            for owner, old, current in reversed(published):
-                self._publish_kvduo_frequency_buffer(owner, old)
+            self._publish_kvduo_frequency_buffers(
+                [(owner, old) for owner, old, _ in published]
+            )
             self._finish_kvduo_metadata_update()
             # Metadata is restored before returning any newly allocated page.
             if safe_to_free:
@@ -2221,6 +2228,28 @@ class HiSparseCoordinator:
             self._kvduo_hot_generation[owner] = self._kvduo_request_generation[owner[1]]
             for start in pages:
                 self._kvduo_hot_page_owners[start] = owner
+
+    def _publish_kvduo_frequency_buffers(self, updates):
+        if not updates:
+            return
+        requests = self.kvduo_hot_pointers.size(1)
+        packet = torch.tensor(
+            [
+                [
+                    layer * requests + req,
+                    buffer.tokens.numel() if buffer is not None else 0,
+                    *(buffer.pointers() if buffer is not None else [0] * 4),
+                ]
+                for (layer, req), buffer in updates
+            ],
+            dtype=torch.int64,
+            pin_memory=self.kvduo_hot_pointers.is_cuda,
+        ).to(self.device, non_blocking=True)
+        indices = packet[:, 0]
+        self.kvduo_hot_pointers.view(-1, 4).index_copy_(0, indices, packet[:, 2:])
+        self.kvduo_req_hot_capacity_gpu.view(-1).index_copy_(
+            0, indices, packet[:, 1].int()
+        )
 
     def _publish_kvduo_frequency_buffer(self, owner, buffer):
         pointers = buffer.pointers() if buffer is not None else [0] * 4
@@ -2554,15 +2583,9 @@ class HiSparseCoordinator:
             self._kvduo_pending_hot_minimum.difference_update(donors)
             shortfall = growth_shortfall()
             if shortfall > 0:
-                protected = self._kvduo_hot_pressure_protected
-                self._kvduo_hot_pressure_protected = protected | {
-                    (layer, req, self._kvduo_request_generation[req])
-                    for layer, req in applicants
-                }
-                try:
-                    self.reclaim_kvduo_hot_pages(shortfall * self.page_size)
-                finally:
-                    self._kvduo_hot_pressure_protected = protected
+                # Pending growth is not an in-flight use. Hand may shrink an
+                # applicant; the capacity check below then cancels its event.
+                self.reclaim_kvduo_hot_pages(shortfall * self.page_size)
             applicants = {
                 owner: pages
                 for owner, pages in applicants.items()
@@ -2827,6 +2850,7 @@ class HiSparseCoordinator:
         self._kvduo_hot_generation = {}
         self._kvduo_request_generation = [0] * requests
         self._kvduo_hot_tail_starts = {}
+        self._kvduo_released_full_offsets = {}
         self._kvduo_tail_retry_pages = {}
         self._kvduo_tail_cleanup_pending = {}
         self._kvduo_decode_order = {}
@@ -2835,6 +2859,7 @@ class HiSparseCoordinator:
         self._kvduo_prefill_next_reservation = 0
 
     def _reset_kvduo_prefill_request(self, req_idx: int) -> None:
+        self._kvduo_released_full_offsets.pop(req_idx, None)
         self._kvduo_hot_tail_starts.pop(req_idx, None)
         self._kvduo_tail_retry_pages.pop(req_idx, None)
         self._kvduo_tail_cleanup_pending.pop(req_idx, None)
@@ -3141,6 +3166,8 @@ class HiSparseCoordinator:
             prefill_req, prefill_key
         ):
             return None
+        if needs_host:
+            self.protect_kvduo_prefill_plan(prefill_req, execution_end)
         token = None
         future = self._kvduo_prefill_future_pages
         previous = future.pop(prefill_key, 0)
@@ -3882,19 +3909,15 @@ class HiSparseCoordinator:
                     protected_len = tree_len - length
                     prefix_transfers[req_idx] = (length, tree_len)
             allocated_len = req.kv.kv_allocated_len
-            if tail_cleanup:
-                compressed_len = self.host_token_len(allocated_len)
-                prefix_len = self.host_token_len(protected_len)
-            else:
-                compressed = self.mem_pool_device.translate_loc_from_full_to_compressed(
-                    self.req_to_token_pool.req_to_token[req_idx, :allocated_len]
-                )
-                compressed_len = len(compressed)
-                prefix_len = len(
-                    self.mem_pool_device.translate_loc_from_full_to_compressed(
-                        self.req_to_token_pool.req_to_token[req_idx, :protected_len]
-                    )
-                )
+            compressed_len = self.host_token_len(allocated_len)
+            prefix_len = self.host_token_len(protected_len)
+            generation = self._kvduo_request_generation[req_idx]
+            released_record = self._kvduo_released_full_offsets.get(req_idx)
+            released_offsets = (
+                released_record[1]
+                if released_record is not None and released_record[0] == generation
+                else set()
+            )
             num_pages = (compressed_len + self.page_size - 1) // self.page_size
             tail_first = max(0, num_pages - self.tail_protected_pages)
             first_owned_page = (prefix_len + self.page_size - 1) // self.page_size
@@ -3919,6 +3942,7 @@ class HiSparseCoordinator:
                 )
                 offsets = set(self._kvduo_tail_retry_pages.get(req_idx, ()))
                 offsets.update(range(record[1], expired_end, self.page_size))
+                offsets.difference_update(released_offsets)
                 tail_progress[req_idx] = (
                     record[0],
                     max(record[1], expired_end),
@@ -3929,25 +3953,34 @@ class HiSparseCoordinator:
                 )
                 if not candidates:
                     continue
-                # Gather only new or deferred pages, never the already released
-                # interval between a deferred page and the current cursor.
-                positions = torch.tensor(
-                    candidates, dtype=torch.int64, device=self.device
-                )
-                token_positions = (
-                    positions[:, None] * self.compress_ratio
-                    + torch.arange(
-                        self.page_size * self.compress_ratio, device=self.device
-                    )
-                ).flatten()
-                pages = self.mem_pool_device.translate_loc_from_full_to_compressed(
-                    self.req_to_token_pool.req_to_token[req_idx, token_positions]
-                ).view(-1, self.page_size)
             else:
                 if end <= start:
                     continue
-                candidates = range(start, end, self.page_size)
-                pages = compressed[start:end].view(-1, self.page_size)
+                candidates = []
+                cursor = start
+                intervals = released_record[2] if released_offsets else ()
+                for lo, hi in intervals:
+                    if hi <= cursor:
+                        continue
+                    if lo >= end:
+                        break
+                    candidates.extend(range(cursor, min(lo, end), self.page_size))
+                    cursor = max(cursor, hi)
+                    if cursor >= end:
+                        break
+                candidates.extend(range(cursor, end, self.page_size))
+            if not candidates:
+                continue
+            # Translate only surviving candidate intervals, not the long prefix
+            # whose physical mappings were removed at an earlier boundary.
+            positions = torch.tensor(candidates, dtype=torch.int64, device=self.device)
+            token_positions = (
+                positions[:, None] * self.compress_ratio
+                + torch.arange(self.page_size * self.compress_ratio, device=self.device)
+            ).flatten()
+            pages = self.mem_pool_device.translate_loc_from_full_to_compressed(
+                self.req_to_token_pool.req_to_token[req_idx, token_positions]
+            ).view(-1, self.page_size)
             candidate_pages.append(pages)
             candidate_meta.extend((req_idx, offset) for offset in candidates)
 
@@ -4104,6 +4137,26 @@ class HiSparseCoordinator:
         self.token_to_kv_pool_allocator.free_hisparse_indices(
             selected_physical.flatten()
         )
+        newly_released = {}
+        for req_idx, offset in selection:
+            newly_released.setdefault(req_idx, []).append(offset)
+            generation = self._kvduo_request_generation[req_idx]
+            record = self._kvduo_released_full_offsets.get(req_idx)
+            if record is None or record[0] != generation:
+                record = (generation, set(), [])
+                self._kvduo_released_full_offsets[req_idx] = record
+            record[1].add(offset)
+        for req_idx, offsets in newly_released.items():
+            intervals = self._kvduo_released_full_offsets[req_idx][2]
+            segments = sorted(
+                intervals + [(offset, offset + self.page_size) for offset in offsets]
+            )
+            intervals.clear()
+            for lo, hi in segments:
+                if intervals and intervals[-1][1] >= lo:
+                    intervals[-1] = (intervals[-1][0], max(intervals[-1][1], hi))
+                else:
+                    intervals.append((lo, hi))
         if tail_cleanup:
             self._publish_kvduo_tail_progress(progress)
         elif request_policy:

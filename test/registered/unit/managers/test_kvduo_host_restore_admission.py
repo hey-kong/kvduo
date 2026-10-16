@@ -1,6 +1,6 @@
-"""Host restore uses its admitted quota without bypassing HOT rollback policy."""
+"""Host restore uses its admitted quota and independent-pool budgets."""
 
-from types import MethodType, SimpleNamespace
+from types import MethodType
 from unittest.mock import MagicMock
 
 import pytest
@@ -43,9 +43,8 @@ def restore_setup(*, dsv4, requests=1, cache_type=RadixCache, extra=2):
     c.mem_pool_host = make_host_pool(16, c.page_size)
     c.mem_pool_host.load_to_device_per_layer = MagicMock()
     cached_locations = tuple(c.mem_pool_host.alloc(c.page_size).tolist())
-    c.mem_pool_device.translate_loc_from_full_to_compressed = (
-        lambda indices: indices[c.compress_ratio - 1 :: c.compress_ratio]
-        // c.compress_ratio
+    c.mem_pool_device.translate_loc_from_full_to_compressed = lambda indices: (
+        indices[c.compress_ratio - 1 :: c.compress_ratio] // c.compress_ratio
     )
     c.mem_pool_device.translate_loc_from_full_to_hisparse_device = (
         c.mem_pool_device.translate_loc_from_full_to_compressed
@@ -90,8 +89,8 @@ def restore_setup(*, dsv4, requests=1, cache_type=RadixCache, extra=2):
     c.token_to_kv_pool_allocator.alloc_kvduo_restore = MagicMock(side_effect=allocate)
     c.token_to_kv_pool_allocator.rollback_restore_allocation = MagicMock()
     adder.tree_cache.kvduo_coordinator = c
-    adder.tree_cache.init_load_back.side_effect = (
-        lambda params: cache_type.init_load_back(adder.tree_cache, params)
+    adder.tree_cache.init_load_back.side_effect = lambda params: (
+        cache_type.init_load_back(adder.tree_cache, params)
     )
     return c, physical, adder, req
 
@@ -144,7 +143,7 @@ def test_dsv4_main_only_restore_is_rejected_at_all_cache_entry_points(cache_type
 
 @pytest.mark.parametrize("dsv4", [False, True])
 @pytest.mark.parametrize("blocked_by", ["host", "logical", "physical"])
-def test_waiting_chunk_protects_host_restore_and_fresh_tail(dsv4, blocked_by):
+def test_waiting_chunk_protects_hbm_only_after_independent_budgets(dsv4, blocked_by):
     c, physical, adder, req = restore_setup(dsv4=dsv4)
     reserve = MagicMock(wraps=c.reserve_kvduo_prefill)
     c.reserve_kvduo_prefill = reserve
@@ -160,7 +159,9 @@ def test_waiting_chunk_protects_host_restore_and_fresh_tail(dsv4, blocked_by):
     assert result is (
         AddReqResult.NO_TOKEN if blocked_by == "logical" else AddReqResult.OTHER
     )
-    assert c._kvduo_prefill_plan_uncovered_pages() == 2
+    assert c._kvduo_prefill_plan_uncovered_pages() == (
+        2 if blocked_by == "physical" else 0
+    )
     if blocked_by == "logical":
         reserve.assert_not_called()
     else:
