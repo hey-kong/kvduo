@@ -266,3 +266,11 @@ def test_dsv4_logical_and_indexer_capacity_survive_full_offload(monkeypatch):
     # Automatic Host sizing uses physical capacity, not logical overcommit.
     budget = plan_dsv4_host_budget(allocator, 0)
     assert budget.full_pages == 2 * physical.size // physical.page_size
+
+
+@pytest.mark.parametrize("raw", ["-1", "true", "1.5", '"2"', "null"])
+def test_invalid_logical_capacity_tokens(raw):
+    with pytest.raises(ValueError, match="logical_capacity_tokens"):
+        parse_kvduo_config(
+            SimpleNamespace(kvduo_config='{"logical_capacity_tokens":' + raw + "}")
+        )

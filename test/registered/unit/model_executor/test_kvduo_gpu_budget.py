@@ -15,11 +15,20 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def dsv4(*, kvduo=True, ratio=2, extra=0):
+def dsv4(*, kvduo=True, ratio=2, extra=0, logical_tokens=0):
     args = ServerArgs(
         model_path="dummy",
         enable_kvduo=kvduo,
-        kvduo_config=json.dumps({"logical_capacity_ratio": ratio}) if kvduo else None,
+        kvduo_config=(
+            json.dumps(
+                {
+                    "logical_capacity_ratio": ratio,
+                    "logical_capacity_tokens": logical_tokens,
+                }
+            )
+            if kvduo
+            else None
+        ),
     )
     if kvduo:
         args._handle_kvduo_aliases()
@@ -52,8 +61,8 @@ def test_extra_headroom_preserves_physical_baseline():
 
 def test_no_extra_keeps_logical_overcommit_and_fits_budget():
     result = plan_gpu_budget(1000, 0, 8, 2, 10, 2, 1)
-    assert result.physical_tokens == 83
-    assert result.logical_tokens == 166
+    assert result.physical_tokens == 75
+    assert result.logical_tokens == 200
     assert result.allocated_bytes <= 1000
 
 
@@ -64,7 +73,7 @@ def test_dsv4_physical_swa_independent_of_logical_history(extra):
     config = planner.calculate_pool_sizes(budget, 256)
     physical = config.c4_max_total_num_tokens * 4
     logical = config.full_max_total_num_tokens
-    assert logical == 2 * physical
+    assert logical >= 2 * physical
     assert config.c128_max_total_num_tokens * 128 == logical
     assert config.swa_max_total_num_tokens == int(physical * 0.1) // 256 * 256
     actual = (
@@ -141,7 +150,8 @@ def test_profile_only_borrows_above_runtime_headroom(
     assert free.call_args.kwargs["cpu_group"] is group.cpu_group
 
 
-def test_generic_planning_preserves_distinct_physical_and_logical_sizes():
+@pytest.mark.parametrize("logical_tokens", [0, 1000])
+def test_generic_planning_preserves_distinct_physical_and_logical_sizes(logical_tokens):
     from test_pool_configurator import _make_model_runner, mock_cpu_env
     from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
     from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
@@ -155,7 +165,9 @@ def test_generic_planning_preserves_distinct_physical_and_logical_sizes():
     )
     kvc.model_config.hf_config.get_text_config = lambda: kvc.model_config.hf_config
     kvc.server_args.enable_kvduo = kvc.server_args.enable_hisparse = True
-    kvc.server_args.kvduo_config = None
+    kvc.server_args.kvduo_config = json.dumps(
+        {"logical_capacity_tokens": logical_tokens}
+    )
     kvc.server_args.hisparse_config = '{"host_to_device_ratio":2}'
     kvc.server_args.dsa_prefill_backend = kvc.server_args.dsa_decode_backend = (
         "flashmla_sparse"
@@ -164,7 +176,10 @@ def test_generic_planning_preserves_distinct_physical_and_logical_sizes():
     with mock_cpu_env():
         planner = DefaultPoolConfigurator(kvc)
     config = planner.calculate_pool_sizes(1 << 20, 64)
-    assert config.kvduo_logical_tokens == 2 * config.max_total_num_tokens
+    if logical_tokens:
+        assert config.kvduo_logical_tokens == 1024
+    else:
+        assert config.kvduo_logical_tokens == 2 * config.max_total_num_tokens
     pool = HiSparseDSATokenToKVPool(
         size=config.max_total_num_tokens,
         logical_size=config.kvduo_logical_tokens,
@@ -193,5 +208,79 @@ def test_generic_planning_preserves_distinct_physical_and_logical_sizes():
     assert (
         pool.index_k_with_scale_buffer[0].shape[0] * 64 >= config.kvduo_logical_tokens
     )
+    logical = allocator.logical_attn_allocator
+    physical = allocator.hisparse_attn_allocator
+    occupied = logical.alloc(physical.size)
+    locations = physical.alloc(physical.size)
+    allocator.full_to_hisparse_device_index_mapping[occupied] = locations
+    allocator.free_hisparse(occupied[:64])
+    # Logical IDs of offloaded history remain occupied, while a new logical
+    # page and the returned physical page can be allocated independently.
+    assert logical.alloc(64) is not None
+    assert physical.alloc(64) is not None
     smaller = planner.calculate_pool_sizes_from_max_tokens(64, 64)
-    assert smaller.max_total_num_tokens == 64 and smaller.kvduo_logical_tokens == 128
+    assert smaller.max_total_num_tokens == 64
+    assert smaller.kvduo_logical_tokens == config.kvduo_logical_tokens
+
+
+def test_logical_target_survives_smaller_physical_budget():
+    small = plan_gpu_budget(1000, 0, 8, 2, 10, 2, 1, logical_tokens=240)
+    large = plan_gpu_budget(1000, 400, 8, 2, 10, 2, 1, logical_tokens=240)
+    assert small.logical_tokens == large.logical_tokens == 240
+    assert small.physical_tokens < large.physical_tokens == 100
+    assert small.allocated_bytes <= 1000
+    assert large.allocated_bytes <= 1400
+
+
+def test_explicit_logical_target_rounds_up_and_bounds_physical():
+    plan = plan_gpu_budget(10000, 0, 8, 2, 10, 2, 64, logical_tokens=65)
+    assert plan.logical_tokens == plan.physical_tokens == 128
+    with pytest.raises(ValueError, match="logical KV backing target"):
+        plan_gpu_budget(1000, 0, 8, 2, 10, 2, 64, logical_tokens=1000)
+
+
+def test_dsv4_absolute_logical_capacity_drives_all_history_pools():
+    planner = dsv4(logical_tokens=16385)
+    result = planner.calculate_pool_sizes(1 << 28, 256)
+    assert result.full_max_total_num_tokens == 16640
+    assert result.c128_max_total_num_tokens * 128 == 16640
+    assert result.c4_max_total_num_tokens * 4 <= 16640
+
+
+def test_generic_pp_synchronizes_independent_logical_capacity(monkeypatch):
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+    import sglang.srt.mem_cache.kv_cache_configurator as module
+    import sglang.srt.model_executor.pool_configurator as planners
+
+    config = planners.MemoryPoolConfig(
+        max_total_num_tokens=64, kvduo_logical_tokens=256
+    )
+    planner = SimpleNamespace(calculate_pool_sizes=lambda *args: config)
+    monkeypatch.setattr(planners, "create_memory_pool_configurator", lambda _: planner)
+    monkeypatch.setattr(module, "get_schedule", lambda: SimpleNamespace(page_size=64))
+    monkeypatch.setattr(
+        module, "get_world_group", lambda: SimpleNamespace(cpu_group="pp")
+    )
+
+    def reduce(tensor, *, op, group):
+        assert group == "pp" and op == torch.distributed.ReduceOp.MIN
+        tensor.fill_(192)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    runner = SimpleNamespace(
+        server_args=SimpleNamespace(pp_size=2),
+        _apply_token_constraints=lambda value: value,
+    )
+    result = KVCacheConfigurator.config_from_budget(runner, 1000)
+    assert result.max_total_num_tokens == 64
+    assert result.kvduo_logical_tokens == 192
+
+
+def test_dsv4_request_state_budget_uses_aligned_logical_target():
+    planner = dsv4(logical_tokens=16385)
+    planner.requested_max_running_requests_per_worker = None
+    state_budget = MagicMock(return_value=0)
+    planner._get_c128_state_fixed_bytes_for_token_capacity = state_budget
+    config = planner.calculate_pool_sizes(1 << 28, 256)
+    state_budget.assert_called_once_with(config.full_max_total_num_tokens)
+    assert config.full_max_total_num_tokens == 16640

@@ -142,6 +142,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             self._kvduo_ratio = parse_kvduo_config(
                 kvc.server_args
             ).logical_capacity_ratio
+            self._kvduo_logical_target = parse_kvduo_config(
+                kvc.server_args
+            ).logical_capacity_tokens
             self._kvduo_extra_budget = getattr(kvc, "kvduo_extra_budget_bytes", 0)
             self._kvduo_physical_bytes = self._compute_cell_size(
                 kvc, num_layers, indexer_ratio_override=0
@@ -357,6 +360,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 self._kvduo_baseline_bytes,
                 self._kvduo_ratio,
                 page_size,
+                logical_tokens=self._kvduo_logical_target,
             )
             self._kvduo_profiled_logical = plan.logical_tokens
             logger.info(
@@ -384,14 +388,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         logical = None
         if self._kvduo_ratio is not None:
-            logical = min(
-                getattr(
-                    self,
-                    "_kvduo_profiled_logical",
-                    max_total_num_tokens * self._kvduo_ratio,
-                ),
-                max_total_num_tokens * self._kvduo_ratio,
+            logical = getattr(
+                self,
+                "_kvduo_profiled_logical",
+                self._kvduo_logical_target or max_total_num_tokens * self._kvduo_ratio,
             )
+            logical = (logical + page_size - 1) // page_size * page_size
+            max_total_num_tokens = min(max_total_num_tokens, logical)
         return MemoryPoolConfig(
             max_total_num_tokens=max_total_num_tokens, kvduo_logical_tokens=logical
         )
@@ -742,6 +745,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         self._kvduo_ratio = None
         if getattr(kvc.server_args, "enable_kvduo", False) is True:
+            from sglang.srt.mem_cache.sparsity import parse_kvduo_config
+
+            self._kvduo_logical_target = parse_kvduo_config(
+                kvc.server_args
+            ).logical_capacity_tokens
             self._kvduo_ratio = self.c4_shrink_factor
             self._kvduo_extra_budget = getattr(kvc, "kvduo_extra_budget_bytes", 0)
             old = self.c4_shrink_factor
@@ -938,9 +946,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             full_token = int(available_bytes / self.bytes_per_full_token)
             if self._kvduo_ratio is not None:
                 full_token = (
-                    int(available_bytes / self._kvduo_baseline_bytes)
+                    self._kvduo_logical_target
+                    or int(available_bytes / self._kvduo_baseline_bytes)
                     * self._kvduo_ratio
                 )
+                full_token = (full_token + page_size - 1) // page_size * page_size
             c128_state_fixed_bytes = (
                 self._get_c128_state_fixed_bytes_for_token_capacity(full_token)
             )
@@ -959,6 +969,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 self._kvduo_baseline_bytes,
                 self._kvduo_ratio,
                 page_size,
+                logical_tokens=self._kvduo_logical_target,
             )
             self._kvduo_profiled_physical = plan.physical_tokens
             logger.info(
