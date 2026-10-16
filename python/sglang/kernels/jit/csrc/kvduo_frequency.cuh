@@ -1,3 +1,5 @@
+#include <cub/block/block_scan.cuh>
+
 #include "hisparse.cuh"
 #include <climits>
 
@@ -19,8 +21,8 @@ __device__ void freq_add(unsigned* words, int slot, int count) {
   } while (old != assumed);
 }
 
-template <int K, bool Paged>
-__global__ void frequency_resolve(
+template <int K, bool Paged, int Block>
+__global__ __launch_bounds__(Block) void frequency_resolve(
     const int* topk,
     int64_t top_stride,
     const int64_t* reqs,
@@ -62,10 +64,16 @@ __global__ void frequency_resolve(
     return;
   }
   int* work = scratch + rid * (9 * K);
-  int* keys = work;
-  int* vals = keys + H;
-  int* counts = vals + H;
-  int* resolved = counts + H;
+  // Capacity scans repeatedly probe this small table. Keep those probes on
+  // chip rather than issuing dependent global loads for every HOT slot.
+  constexpr bool SharedHash = K <= 2048;
+  __shared__ int hash_table[SharedHash ? 2 * H : 1];
+  int* keys = SharedHash ? hash_table : work;
+  int* vals = SharedHash ? hash_table + H : work + H;
+  int* counts = work + 2 * H;
+  using Scan = cub::BlockScan<int, Block>;
+  __shared__ typename Scan::TempStorage scan_storage;
+  int* resolved = work + 3 * H;
   int* misses = resolved + K;
   int* destinations = misses + K;
   const int* selected = topk + row * top_stride;
@@ -158,31 +166,56 @@ __global__ void frequency_resolve(
     }
   }
   __syncthreads();
-  if (!tid) {
-    for (int i = 0; i < K; ++i) {
-      int token = selected[i];
-      if (token >= 0 && token < length && out[i] < 0 && freq_find(token, keys, vals, H) == i && resolved[i] < 0)
-        misses[count++] = i;
+  // Stable parallel compaction preserves top-k order for the H2D list.
+  for (int start = 0; start < K; start += Block) {
+    const int i = start + tid;
+    bool missing = false;
+    if (i < K) {
+      const int token = selected[i];
+      missing = token >= 0 && token < length && out[i] < 0 && freq_find(token, keys, vals, H) == i && resolved[i] < 0;
     }
-    int next = 0;
-    // Empty slots first. Only if expansion could not yet happen, replace the
-    // lowest frequency, ties by slot. Never evict this round's HOT hits.
-    for (int priority = -1; priority <= 3 && next < count; ++priority) {
-      for (int slot = 0; slot < capacity && next < count; ++slot) {
-        if (visited[slot]) continue;
-        const int token = tokens[slot];
-        const unsigned shift = 2 * (slot % 16);
-        const int f = (frequency[slot / 16] >> shift) & 3;
-        if (priority == -1 ? token >= 0 : (token < 0 || f != priority)) continue;
-        int i = misses[next];
-        if (token >= 0 && observe[0]) growth[rid] = 1;
+    int rank, total;
+    Scan(scan_storage).ExclusiveSum(int(missing), rank, total);
+    if (missing) misses[count + rank] = i;
+    __syncthreads();
+    if (!tid) count += total;
+    __syncthreads();
+  }
+  __shared__ int next;
+  if (!tid) next = 0;
+  __syncthreads();
+  // Empty slots first, then lowest frequency with stable slot-order ties.
+  // All threads select destinations, including when capacity grows large.
+  for (int priority = -1; priority <= 3 && next < count; ++priority) {
+    for (int start = 0; start < capacity && next < count; start += Block) {
+      const int slot = start + tid;
+      bool candidate = false;
+      int token = -1;
+      if (slot < capacity && !visited[slot]) {
+        token = tokens[slot];
+        const int f = (frequency[slot / 16] >> (2 * (slot % 16))) & 3;
+        candidate = priority == -1 ? token < 0 : (token >= 0 && f == priority);
+      }
+      int rank, total;
+      Scan(scan_storage).ExclusiveSum(int(candidate), rank, total);
+      // Finish all packed-frequency reads before parallel writes to the words.
+      __syncthreads();
+      const int m = next + rank;
+      if (candidate && m < count) {
+        const int i = misses[m];
+        if (token >= 0 && observe[0]) atomicExch(growth + rid, 1);
         tokens[slot] = selected[i];
-        frequency[slot / 16] &= ~(3u << shift);
+        atomicAnd(frequency + slot / 16, ~(3u << (2 * (slot % 16))));
         visited[slot] = 1;
         resolved[i] = locations[slot];
-        destinations[next++] = locations[slot];
+        destinations[m] = locations[slot];
       }
+      __syncthreads();
+      if (!tid) next = min(count, next + total);
+      __syncthreads();
     }
+  }
+  if (!tid) {
     if (next != count) {
       error = 1;
       status[rid] = 1;
@@ -252,7 +285,7 @@ void resolve_frequency(
     uint64_t stream) {
   using namespace host;
   LaunchKernel(batch, Block, reinterpret_cast<cudaStream_t>(stream))(
-      frequency_resolve<K, Paged>,
+      frequency_resolve<K, Paged, Block>,
       reinterpret_cast<int*>(topk),
       top_stride,
       reinterpret_cast<int64_t*>(requests),

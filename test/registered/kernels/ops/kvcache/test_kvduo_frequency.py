@@ -271,3 +271,42 @@ def test_c4_host_restore_and_merge_preserve_values_and_scales():
             assert torch.equal(
                 _read_dsv4_token(snapshot, loc), _read_dsv4_token(host, token)
             )
+
+
+@pytest.mark.parametrize("block_size", [256, 960])
+def test_parallel_victim_selection_matches_stable_frequency_order(block_size):
+    c, buffers, selected, requests, lengths, output, backing, host = fixture()
+    c.swap_in_block_size = block_size
+    b = FrequencyBuffer.empty(
+        torch.arange(3072, 3648, dtype=torch.int32, device="cuda")
+    )
+    b.tokens[:512] = torch.arange(512, dtype=torch.int32, device="cuda")
+    frequencies = [i % 3 if i < 48 else 3 for i in range(512)] + [0] * 64
+    b.frequency.copy_(pack_frequency(frequencies, device="cuda"))
+    backing[b.locations[:512].long()] = host[:512].to("cuda")
+    c.kvduo_hot_pointers[0, 1].copy_(
+        torch.tensor(b.pointers(), dtype=torch.int64, device="cuda")
+    )
+    c.kvduo_req_hot_capacity_gpu[0, 1] = 576
+    selected[1] = torch.arange(256, 768, dtype=torch.int32, device="cuda")
+    victims = list(range(512, 576)) + sorted(
+        range(256), key=lambda i: (frequencies[i], i)
+    )
+    expected = list(range(512)) + [-1] * 64
+    expected_freq = frequencies[:]
+    for slot, token in zip(victims[:256], range(512, 768)):
+        expected[slot] = token
+        expected_freq[slot] = 0
+    for _ in range(3):
+        b.tokens.copy_(
+            torch.tensor(list(range(512)) + [-1] * 64, dtype=torch.int32, device="cuda")
+        )
+        b.frequency.copy_(pack_frequency(frequencies, device="cuda"))
+        c.kvduo_resolver_stats.zero_()
+        resolve(c, 0, requests, lengths, selected, output)
+        torch.cuda.synchronize()
+        assert b.tokens.tolist() == expected
+        assert unpack_frequency(b.frequency, 576) == expected_freq
+        assert c.kvduo_resolver_stats[0, 1].tolist() == [256, 512]
+        assert c.kvduo_hot_growth_events[0, 1].item() == 1
+        assert torch.equal(backing[output[1].long()].cpu(), host[256:768])
