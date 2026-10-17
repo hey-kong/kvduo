@@ -573,3 +573,18 @@ def test_blocked_prefill_preview_does_not_synchronize_budgets():
     assert c._kvduo_full_prefill_hint is not None
     c._kvduo_prefill_history_ready.assert_not_called()
     c._reserve_kvduo_prefill_host.assert_not_called()
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+@pytest.mark.parametrize("tokens,pages", [(8, 4), (8.0, 4), (8.1, 5), (10.1, 6)])
+def test_prefill_hint_rounds_fractional_budget_up_to_integer_pages(
+    ratio, tokens, pages
+):
+    c, _ = ready_coordinator()
+    adder, req = adder_and_req(c)
+    c.page_size = 2
+    c.compress_ratio = ratio
+    c.preview_kvduo_prefill_reclaim(req, 2, tokens * ratio, adder.tree_cache)
+    hint_pages = c._kvduo_full_prefill_hint[1]
+    assert type(hint_pages) is int
+    assert hint_pages == pages

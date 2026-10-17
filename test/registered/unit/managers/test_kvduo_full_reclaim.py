@@ -771,3 +771,29 @@ def test_reclaim_does_not_expand_for_prefill_above_history_budget():
     assert c.reclaim_kvduo_full_pages(c.page_size) == 4 * c.page_size
     assert c._mixed_slots == [True, False, False]
     c._reserve_kvduo_prefill_host.assert_not_called()
+
+
+def test_fractional_prefill_budget_reaches_selector_as_integer(monkeypatch):
+    c, _, _ = make_request_reclaim_coordinator([4, 4, 4])
+    req = SimpleNamespace(
+        prefix_indices=torch.empty(0, dtype=torch.int64),
+        full_untruncated_fill_ids=list(range(8)),
+        sampling_params=SimpleNamespace(max_new_tokens=1),
+        output_ids=[],
+    )
+    c.preview_kvduo_prefill_reclaim(req, 4, 8.1, None)
+    c._kvduo_prefill_history_ready = MagicMock(return_value=True)
+    c._reserve_kvduo_prefill_host = MagicMock(return_value=True)
+    selector = select_kvduo_full_requests
+
+    def checked_selector(valid, owners, costs, age, needed_pages, **kwargs):
+        assert type(needed_pages) is int
+        assert needed_pages == 6  # One decode page plus ceil(8.1 / 2).
+        return selector(valid, owners, costs, age, needed_pages, **kwargs)
+
+    monkeypatch.setattr(
+        "sglang.srt.managers.hisparse_coordinator.select_kvduo_full_requests",
+        checked_selector,
+    )
+    assert c.reclaim_kvduo_full_pages(c.page_size) == 8 * c.page_size
+    assert c._mixed_slots == [True, True, False]
