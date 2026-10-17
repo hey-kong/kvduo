@@ -48,7 +48,6 @@ def test_only_kvduo_waits_for_warmup_before_startup_returns(
         swap_in_block_size=960,
         host_size=0,
         tail_protected_pages=2,
-        full_reclaim_policy="request",
         decode_emergency_reclaim=False,
         max_relative_miss_increase=0.1,
     )

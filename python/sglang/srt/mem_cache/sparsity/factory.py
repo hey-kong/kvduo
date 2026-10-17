@@ -146,7 +146,6 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         "logical_capacity_tokens",
         "swap_in_block_size",
         "tail_protected_pages",
-        "full_reclaim_policy",
         "decode_emergency_reclaim",
     }
     unknown = set(values) - known
@@ -188,12 +187,6 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
             f"swap_in_block_size ({block_size}) must be in the range [1, 1024]"
         )
 
-    full_reclaim_policy = values.get("full_reclaim_policy", "request")
-    if not isinstance(full_reclaim_policy, str) or full_reclaim_policy not in (
-        "request",
-        "page",
-    ):
-        raise ValueError("full_reclaim_policy must be 'request' or 'page'")
     decode_emergency_reclaim = values.get("decode_emergency_reclaim", False)
     if not isinstance(decode_emergency_reclaim, bool):
         raise ValueError("decode_emergency_reclaim must be a boolean")
@@ -204,7 +197,6 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         logical_capacity_tokens=logical_tokens,
         swap_in_block_size=block_size,
         tail_protected_pages=tail_pages,
-        full_reclaim_policy=full_reclaim_policy,
         decode_emergency_reclaim=decode_emergency_reclaim,
     )
 

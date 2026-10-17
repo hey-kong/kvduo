@@ -6,7 +6,6 @@ import time
 import torch
 
 from sglang.kernels.ops.kvcache.kvduo_full_reclaim import (
-    select_kvduo_full_pages,
     select_kvduo_full_requests,
     summarize_kvduo_full_pages,
 )
@@ -38,8 +37,7 @@ def warmup_kvduo_reclaim(
 def _warmup(backing, page_size, storage_layers, top_k, paged, block_size=256):
     device = backing.device
     k = page_size * storage_layers
-    # Both FULL index types are supported by runtime callers. Exercise both
-    # policies, including a nonzero mandatory HOT charge and protected page.
+    # Both FULL index types are supported by runtime callers. Exercise request selection, including a nonzero mandatory HOT charge and protected page.
     indices = torch.arange(4 * page_size, dtype=torch.int64, device=device)
     mapping = indices + page_size
     versions = torch.ones_like(indices)
@@ -48,8 +46,6 @@ def _warmup(backing, page_size, storage_layers, top_k, paged, block_size=256):
         _, scores, valid = summarize_kvduo_full_pages(
             pages, mapping, versions, versions, indices, indices[:1]
         )
-        if not select_kvduo_full_pages(scores, valid, [0, 0, 1, 1], [0, 1], 1):
-            raise RuntimeError("KVDuo FULL page warmup failed")
         if not select_kvduo_full_requests(valid, [0, 0, 1, 1], [0, 1], [0, 1], 1):
             raise RuntimeError("KVDuo FULL request warmup failed")
 

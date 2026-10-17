@@ -77,7 +77,6 @@ class KVDuoConfig:
     logical_capacity_tokens: int = 0
     swap_in_block_size: int = 960
     tail_protected_pages: int = 2
-    full_reclaim_policy: str = "request"
     decode_emergency_reclaim: bool = False
 
 

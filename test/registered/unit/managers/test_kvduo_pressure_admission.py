@@ -184,11 +184,8 @@ def test_radix_reclaim_continues_past_host_only_entries_and_stops_without_progre
     batch.tree_cache.evict.assert_called_once()
 
 
-def make_full_coordinator(
-    *, pages=8, layers=1, ratio=1, initial_pages=2, full_reclaim_policy="page"
-):
+def make_full_coordinator(*, pages=8, layers=1, ratio=1, initial_pages=2):
     coordinator, physical = make_coordinator(layers=layers, free_pages=0)
-    coordinator.full_reclaim_policy = full_reclaim_policy
     coordinator.compress_ratio = ratio
     coordinator.is_dsv4_hisparse = ratio > 1
     coordinator.mem_pool_device.page_size = coordinator.page_size
@@ -203,8 +200,8 @@ def make_full_coordinator(
     coordinator.req_to_token_pool = SimpleNamespace(
         req_to_token=torch.arange(full_count).view(1, -1)
     )
-    coordinator.mem_pool_device.translate_loc_from_full_to_compressed = (
-        lambda indices: indices[ratio - 1 :: ratio] // ratio
+    coordinator.mem_pool_device.translate_loc_from_full_to_compressed = lambda indices: (
+        indices[ratio - 1 :: ratio] // ratio
     )
     coordinator.mem_pool_device.full_to_hisparse_device_index_mapping = torch.arange(
         coordinator.page_size, coordinator.page_size + count
@@ -260,11 +257,9 @@ def make_full_coordinator(
     return coordinator, physical, req
 
 
-@pytest.mark.parametrize("policy,reclaimed", [("page", 3), ("request", 6)])
-def test_decode_full_reclaim_funds_both_append_and_new_mixed_minima(policy, reclaimed):
-    coordinator, physical, req = make_full_coordinator(
-        layers=2, full_reclaim_policy=policy
-    )
+def test_decode_full_reclaim_funds_both_append_and_new_mixed_minima():
+    reclaimed = 6
+    coordinator, physical, req = make_full_coordinator(layers=2)
     coordinator._reclaim_for_physical_allocation = MethodType(
         HiSparseCoordinator._reclaim_for_physical_allocation, coordinator
     )
@@ -280,11 +275,8 @@ def test_decode_full_reclaim_funds_both_append_and_new_mixed_minima(policy, recl
     assert coordinator.kvduo_req_hot_capacity[:, 0].tolist() == [4, 4]
 
 
-@pytest.mark.parametrize("policy", ["page", "request"])
-def test_decode_defers_when_full_reclaim_cannot_fund_new_mixed_minima(policy):
-    coordinator, physical, req = make_full_coordinator(
-        pages=4, layers=2, full_reclaim_policy=policy
-    )
+def test_decode_defers_when_full_reclaim_cannot_fund_new_mixed_minima():
+    coordinator, physical, req = make_full_coordinator(pages=4, layers=2)
     coordinator._reclaim_for_physical_allocation = MethodType(
         HiSparseCoordinator._reclaim_for_physical_allocation, coordinator
     )
@@ -297,13 +289,8 @@ def test_decode_defers_when_full_reclaim_cannot_fund_new_mixed_minima(policy):
 
 
 @pytest.mark.parametrize("ratio", [1, 4])
-@pytest.mark.parametrize("policy", ["page", "request"])
-def test_prefill_never_demotes_active_full_even_with_net_reclaimable_pages(
-    ratio, policy
-):
-    c, physical, req = make_full_coordinator(
-        layers=2, ratio=ratio, full_reclaim_policy=policy
-    )
+def test_prefill_never_demotes_active_full_even_with_net_reclaimable_pages(ratio):
+    c, physical, req = make_full_coordinator(layers=2, ratio=ratio)
     before = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
     assert c.reserve_kvduo_prefill(1) is None
     assert physical.free_pages == 0
@@ -345,8 +332,9 @@ def test_finish_retains_only_prefill_prefix_even_when_decode_prefix_is_resident(
 ):
     coordinator, physical, req = make_full_coordinator(ratio=ratio)
     req.cache_protected_len = protected_pages * 2 * ratio
-    coordinator.full_last_touch[8:10] = 0
-    assert coordinator.reclaim_kvduo_full_pages(2) == 2
+    coordinator._kvduo_pressure_protected = torch.arange(4, dtype=torch.int64)
+    assert coordinator.reclaim_kvduo_full_pages(2) == 8
+    coordinator._kvduo_pressure_protected = None
     assert req.kvduo_radix_insert_len == 4 * ratio
     coordinator.request_finished(req)
     mapping = coordinator.mem_pool_device.full_to_hisparse_device_index_mapping

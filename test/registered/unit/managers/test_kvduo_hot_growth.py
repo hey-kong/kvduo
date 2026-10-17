@@ -23,7 +23,6 @@ def make_host_pool(size=1024, page_size=2):
 def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
     coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
     coordinator.enable_mixed_residency = True
-    coordinator.full_reclaim_policy = "request"
     coordinator.decode_emergency_reclaim = False
     coordinator.decode_producer_stream = None
     coordinator.device = "cpu"
