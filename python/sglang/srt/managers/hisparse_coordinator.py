@@ -2962,6 +2962,24 @@ class HiSparseCoordinator:
                 if record is not None and record[0] == generation:
                     self._kvduo_hot_tail_starts.pop(req_idx, None)
                     self._kvduo_tail_retry_pages.pop(req_idx, None)
+        # Tail expiry is driven by page advancement, not by whether a new
+        # backup was submitted: a prefill-backed page may already be valid on
+        # Host. Only inspect the per-request cursor, never its historical pages.
+        for req_idx, (generation, cursor) in self._kvduo_hot_tail_starts.items():
+            req = self._active_kvduo_reqs.get(req_idx)
+            if (
+                req is None
+                or generation != self._kvduo_request_generation[req_idx]
+                or not self._mixed_slots[req_idx]
+                or getattr(req, "hisparse_staging", False)
+                or (callable(getattr(req, "finished", None)) and req.finished())
+            ):
+                continue
+            length = self.host_token_len(req.kv.kv_allocated_len)
+            pages = (length + self.page_size - 1) // self.page_size
+            expired_end = max(0, pages - self.tail_protected_pages) * self.page_size
+            if expired_end > cursor:
+                pending[req_idx] = generation
         if not pending:
             return
         # Poll queued turnover/retry jobs; all ranks defer an unfinished backup.

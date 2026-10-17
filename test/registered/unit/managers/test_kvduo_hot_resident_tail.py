@@ -20,7 +20,6 @@ def hot_request(ratio=1):
     assert c.kvduo_residency_mode(0) is KVDuoResidencyMode.HOT_RESIDENT
     assert c._kvduo_hot_tail_starts[0][1] == 6 * c.page_size
     req.kv.kv_allocated_len = 9 * c.page_size * ratio
-    c._kvduo_tail_cleanup_pending[0] = c._kvduo_request_generation[0]
     return c, p, req
 
 
@@ -79,6 +78,7 @@ def test_cleanup_defers_without_waiting_until_all_ranks_ready(pending):
 @pytest.mark.parametrize("stale", ["generation", "ended", "full"])
 def test_cleanup_never_applies_old_job_to_reused_or_full_request(stale):
     c, p, _ = hot_request()
+    c._kvduo_tail_cleanup_pending[0] = c._kvduo_request_generation[0]
     if stale == "generation":
         c._kvduo_request_generation[0] += 1
     elif stale == "ended":
@@ -130,7 +130,6 @@ def test_long_output_scans_each_expired_page_once(monkeypatch, ratio):
     monkeypatch.setattr(module, "summarize_kvduo_full_pages", summarize)
     for step in range(100):
         req.kv.kv_allocated_len = (9 + step) * c.page_size * ratio
-        c._kvduo_tail_cleanup_pending[0] = c._kvduo_request_generation[0]
         c.begin_kvduo_schedule_boundary()
     assert sum(call.args[0].size(0) for call in summarize.call_args_list) == 100
     assert c._kvduo_hot_tail_starts[0][1] == 106 * c.page_size
@@ -228,6 +227,7 @@ def test_reclaim_consensus_failure_does_not_advance_progress():
 
 def test_old_job_does_not_clear_new_generation_cursor_or_retries():
     c, _, _ = hot_request()
+    c._kvduo_tail_cleanup_pending[0] = c._kvduo_request_generation[0]
     c._kvduo_request_generation[0] += 1
     generation = c._kvduo_request_generation[0]
     c._kvduo_hot_tail_starts[0] = (generation, 18)
@@ -235,3 +235,36 @@ def test_old_job_does_not_clear_new_generation_cursor_or_retries():
     c.begin_kvduo_schedule_boundary()
     assert c._kvduo_hot_tail_starts[0] == (generation, 18)
     assert c._kvduo_tail_retry_pages[0] == {16}
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+@pytest.mark.parametrize("protected_pages", [1, 2, 3])
+def test_first_token_on_new_page_expires_only_oldest_tail(ratio, protected_pages):
+    c, physical, req = make_full_coordinator(pages=12, ratio=ratio)
+    c.tail_protected_pages = protected_pages
+    req.kv.kv_allocated_len = 8 * c.page_size * ratio
+    c.reclaim_kvduo_full_pages(c.page_size, reserve_hot_minimum=True)
+    cursor = (8 - protected_pages) * c.page_size
+    assert c._kvduo_hot_tail_starts[0][1] == cursor
+    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
+    before = mapping.clone()
+    free = physical.free_pages
+    assert not c._kvduo_tail_cleanup_pending
+    c.reclaim_kvduo_full_pages = MagicMock(wraps=c.reclaim_kvduo_full_pages)
+    # Same page: no pending job, GPU summary or TP cleanup communication.
+    c._kvduo_consensus = MagicMock(return_value=True)
+    c.begin_kvduo_schedule_boundary()
+    c.reclaim_kvduo_full_pages.assert_not_called()
+    c._kvduo_consensus.assert_not_called()
+    # Enter the next compressed page without creating a new backup job.
+    req.kv.kv_allocated_len += ratio
+    c.begin_kvduo_schedule_boundary()
+    assert physical.free_pages == free + 1
+    assert not mapping[cursor : cursor + c.page_size].any()
+    assert torch.equal(mapping[cursor + c.page_size :], before[cursor + c.page_size :])
+    assert c._kvduo_hot_tail_starts[0][1] == cursor + c.page_size
+    c.reclaim_kvduo_full_pages.reset_mock()
+    c._kvduo_consensus.reset_mock()
+    c.begin_kvduo_schedule_boundary()
+    c.reclaim_kvduo_full_pages.assert_not_called()
+    c._kvduo_consensus.assert_not_called()
