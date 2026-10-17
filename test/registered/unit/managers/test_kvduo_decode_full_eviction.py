@@ -101,7 +101,16 @@ def test_decode_full_pages_remain_resident_until_request_finish(
     expected = [4, 4, 4] if mixed else [0, 0, 0]
     assert c.kvduo_req_hot_capacity[:, 0].tolist() == expected
     c.token_to_kv_pool_allocator.free_hisparse_indices.assert_not_called()
-    c.reclaim_kvduo_full_pages.assert_not_called()
+    if mixed:
+        # This fixture sets the mode without actually demoting FULL or creating
+        # a Tail cursor. Replay may poll sealed-tail jobs but must free nothing.
+        assert c.reclaim_kvduo_full_pages.call_count > 0
+        assert all(
+            call.kwargs.get("tail_cleanup") is True
+            for call in c.reclaim_kvduo_full_pages.call_args_list
+        )
+    else:
+        c.reclaim_kvduo_full_pages.assert_not_called()
     c.request_finished(req)
     assert mapping[:4].tolist() == original[:4].tolist()
     assert torch.all(mapping[4:] == 0)
