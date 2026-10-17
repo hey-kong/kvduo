@@ -2244,7 +2244,7 @@ class HiSparseCoordinator:
             for req in requests_cpu
         )
 
-    def kvduo_full_topk_metadata(self, layer, requests, output):
+    def kvduo_full_topk_metadata(self, layer, requests, output, *, mixed=False):
         return KVDuoFullTopK(
             output,
             requests,
@@ -2260,16 +2260,23 @@ class HiSparseCoordinator:
             layer,
             self.mem_pool_device.flat_layer_slot_stride,
             self.page_size,
+            self.kvduo_req_hot_capacity_gpu[layer] if mixed else None,
         )
 
-    def publish_kvduo_decode_controls(self, batch_size, *, fully_resident=False):
+    def publish_kvduo_decode_controls(
+        self, batch_size, *, fully_resident=False, fused_full_rows=False
+    ):
         begin_kvduo_decode(
             self.full_touch_clock,
             self.kvduo_full_clock_base,
             self.kvduo_observe,
             self.num_real_reqs,
             batch_size=batch_size,
-            full_layers=self.mem_pool_device.layer_num if fully_resident else 0,
+            full_layers=(
+                self.mem_pool_device.layer_num
+                if fully_resident or fused_full_rows
+                else 0
+            ),
         )
 
     def _init_kvduo_feedback_workspace(self):
@@ -4142,6 +4149,7 @@ class HiSparseCoordinator:
         layer_id: int,
         *,
         touch_clock_advanced: bool = False,
+        full_rows_resolved: bool = False,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices."""
         if not self.is_dsv4_hisparse:
@@ -4162,6 +4170,7 @@ class HiSparseCoordinator:
                 compressed_seq_lens,
                 top_k_result,
                 top_k_indices,
+                full_rows_resolved=full_rows_resolved,
             )
             return top_k_indices
 

@@ -59,18 +59,25 @@ __global__ __launch_bounds__(Block) void frequency_resolve(
     int* status,
     int* stats,
     int* growth,
-    int* scratch) {
+    int* scratch,
+    bool full_rows_resolved) {
   constexpr int H = 2 * K;
   const int row = blockIdx.x, tid = threadIdx.x;
   int* out = output + row * output_stride;
-  for (int i = tid; i < K; i += blockDim.x)
-    out[i] = -1;
-  if (row >= real[0]) return;
+  if (row >= real[0]) {
+    for (int i = tid; i < K; i += blockDim.x)
+      out[i] = -1;
+    return;
+  }
   const int64_t rid = reqs[row], length = lengths[row];
   if (rid < 0 || rid >= requests || length < 0 || length > lookup_stride || length > host_stride) {
     if (!tid) __assert_fail("KVDuo invalid request extent", __FILE__, __LINE__, __func__);
     return;
   }
+  // Fused TopK already published FULL addresses and observations for this row.
+  if (full_rows_resolved && capacities[rid] == 0) return;
+  for (int i = tid; i < K; i += blockDim.x)
+    out[i] = -1;
   int* work = scratch + rid * (9 * K);
   // Capacity scans repeatedly probe this small table. Keep those probes on
   // chip rather than issuing dependent global loads for every HOT slot.
@@ -306,7 +313,8 @@ void resolve_frequency(
     int64_t lookup_stride,
     int64_t logical_size,
     int64_t host_stride,
-    uint64_t stream) {
+    uint64_t stream,
+    bool full_rows_resolved) {
   using namespace host;
   LaunchKernel(batch, Block, reinterpret_cast<cudaStream_t>(stream))(
       frequency_resolve<K, Paged, Block>,
@@ -338,7 +346,8 @@ void resolve_frequency(
       reinterpret_cast<int*>(status),
       reinterpret_cast<int*>(stats),
       reinterpret_cast<int*>(growth),
-      reinterpret_cast<int*>(scratch));
+      reinterpret_cast<int*>(scratch),
+      full_rows_resolved);
 }
 
 // Runtime-sized global workspace; merge never specializes on the page count.

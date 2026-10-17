@@ -150,3 +150,13 @@ def test_begin_decode_does_not_mutate_banks_on_bad_controls():
             batch_size=-1,
         )
     assert torch.equal(c.full_touch_clock, before)
+
+
+def test_mixed_fused_rows_reserve_layer_clocks_at_replay_boundary():
+    c = coordinator()
+    c.publish_kvduo_decode_controls(2, fused_full_rows=True)
+    assert c.kvduo_full_clock_base.item() == 10
+    assert c.full_touch_clock.item() == 13
+    c.publish_kvduo_decode_controls(2, fused_full_rows=True)
+    assert c.kvduo_full_clock_base.item() == 13
+    assert c.full_touch_clock.item() == 16

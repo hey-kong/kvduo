@@ -989,7 +989,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             bs, stream_idx=stream_idx, num_tokens=num_tokens
         )
         forward_batch.kvduo_full_decode = variant_label == "kvduo_full"
-        if forward_batch.kvduo_full_decode:
+        forward_batch.kvduo_mixed_full_decode = (
+            self.kvduo_full_graph and not forward_batch.kvduo_full_decode
+        )
+        if forward_batch.kvduo_full_decode or forward_batch.kvduo_mixed_full_decode:
             # Dummy capture rows have no allocated FULL backing.
             forward_batch.hisparse_coordinator.num_real_reqs.zero_()
 
@@ -1256,7 +1259,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if fully_resident:
                 variant_label = "kvduo_full"
             coordinator.publish_kvduo_decode_controls(
-                raw_bs, fully_resident=fully_resident
+                raw_bs,
+                fully_resident=fully_resident,
+                fused_full_rows=self.kvduo_full_graph,
             )
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(

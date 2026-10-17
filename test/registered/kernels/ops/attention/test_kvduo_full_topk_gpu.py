@@ -196,3 +196,159 @@ os._exit(2)
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "KVDuo FULL TopK missing resident KV" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("seq,batch", [(4096, 4), (40003, 32), (70003, 4)])
+def test_mixed_fusion_replay_preserves_full_output_and_restores_real_host_misses(
+    seq, batch
+):
+    from sglang.kernels.ops.kvcache.kvduo_frequency import launch_resolve
+    from sglang.srt.mem_cache.sparsity.core.kvduo_frequency import FrequencyBuffer
+
+    width = (seq + 63) // 64 * 64
+    k = 512
+    scores = torch.arange(width, dtype=torch.float32, device="cuda").repeat(batch, 1)
+    lengths = torch.zeros(batch, dtype=torch.int32, device="cuda")
+    lengths[:2] = seq
+    lengths64 = lengths.long()
+    requests = torch.full((batch,), 999, dtype=torch.int64, device="cuda")
+    requests[:2] = torch.tensor([1, 0], device="cuda")
+    lookup = torch.arange(2 * width, device="cuda").view(2, width)
+    mapping = lookup.flatten() + 64
+    mapping[:width] = 0
+    versions = torch.ones_like(mapping)
+    touches = torch.zeros_like(mapping)
+    host_locs = lookup.clone()
+    host = torch.arange(2 * width * 8, dtype=torch.int32).view(-1, 8).pin_memory()
+    backing = torch.full(
+        (2 * width + 64 + 2 * k, 8), -999, dtype=torch.int32, device="cuda"
+    )
+    backing[64 + width : 64 + 2 * width].copy_(host[width:].cuda())
+    buffers = [
+        FrequencyBuffer.empty(
+            torch.arange(
+                64 + 2 * width + r * k,
+                64 + 2 * width + (r + 1) * k,
+                dtype=torch.int32,
+                device="cuda",
+            )
+        )
+        for r in range(2)
+    ]
+    pointers = torch.tensor(
+        [buffers[0].pointers(), [0] * 4], dtype=torch.int64, device="cuda"
+    )
+    capacities = torch.tensor([k, 0], dtype=torch.int32, device="cuda")
+    status = torch.zeros(2, dtype=torch.int32, device="cuda")
+    stats = torch.zeros((2, 2), dtype=torch.int32, device="cuda")
+    growth = torch.zeros_like(status)
+    observe = torch.ones(1, dtype=torch.int32, device="cuda")
+    real = torch.tensor([2], dtype=torch.int32, device="cuda")
+    clock = torch.tensor([11], device="cuda")
+    base = torch.tensor([10], device="cuda")
+    raw = torch.empty((batch, k), dtype=torch.int32, device="cuda")
+    unused = torch.full_like(raw, -123)
+    output = torch.empty_like(raw)
+    pages = torch.empty((batch, 0), dtype=torch.int32, device="cuda")
+    scratch = torch.full((2, 9 * k), -77, dtype=torch.int32, device="cuda")
+    plan = plan_topk_v2(lengths)
+    spec = KVDuoFullTopK(
+        output,
+        requests,
+        lookup,
+        mapping,
+        touches,
+        status,
+        stats,
+        growth,
+        observe,
+        real,
+        base,
+        0,
+        backing.size(0),
+        64,
+        capacities,
+    )
+
+    def run():
+        topk_transform_512_v2(
+            scores,
+            lengths,
+            pages,
+            unused,
+            64,
+            plan,
+            raw,
+            raw_only=True,
+            full_metadata=spec,
+        )
+        launch_resolve(
+            k,
+            False,
+            raw,
+            requests,
+            lengths64,
+            pointers,
+            capacities,
+            real,
+            lookup,
+            mapping,
+            touches,
+            versions,
+            versions,
+            host_locs,
+            host,
+            backing,
+            32,
+            0,
+            clock,
+            observe,
+            output,
+            status,
+            stats,
+            growth,
+            scratch,
+            block_size=960,
+            full_rows_resolved=True,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    addresses = [
+        (t.data_ptr(), t.shape, t.stride()) for t in (pointers, capacities, output, raw)
+    ]
+    for step in range(3):
+        if step == 2:
+            # The same mixed graph must now resolve the formerly FULL owner via H2D.
+            capacities[1] = k
+            pointers[1].copy_(
+                torch.tensor(buffers[1].pointers(), dtype=torch.int64, device="cuda")
+            )
+            mapping[width:] = 0
+        scores.neg_()
+        for owner in range(2 if step == 2 else 1):
+            buffers[owner].tokens.fill_(-1)
+            buffers[owner].frequency.zero_()
+            backing[buffers[owner].locations.long()] = -999
+        stats.zero_()
+        scratch.fill_(-77)
+        output.fill_(-999)
+        begin_kvduo_decode(clock, base, observe, real, batch_size=2, full_layers=1)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert stats[0].tolist() == [k, k]
+        assert stats[1].tolist() == ([k, k] if step == 2 else [0, k])
+        assert torch.all(output[2:] == -1) and torch.all(unused == -123)
+        for row, owner in enumerate([1, 0]):
+            expected = host[(owner * width + raw[row].cpu().long())]
+            assert torch.equal(backing[output[row].long()].cpu(), expected)
+        if step < 2:
+            assert torch.all(scratch[1] == -77)
+            assert torch.equal(output[0].long(), mapping[lookup[1, raw[0].long()]])
+        assert addresses == [
+            (t.data_ptr(), t.shape, t.stride())
+            for t in (pointers, capacities, output, raw)
+        ]

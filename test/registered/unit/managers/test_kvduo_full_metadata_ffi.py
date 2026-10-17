@@ -65,7 +65,7 @@ def test_real_ffi_transports_full_metadata_as_pointers_and_retains_lookup_stride
         with torch.inference_mode():
             launch(scores, raw, spec)
         args = observed[-1]
-        assert len(args) == 25
+        assert len(args) == 26
         assert all(isinstance(args[i], tvm_ffi.Tensor) for i in (0, 1, 2, 3, 5, 6))
         assert all(isinstance(arg, int) for arg in args[7:])
         assert args[7:18] == tuple(
@@ -84,7 +84,7 @@ def test_real_ffi_transports_full_metadata_as_pointers_and_retains_lookup_stride
                 "clock_base",
             )
         )
-        assert args[18:] == (2, 128, 136, 256, 1, 512, 64)
+        assert args[18:] == (2, 128, 136, 256, 1, 512, 64, 0)
 
 
 @pytest.mark.parametrize(
@@ -139,3 +139,29 @@ def test_full_summary_dispatch_passes_only_logical_pages_as_a_tensor(
     assert bool(args[5]) == protected
     assert args[6:9] == tuple(output.data_ptr() for output in outputs)
     assert args[9] == 128
+
+
+def test_mixed_full_metadata_passes_graph_stable_capacity_pointer(monkeypatch):
+    scores, raw, spec = full_case()
+    capacity = torch.tensor([512, 0], dtype=torch.int32)
+    spec = replace(spec, hot_capacities=capacity)
+    observed = []
+    monkeypatch.setattr(
+        topk,
+        "_jit_topk_v2_module",
+        lambda: SimpleNamespace(
+            topk_transform_full=tvm_ffi.convert(lambda *args: observed.append(args))
+        ),
+    )
+    launch(scores, raw, spec)
+    assert observed[-1][-1] == capacity.data_ptr()
+    capacity[1] = 512
+    launch(scores, raw, spec)
+    assert observed[-1][-1] == capacity.data_ptr()
+    for invalid in (
+        capacity.long(),
+        capacity[:1],
+        torch.zeros(2, dtype=torch.int32, device="meta"),
+    ):
+        with pytest.raises(ValueError, match="hot_capacities"):
+            launch(scores, raw, replace(spec, hot_capacities=invalid))
