@@ -5,6 +5,12 @@
 #include <climits>
 
 namespace {
+struct FrequencyPageMax {
+  __device__ unsigned long long operator()(unsigned long long left, unsigned long long right) const {
+    return left > right ? left : right;
+  }
+};
+
 __device__ int freq_find(int token, const int* keys, const int* vals, int size) {
   int h = hash_slot(token, size);
   while (keys[h] != -1 && keys[h] != token)
@@ -408,7 +414,7 @@ __global__ void frequency_merge_plan(
       for (int p = tid; p < pages; p += blockDim.x)
         if (!summary[p + 2])
           best = max(best, (static_cast<unsigned long long>(counts[p]) << 32) | (0xffffffffu - unsigned(p)));
-      const auto winner = Reduce(reduce_storage).Reduce(best, cub::Max());
+      const auto winner = Reduce(reduce_storage).Reduce(best, FrequencyPageMax{});
       if (!tid) summary[int(0xffffffffu - unsigned(winner)) + 2] = 1;
       __syncthreads();
     }
