@@ -4,7 +4,6 @@ import logging
 import time
 
 import torch
-
 from sglang.kernels.ops.kvcache.kvduo_full_reclaim import (
     select_kvduo_full_requests,
     summarize_kvduo_full_pages,
@@ -48,6 +47,15 @@ def _warmup(backing, page_size, storage_layers, top_k, paged, block_size=256):
         )
         if not select_kvduo_full_requests(valid, [0, 0, 1, 1], [0, 1], [0, 1], 1):
             raise RuntimeError("KVDuo FULL request warmup failed")
+
+    from sglang.kernels.ops.kvcache.kvduo_control import publish_kvduo_buffers
+
+    publication = torch.tensor([[0, 0, 0, 0, 0, 0]], dtype=torch.int64, device=device)
+    publish_kvduo_buffers(
+        publication,
+        torch.empty((1, 1, 4), dtype=torch.int64, device=device),
+        torch.empty((1, 1), dtype=torch.int32, device=device),
+    )
 
     from sglang.kernels.ops.kvcache.kvduo_frequency import launch_resolve, merge
     from sglang.srt.mem_cache.sparsity.core.kvduo_frequency import (

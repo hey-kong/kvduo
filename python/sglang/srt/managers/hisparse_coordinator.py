@@ -12,7 +12,10 @@ from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_mla,
     transfer_cache_dsv4_mla,
 )
-from sglang.kernels.ops.kvcache.kvduo_control import pack_kvduo_feedback
+from sglang.kernels.ops.kvcache.kvduo_control import (
+    pack_kvduo_feedback,
+    publish_kvduo_buffers,
+)
 from sglang.kernels.ops.kvcache.kvduo_full_decode import (
     KVDuoFullTopK,
     begin_kvduo_decode,
@@ -2207,10 +2210,8 @@ class HiSparseCoordinator:
             dtype=torch.int64,
             pin_memory=self.kvduo_hot_pointers.is_cuda,
         ).to(self.device, non_blocking=True)
-        indices = packet[:, 0]
-        self.kvduo_hot_pointers.view(-1, 4).index_copy_(0, indices, packet[:, 2:])
-        self.kvduo_req_hot_capacity_gpu.view(-1).index_copy_(
-            0, indices, packet[:, 1].int()
+        publish_kvduo_buffers(
+            packet, self.kvduo_hot_pointers, self.kvduo_req_hot_capacity_gpu
         )
 
     def _publish_kvduo_frequency_buffer(self, owner, buffer):
@@ -2281,6 +2282,9 @@ class HiSparseCoordinator:
             dtype=torch.int32,
             device=self.kvduo_hot_growth_events.device,
         )
+        self._kvduo_feedback_positions_host = torch.empty(
+            requests, dtype=torch.int32, pin_memory=self.kvduo_hot_growth_events.is_cuda
+        )
         self._kvduo_feedback_bindings = None
 
     def _consume_kvduo_hot_growth_events(self) -> torch.Tensor | dict:
@@ -2301,10 +2305,13 @@ class HiSparseCoordinator:
             if not hasattr(self, "_kvduo_feedback_positions"):
                 self._init_kvduo_feedback_workspace()
             if bindings != self._kvduo_feedback_bindings:
-                positions = torch.full((requests,), -1, dtype=torch.int32)
+                positions = self._kvduo_feedback_positions_host
+                positions.fill_(-1)
                 for i, (req, _) in enumerate(bindings):
                     positions[req] = i
-                self._kvduo_feedback_positions.copy_(positions)
+                self._kvduo_feedback_positions.copy_(
+                    positions, non_blocking=bool(bindings)
+                )
                 self._kvduo_feedback_bindings = bindings
             count = len(bindings)
             pack_kvduo_feedback(
@@ -2643,9 +2650,12 @@ class HiSparseCoordinator:
         if old.tokens.is_cuda:
             from sglang.kernels.ops.kvcache.kvduo_frequency import merge
 
+            if not hasattr(self, "_kvduo_merge_workspace"):
+                self._kvduo_merge_workspace = {}
             new, kept = merge(
                 old,
                 self.mem_pool_device.get_flat_key_buffer(),
+                workspace=self._kvduo_merge_workspace,
                 k=self.hot_page_size,
                 minimum=self.min_hot_pages,
                 paged=self.is_dsv4_hisparse,
@@ -2849,17 +2859,18 @@ class HiSparseCoordinator:
             index = layer * requests + req
             words[index // 63] |= 1 << (index % 63)
         fields = [reserved, *words]
-        packet = torch.tensor(
-            [free, *(item for value in fields for item in (value, -value))],
-            dtype=torch.int64,
-        )
+        values = [free, *(item for value in fields for item in (value, -value))]
+        packet = getattr(self, "_kvduo_growth_resource_packet", None)
+        if packet is None or packet.numel() != len(values):
+            packet = torch.empty(len(values), dtype=torch.int64)
+            self._kvduo_growth_resource_packet = packet
+        packet.numpy()[:] = values
         torch.distributed.all_reduce(
             packet, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
         )
-        consistent = all(
-            packet[i].item() == -packet[i + 1].item() for i in range(1, len(packet), 2)
-        )
-        return int(packet[0]), consistent
+        result = packet.tolist()
+        consistent = all(result[i] == -result[i + 1] for i in range(1, len(result), 2))
+        return result[0], consistent
 
     def _kvduo_consensus(self, value) -> bool:
         """Every TP rank must publish the same request/capacity batch."""
@@ -3196,15 +3207,16 @@ class HiSparseCoordinator:
             + self._kvduo_next_decode_pages()
         )
         self._reclaim_kvduo_radix_pages(required, tree_cache)
-        shortage = max(
-            0,
-            required
-            - self._kvduo_common_available(
-                allocator.available_size() // self.page_size
-            ),
-        )
-        ready = shortage == 0
-        if not self._kvduo_consensus((ready, required)) or not ready:
+        free = allocator.available_size() // self.page_size
+        if getattr(self, "tp_world_size", 1) > 1:
+            packet = torch.tensor([free, required, -required], dtype=torch.int64)
+            torch.distributed.all_reduce(
+                packet, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+            free, minimum_required, negative_maximum = packet.tolist()
+            if minimum_required != -negative_maximum:
+                return None
+        if free < required:
             return None
         token = self._kvduo_prefill_next_reservation
         self._kvduo_prefill_next_reservation += 1
@@ -3965,13 +3977,14 @@ class HiSparseCoordinator:
                 self._kvduo_consensus(())
             return 0
         logical_pages = torch.cat(candidate_pages, dim=0)
-        physical_pages, page_touch, valid = summarize_kvduo_full_pages(
+        physical_pages, _, valid = summarize_kvduo_full_pages(
             logical_pages,
             self.mem_pool_device.full_to_hisparse_device_index_mapping,
             self.full_data_version,
             self.full_host_version,
             self.full_last_touch,
             getattr(self, "_kvduo_pressure_protected", None),
+            compute_touch=False,
         )
 
         minimum_costs = {}

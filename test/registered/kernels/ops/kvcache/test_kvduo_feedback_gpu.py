@@ -3,7 +3,6 @@ from pathlib import Path
 
 import pytest
 import torch
-
 from sglang.kernels.ops.kvcache.kvduo_control import pack_kvduo_feedback
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -67,3 +66,26 @@ def test_coordinator_feedback_rebinds_slots_and_rejects_old_generation(monkeypat
         c._kvduo_feedback_positions.data_ptr(),
         c._kvduo_feedback_packet.data_ptr(),
     )
+
+
+def test_publication_graph_replay_preserves_addresses_and_unmodified_owners():
+    from sglang.kernels.ops.kvcache.kvduo_control import publish_kvduo_buffers
+
+    pointers = torch.full((3, 5, 4), 99, dtype=torch.int64, device="cuda")
+    capacities = torch.full((3, 5), 99, dtype=torch.int32, device="cuda")
+    packet = torch.tensor([[1, 64, 10, 11, 12, 13], [14, 0, 0, 0, 0, 0]], device="cuda")
+    publish_kvduo_buffers(packet, pointers, capacities)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        publish_kvduo_buffers(packet, pointers, capacities)
+    addresses = pointers.data_ptr(), capacities.data_ptr()
+    for capacity in (128, 256, 0):
+        packet[0, 1] = capacity
+        graph.replay()
+        torch.cuda.synchronize()
+        assert pointers[0, 1].tolist() == [10, 11, 12, 13]
+        assert capacities[0, 1].item() == capacity
+        assert not pointers[2, 4].any()
+        assert capacities[2, 4] == 0
+        assert (pointers.view(-1, 4)[[0, 2, 7, 13]] == 99).all()
+        assert addresses == (pointers.data_ptr(), capacities.data_ptr())

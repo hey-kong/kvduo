@@ -1,6 +1,5 @@
 import pytest
 import torch
-
 from sglang.kernels.ops.kvcache.kvduo_full_reclaim import select_kvduo_full_requests
 from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -110,3 +109,26 @@ def test_net_gain_precedes_residency_and_residency_breaks_gain_ties(costs, expec
         )
         == expected
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_summary_without_touch_scores_preserves_full_safety_checks(dtype):
+    from sglang.kernels.ops.kvcache.kvduo_full_reclaim import summarize_kvduo_full_pages
+
+    pages = torch.arange(257 * 64, dtype=dtype, device="cuda").view(257, 64)
+    mapping = torch.arange(pages.numel(), device="cuda") + 64
+    versions = torch.ones_like(mapping)
+    host_versions = versions.clone()
+    host_versions[17] = 0
+    mapping[100] = 0
+    touches = mapping * 2
+    original = summarize_kvduo_full_pages(
+        pages, mapping, versions, host_versions, touches, pages[2]
+    )
+    optimized = summarize_kvduo_full_pages(
+        pages, mapping, versions, host_versions, touches, pages[2], compute_touch=False
+    )
+    assert torch.equal(original[0], optimized[0])
+    assert torch.equal(original[2], optimized[2])
+    assert optimized[2][:4].tolist() == [0, 0, 0, 1]
+    assert not optimized[1].any()
