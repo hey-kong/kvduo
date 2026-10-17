@@ -2951,9 +2951,9 @@ class HiSparseCoordinator:
                 self._kvduo_tail_retry_pages.pop(req_idx, None)
                 self._kvduo_tail_cleanup_pending.pop(req_idx, None)
 
-    def _cleanup_kvduo_old_tails(self) -> None:
+    def _cleanup_kvduo_old_tails(self, *, backup_ready: bool = False) -> int:
         if not self.enable_mixed_residency:
-            return
+            return 0
         pending = self._kvduo_tail_cleanup_pending
         for req_idx, generation in list(pending.items()):
             if (
@@ -2986,21 +2986,27 @@ class HiSparseCoordinator:
             if expired_end > cursor:
                 pending[req_idx] = generation
         if not pending:
-            return
+            return 0
         # Poll queued turnover/retry jobs; all ranks defer an unfinished backup.
         # The reclaimer orders old readers with a stream wait, rather than
         # requiring an idle producer (which overlap scheduling may never offer).
         ready = (
-            not getattr(self, "_has_pending_backup", False)
+            backup_ready
+            or not getattr(self, "_has_pending_backup", False)
             or self._backup_done_event.query()
         )
         if (
             not self._kvduo_consensus((tuple(sorted(pending.items())), ready))
             or not ready
         ):
-            return
+            return 0
         owners = set(pending)
-        self.reclaim_kvduo_full_pages(
+        reclaim = (
+            self._reclaim_kvduo_full_pages_ready
+            if backup_ready
+            else self.reclaim_kvduo_full_pages
+        )
+        return reclaim(
             self.page_size, request_indices=owners, release_all=True, tail_cleanup=True
         )
 
@@ -4096,12 +4102,7 @@ class HiSparseCoordinator:
         tail_cleanup=False,
         included_prefill_pages: int = 0,
     ) -> int:
-        """Demote eligible request-owned FULL pages using the configured policy.
-
-        The host copy is complete before requests leave staging. This control
-        path runs under allocation pressure or sealed-tail cleanup; steady-state
-        full/hot/host resolution remains entirely device-driven and graph-safe.
-        """
+        """Drain ready old Tails before expanding a pressure FULL reclaim."""
         if not self.enable_mixed_residency or num_tokens <= 0:
             return 0
         if self.decode_producer_stream is not None:
@@ -4109,6 +4110,34 @@ class HiSparseCoordinator:
                 self.decode_producer_stream
             )
         self.wait_for_pending_backup()
+        reclaimed = 0
+        if not (release_all or tail_cleanup or request_indices is not None):
+            # Reuse this wait: the schedule-boundary poll may have deferred
+            # cleanup, or a new allocation may just have expired another page.
+            reclaimed = self._cleanup_kvduo_old_tails(backup_ready=True)
+            num_tokens -= reclaimed
+            if num_tokens <= 0:
+                return reclaimed
+        return reclaimed + self._reclaim_kvduo_full_pages_ready(
+            num_tokens,
+            reserve_hot_minimum=reserve_hot_minimum,
+            request_indices=request_indices,
+            release_all=release_all,
+            tail_cleanup=tail_cleanup,
+            included_prefill_pages=included_prefill_pages,
+        )
+
+    def _reclaim_kvduo_full_pages_ready(
+        self,
+        num_tokens: int,
+        *,
+        reserve_hot_minimum: bool = False,
+        request_indices=None,
+        release_all=False,
+        tail_cleanup=False,
+        included_prefill_pages: int = 0,
+    ) -> int:
+        """Select and release pages after ordering old readers and backup."""
         hint = (
             self._kvduo_full_reclaim_prefill_plan()
             if not (release_all or tail_cleanup or request_indices is not None)
@@ -4401,6 +4430,13 @@ class HiSparseCoordinator:
             self._kvduo_full_prefill_hint = None
         if tail_cleanup:
             self._publish_kvduo_tail_progress(progress)
+            logger.info(
+                "KVDuo old Tail cleanup completed: requests=%d, "
+                "released_physical_blocks=%d, physical_block_tokens=%d",
+                len(first_holes),
+                len(selected),
+                self.page_size,
+            )
         else:
             logger.info(
                 "KVDuo FULL request reclaim completed: requests=%d, "
