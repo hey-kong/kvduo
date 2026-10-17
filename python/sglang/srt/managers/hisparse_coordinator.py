@@ -2951,7 +2951,7 @@ class HiSparseCoordinator:
                 self._kvduo_tail_retry_pages.pop(req_idx, None)
                 self._kvduo_tail_cleanup_pending.pop(req_idx, None)
 
-    def _cleanup_kvduo_old_tails(self, *, backup_ready: bool = False) -> int:
+    def _cleanup_kvduo_old_tails(self) -> int:
         if not self.enable_mixed_residency:
             return 0
         pending = self._kvduo_tail_cleanup_pending
@@ -2987,26 +2987,11 @@ class HiSparseCoordinator:
                 pending[req_idx] = generation
         if not pending:
             return 0
-        # Poll queued turnover/retry jobs; all ranks defer an unfinished backup.
-        # The reclaimer orders old readers with a stream wait, rather than
-        # requiring an idle producer (which overlap scheduling may never offer).
-        ready = (
-            backup_ready
-            or not getattr(self, "_has_pending_backup", False)
-            or self._backup_done_event.query()
-        )
-        if (
-            not self._kvduo_consensus((tuple(sorted(pending.items())), ready))
-            or not ready
-        ):
+        # The pressure caller has already ordered old readers and Host backup.
+        if not self._kvduo_consensus(tuple(sorted(pending.items()))):
             return 0
         owners = set(pending)
-        reclaim = (
-            self._reclaim_kvduo_full_pages_ready
-            if backup_ready
-            else self.reclaim_kvduo_full_pages
-        )
-        return reclaim(
+        return self._reclaim_kvduo_full_pages_ready(
             self.page_size, request_indices=owners, release_all=True, tail_cleanup=True
         )
 
@@ -3018,7 +3003,6 @@ class HiSparseCoordinator:
         self._kvduo_prefill_queue_plan = None
         self._kvduo_next_prefill_pages = 0
         self._kvduo_next_prefill_key = None
-        self._cleanup_kvduo_old_tails()
 
     def kvduo_prefill_batch_allocated(self) -> None:
         # Allocations have completed. They now occupy physical pages rather
@@ -4112,9 +4096,8 @@ class HiSparseCoordinator:
         self.wait_for_pending_backup()
         reclaimed = 0
         if not (release_all or tail_cleanup or request_indices is not None):
-            # Reuse this wait: the schedule-boundary poll may have deferred
-            # cleanup, or a new allocation may just have expired another page.
-            reclaimed = self._cleanup_kvduo_old_tails(backup_ready=True)
+            # Clean accumulated expired pages using the existing backup wait.
+            reclaimed = self._cleanup_kvduo_old_tails()
             num_tokens -= reclaimed
             if num_tokens <= 0:
                 return reclaimed

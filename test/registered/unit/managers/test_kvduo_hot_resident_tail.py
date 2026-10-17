@@ -24,18 +24,18 @@ def hot_request(ratio=1):
 
 
 @pytest.mark.parametrize("ratio", [1, 4])
-def test_old_tail_released_without_pressure_current_tail_preserved(ratio):
+def test_old_tail_cleanup_preserves_current_tail(ratio):
     c, p, _ = hot_request(ratio)
     before = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
     free = p.free_pages
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
     assert mapping[12:14].tolist() == [0, 0]
     assert torch.equal(mapping[14:], before[14:])
     assert p.free_pages == free + 1
     assert not c._kvduo_tail_cleanup_pending
     c.reclaim_kvduo_full_pages = MagicMock(wraps=c.reclaim_kvduo_full_pages)
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     c.reclaim_kvduo_full_pages.assert_not_called()
 
 
@@ -54,25 +54,30 @@ def test_old_tail_keeps_existing_page_protections(protected):
         c._kvduo_host_valid_len[0] = 12
     before = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
     free = p.free_pages
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     assert torch.equal(c.mem_pool_device.full_to_hisparse_device_index_mapping, before)
     assert p.free_pages == free
 
 
-@pytest.mark.parametrize("pending", ["backup", "rank"])
-def test_cleanup_defers_without_waiting_until_all_ranks_ready(pending):
+@pytest.mark.parametrize("backup_ready", [False, True])
+def test_schedule_boundary_never_cleans_old_tail(backup_ready):
     c, p, _ = hot_request()
-    c.reclaim_kvduo_full_pages = MagicMock(wraps=c.reclaim_kvduo_full_pages)
-    c.decode_producer_stream = MagicMock()
-    c.decode_producer_stream.query.return_value = pending != "producer"
     c._has_pending_backup = True
     c._backup_done_event = MagicMock()
-    c._backup_done_event.query.return_value = pending != "backup"
-    c._kvduo_consensus = MagicMock(return_value=pending != "rank")
-    c.begin_kvduo_schedule_boundary()
-    c.reclaim_kvduo_full_pages.assert_not_called()
-    assert c._kvduo_tail_cleanup_pending
-    c._backup_done_event.wait.assert_not_called()
+    c._backup_done_event.query.return_value = backup_ready
+    c._cleanup_kvduo_old_tails = MagicMock(wraps=c._cleanup_kvduo_old_tails)
+    c._kvduo_consensus = MagicMock(return_value=True)
+    c.wait_for_pending_backup.reset_mock()
+    before = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
+    free = p.free_pages
+    for _ in range(10):
+        c.begin_kvduo_schedule_boundary()
+    assert torch.equal(c.mem_pool_device.full_to_hisparse_device_index_mapping, before)
+    assert p.free_pages == free
+    c._cleanup_kvduo_old_tails.assert_not_called()
+    c._kvduo_consensus.assert_not_called()
+    c._backup_done_event.query.assert_not_called()
+    c.wait_for_pending_backup.assert_not_called()
 
 
 @pytest.mark.parametrize("stale", ["generation", "ended", "full"])
@@ -86,7 +91,7 @@ def test_cleanup_never_applies_old_job_to_reused_or_full_request(stale):
     else:
         c._mixed_slots[0] = False
     c.reclaim_kvduo_full_pages = MagicMock()
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     c.reclaim_kvduo_full_pages.assert_not_called()
     assert not c._kvduo_tail_cleanup_pending
 
@@ -108,7 +113,7 @@ def test_busy_decode_producer_is_stream_ordered_not_required_to_be_idle(monkeypa
     c.decode_producer_stream.query.return_value = False
     device = MagicMock()
     monkeypatch.setattr(module, "device_module", device)
-    c.begin_kvduo_schedule_boundary()
+    c.reclaim_kvduo_full_pages(c.page_size)
     device.current_stream.return_value.wait_stream.assert_called_with(
         c.decode_producer_stream
     )
@@ -130,7 +135,7 @@ def test_long_output_scans_each_expired_page_once(monkeypatch, ratio):
     monkeypatch.setattr(module, "summarize_kvduo_full_pages", summarize)
     for step in range(100):
         req.kv.kv_allocated_len = (9 + step) * c.page_size * ratio
-        c.begin_kvduo_schedule_boundary()
+        c._cleanup_kvduo_old_tails()
     assert sum(call.args[0].size(0) for call in summarize.call_args_list) == 100
     assert c._kvduo_hot_tail_starts[0][1] == 106 * c.page_size
     assert not c._kvduo_tail_retry_pages
@@ -152,7 +157,7 @@ def test_blocked_page_retries_after_cursor_advances_without_new_turnover(
     else:
         c._kvduo_pressure_protected = torch.tensor([12])
     free = p.free_pages
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     assert p.free_pages == free
     assert c._kvduo_hot_tail_starts[0][1] == 14
     assert c._kvduo_tail_retry_pages[0] == {12}
@@ -161,7 +166,7 @@ def test_blocked_page_retries_after_cursor_advances_without_new_turnover(
     c._kvduo_host_valid_len[0] = 20
     req.cache_protected_len = 0
     c._kvduo_pressure_protected = None
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     assert p.free_pages == free + 1
     assert not c._kvduo_tail_retry_pages
     assert not c._kvduo_tail_cleanup_pending
@@ -173,9 +178,9 @@ def test_blocked_hole_does_not_rescan_released_pages_behind_it(monkeypatch, rati
 
     c, p, req = hot_request(ratio)
     c.full_host_version[12:14] = 0
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     req.kv.kv_allocated_len = 10 * c.page_size * ratio
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     assert c._kvduo_hot_tail_starts[0][1] == 16
     assert c.mem_pool_device.full_to_hisparse_device_index_mapping[14:16].tolist() == [
         0,
@@ -184,7 +189,7 @@ def test_blocked_hole_does_not_rescan_released_pages_behind_it(monkeypatch, rati
     c.full_host_version[12:14] = 1
     summarize = MagicMock(wraps=module.summarize_kvduo_full_pages)
     monkeypatch.setattr(module, "summarize_kvduo_full_pages", summarize)
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     assert summarize.call_args.args[0].tolist() == [[12, 13]]
     assert not c._kvduo_tail_retry_pages
 
@@ -192,11 +197,11 @@ def test_blocked_hole_does_not_rescan_released_pages_behind_it(monkeypatch, rati
 def test_absent_retry_page_is_retired_without_double_free():
     c, p, _ = hot_request()
     c.full_host_version[12:14] = 0
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     c.full_host_version[12:14] = 1
     c.reclaim_kvduo_full_pages(c.page_size, release_all=True)
     free = p.free_pages
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     assert p.free_pages == free
     assert not c._kvduo_tail_retry_pages
     assert not c._kvduo_tail_cleanup_pending
@@ -209,7 +214,7 @@ def test_failed_release_does_not_publish_advanced_cursor():
         "release failed"
     )
     with pytest.raises(RuntimeError, match="release failed"):
-        c.begin_kvduo_schedule_boundary()
+        c._cleanup_kvduo_old_tails()
     assert c._kvduo_hot_tail_starts == before
     assert c._kvduo_tail_cleanup_pending
 
@@ -219,7 +224,7 @@ def test_reclaim_consensus_failure_does_not_advance_progress():
     before = dict(c._kvduo_hot_tail_starts)
     c._kvduo_consensus = MagicMock(side_effect=[True, False])
     free = p.free_pages
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     assert c._kvduo_hot_tail_starts == before
     assert c._kvduo_tail_cleanup_pending
     assert p.free_pages == free
@@ -232,7 +237,7 @@ def test_old_job_does_not_clear_new_generation_cursor_or_retries():
     generation = c._kvduo_request_generation[0]
     c._kvduo_hot_tail_starts[0] = (generation, 18)
     c._kvduo_tail_retry_pages[0] = {16}
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     assert c._kvduo_hot_tail_starts[0] == (generation, 18)
     assert c._kvduo_tail_retry_pages[0] == {16}
 
@@ -253,19 +258,19 @@ def test_first_token_on_new_page_expires_only_oldest_tail(ratio, protected_pages
     c.reclaim_kvduo_full_pages = MagicMock(wraps=c.reclaim_kvduo_full_pages)
     # Same page: no pending job, GPU summary or TP cleanup communication.
     c._kvduo_consensus = MagicMock(return_value=True)
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     c.reclaim_kvduo_full_pages.assert_not_called()
     c._kvduo_consensus.assert_not_called()
     # Enter the next compressed page without creating a new backup job.
     req.kv.kv_allocated_len += ratio
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     assert physical.free_pages == free + 1
     assert not mapping[cursor : cursor + c.page_size].any()
     assert torch.equal(mapping[cursor + c.page_size :], before[cursor + c.page_size :])
     assert c._kvduo_hot_tail_starts[0][1] == cursor + c.page_size
     c.reclaim_kvduo_full_pages.reset_mock()
     c._kvduo_consensus.reset_mock()
-    c.begin_kvduo_schedule_boundary()
+    c._cleanup_kvduo_old_tails()
     c.reclaim_kvduo_full_pages.assert_not_called()
     c._kvduo_consensus.assert_not_called()
 
@@ -277,7 +282,7 @@ def test_pressure_drains_deferred_tail_once_without_prefill_planning(ratio, capl
     c._backup_done_event = MagicMock()
     c._backup_done_event.query.return_value = False
     c.begin_kvduo_schedule_boundary()
-    assert c._kvduo_tail_cleanup_pending
+    assert not c._kvduo_tail_cleanup_pending
     free = physical.free_pages
     c.wait_for_pending_backup.reset_mock()
     c._backup_done_event.query.reset_mock()
@@ -334,3 +339,25 @@ def test_pressure_tail_retry_keeps_protected_pages(protected):
     assert physical.free_pages == free
     assert torch.equal(c.mem_pool_device.full_to_hisparse_device_index_mapping, before)
     assert c._kvduo_tail_retry_pages[0] == {12}
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_pressure_batches_tail_pages_accumulated_across_boundaries(ratio):
+    c, physical, req = make_full_coordinator(pages=16, ratio=ratio)
+    req.kv.kv_allocated_len = 8 * c.page_size * ratio
+    c.reclaim_kvduo_full_pages(c.page_size, reserve_hot_minimum=True)
+    free = physical.free_pages
+    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
+    before = mapping.clone()
+    c.wait_for_pending_backup.reset_mock()
+    for pages in range(9, 14):
+        req.kv.kv_allocated_len = pages * c.page_size * ratio
+        c.begin_kvduo_schedule_boundary()
+        assert physical.free_pages == free
+        assert torch.equal(mapping, before)
+    c.wait_for_pending_backup.assert_not_called()
+    assert c.reclaim_kvduo_full_pages(c.page_size) == 5 * c.page_size
+    assert physical.free_pages == free + 5
+    assert not mapping[12:22].any()
+    assert torch.equal(mapping[22:], before[22:])
+    c.wait_for_pending_backup.assert_called_once()
