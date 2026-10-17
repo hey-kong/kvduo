@@ -1,6 +1,7 @@
 # mapping on device memory, host memory and memory allocator
 
 import logging
+import math
 from contextlib import nullcontext
 from typing import Optional
 
@@ -42,7 +43,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         kv_cache_dim: int,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        host_to_device_ratio: int = 2,
+        host_to_device_ratio: float = 2,
         enable_kvduo: bool = False,
         logical_size: Optional[int] = None,
     ):
@@ -67,7 +68,13 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             index_buf_size=(
-                size * host_to_device_ratio if logical_size is None else logical_size
+                (
+                    math.ceil(size * host_to_device_ratio / page_size) * page_size
+                    if enable_kvduo
+                    else size * host_to_device_ratio
+                )
+                if logical_size is None
+                else logical_size
             ),
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize

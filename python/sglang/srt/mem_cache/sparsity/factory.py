@@ -153,7 +153,14 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         raise ValueError(f"Unknown kvduo_config field(s): {sorted(unknown)}")
 
     top_k = values.get("top_k", DEFAULT_TOP_K)
-    logical_ratio = values.get("logical_capacity_ratio", 2)
+    logical_ratio = values.get("logical_capacity_ratio", 2.5)
+    if (
+        isinstance(logical_ratio, bool)
+        or not isinstance(logical_ratio, (int, float))
+        or not math.isfinite(logical_ratio)
+        or logical_ratio < 1
+    ):
+        raise ValueError("logical_capacity_ratio must be a finite number >= 1")
     logical_tokens = values.get("logical_capacity_tokens", 0)
     if (
         isinstance(logical_tokens, bool)
@@ -172,7 +179,6 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
     block_size = values.get("swap_in_block_size", DEFAULT_SWAP_IN_BLOCK_SIZE)
     tail_pages = values.get("tail_protected_pages", DEFAULT_TAIL_PROTECTED_PAGES)
     fields = {
-        "logical_capacity_ratio": logical_ratio,
         "top_k": top_k,
         "swap_in_block_size": block_size,
         "tail_protected_pages": tail_pages,
