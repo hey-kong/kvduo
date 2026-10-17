@@ -3895,7 +3895,6 @@ class HiSparseCoordinator:
         )
         prefix_transfers = {}
         tail_progress = {}
-        candidate_pages = []
         candidate_meta = []
         for req_idx, req in sorted(self._active_kvduo_reqs.items()):
             if request_indices is not None and req_idx not in request_indices:
@@ -3974,17 +3973,6 @@ class HiSparseCoordinator:
                 candidates.extend(range(cursor, end, self.page_size))
             if not candidates:
                 continue
-            # Translate only surviving candidate intervals, not the long prefix
-            # whose physical mappings were removed at an earlier boundary.
-            positions = torch.tensor(candidates, dtype=torch.int64, device=self.device)
-            token_positions = (
-                positions[:, None] * self.compress_ratio
-                + torch.arange(self.page_size * self.compress_ratio, device=self.device)
-            ).flatten()
-            pages = self.mem_pool_device.translate_loc_from_full_to_compressed(
-                self.req_to_token_pool.req_to_token[req_idx, token_positions]
-            ).view(-1, self.page_size)
-            candidate_pages.append(pages)
             candidate_meta.extend((req_idx, offset) for offset in candidates)
 
         def progress_after(discarded):
@@ -3996,7 +3984,7 @@ class HiSparseCoordinator:
                 for req_idx, (generation, cursor, _) in sorted(tail_progress.items())
             )
 
-        if not candidate_pages:
+        if not candidate_meta:
             if tail_cleanup:
                 progress = progress_after(())
                 if self._kvduo_consensus(((), progress)):
@@ -4004,7 +3992,29 @@ class HiSparseCoordinator:
             else:
                 self._kvduo_consensus(())
             return 0
-        logical_pages = torch.cat(candidate_pages, dim=0)
+        # Upload once, then translate bounded batches rather than one request
+        # at a time. Bound temporary indices even for very long active batches.
+        candidates_gpu = torch.tensor(
+            candidate_meta, dtype=torch.int64, device=self.device
+        )
+        page_tokens = self.page_size * self.compress_ratio
+        pages_per_batch = max(1, (1 << 18) // page_tokens)
+        within = torch.arange(page_tokens, device=self.device)
+        candidate_pages = []
+        for batch in candidates_gpu.split(pages_per_batch):
+            token_positions = batch[:, 1, None] * self.compress_ratio + within
+            candidate_pages.append(
+                self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    self.req_to_token_pool.req_to_token[
+                        batch[:, 0, None], token_positions
+                    ].flatten()
+                ).view(-1, self.page_size)
+            )
+        logical_pages = (
+            candidate_pages[0]
+            if len(candidate_pages) == 1
+            else torch.cat(candidate_pages, dim=0)
+        )
         physical_pages, _, valid = summarize_kvduo_full_pages(
             logical_pages,
             self.mem_pool_device.full_to_hisparse_device_index_mapping,

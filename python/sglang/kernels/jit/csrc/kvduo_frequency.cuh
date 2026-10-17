@@ -182,6 +182,7 @@ __global__ __launch_bounds__(Block) void frequency_resolve(
   __syncthreads();
   // One scan of actual capacity, with a top-k-sized hash table. No capacity
   // dependent shared memory, LRU permutation or compile-time capacity limit.
+#ifdef USE_ROCM
   for (int slot = tid; slot < capacity; slot += blockDim.x) {
     int token = tokens[slot], h = -1;
     if (token >= 0) {
@@ -196,6 +197,50 @@ __global__ __launch_bounds__(Block) void frequency_resolve(
       if (observe[0]) freq_add(frequency, slot, counts[h]);
     }
   }
+#else
+  static_assert(Block % 32 == 0);
+  const int lane = tid % 32;
+  for (int base = tid - lane; base < capacity; base += blockDim.x) {
+    const int slot = base + lane;
+    int h = -1;
+    if (slot < capacity) {
+      const int token = tokens[slot];
+      if (token >= 0) {
+        h = hash_slot(token, H);
+        while (keys[h] != -1 && keys[h] != token)
+          h = (h + 1) % H;
+        if (keys[h] != token) h = -1;
+      }
+      visited[slot] = h >= 0;
+      if (h >= 0) resolved[vals[h]] = locations[slot];
+    }
+    if (observe[0] && __ballot_sync(0xffffffffu, h >= 0)) {
+      // A warp owns two complete frequency words. Ballots combine independent
+      // saturating updates without atomic contention between adjacent slots.
+      const bool has_word = slot / 16 < (capacity + 15) / 16;
+      const unsigned old = has_word ? frequency[slot / 16] : 0;
+      const unsigned before = (old >> (2 * (slot % 16))) & 3;
+      const unsigned after = h >= 0 ? min(3, int(before) + counts[h]) : before;
+      const unsigned lo = __ballot_sync(0xffffffffu, after & 1);
+      const unsigned hi = __ballot_sync(0xffffffffu, after & 2);
+      const unsigned changed = __ballot_sync(0xffffffffu, before != after);
+      if (lane % 16 == 0 && has_word && ((changed >> lane) & 0xffffu)) {
+        unsigned low = (lo >> lane) & 0xffffu;
+        unsigned high = (hi >> lane) & 0xffffu;
+        // Spread the sixteen one-bit fields into even bit positions.
+        low = (low | (low << 8)) & 0x00ff00ffu;
+        low = (low | (low << 4)) & 0x0f0f0f0fu;
+        low = (low | (low << 2)) & 0x33333333u;
+        low = (low | (low << 1)) & 0x55555555u;
+        high = (high | (high << 8)) & 0x00ff00ffu;
+        high = (high | (high << 4)) & 0x0f0f0f0fu;
+        high = (high | (high << 2)) & 0x33333333u;
+        high = (high | (high << 1)) & 0x55555555u;
+        frequency[slot / 16] = low | (high << 1);
+      }
+    }
+  }
+#endif
   __syncthreads();
   // Stable parallel compaction preserves top-k order for the H2D list.
   for (int start = 0; start < K; start += Block) {
@@ -510,6 +555,36 @@ __global__ void frequency_merge_plan(
         atomicOr(new_frequency + out / 16, 1u << (2 * (out % 16)));
       }
     }
+}
+
+__global__ void frequency_decay_in_place(int* tokens, unsigned* frequency, uint8_t* selected, int capacity, int* growth) {
+  const int word = blockIdx.x * blockDim.x + threadIdx.x;
+  if (word < (capacity + 15) / 16) {
+    const unsigned old = frequency[word];
+    unsigned next = 0;
+    for (int i = 0; i < 16 && word * 16 + i < capacity; ++i) {
+      const int slot = word * 16 + i;
+      if (tokens[slot] >= 0 && ((old >> (2 * i)) & 3) == 3)
+        next |= 1u << (2 * i);
+      else
+        tokens[slot] = -1;
+      selected[slot] = 0;
+    }
+    frequency[word] = next;
+  }
+  if (word == 0 && growth) growth[0] = 0;
+}
+
+void decay_frequency(uint64_t tokens, uint64_t frequency, uint64_t selected, int capacity, uint64_t growth, uint64_t stream) {
+  using namespace host;
+  RuntimeCheck(tokens && frequency && selected && capacity > 0, "Invalid frequency decay buffer");
+  LaunchKernel((capacity + 4095) / 4096, 256, reinterpret_cast<cudaStream_t>(stream))(
+      frequency_decay_in_place,
+      reinterpret_cast<int*>(tokens),
+      reinterpret_cast<unsigned*>(frequency),
+      reinterpret_cast<uint8_t*>(selected),
+      capacity,
+      reinterpret_cast<int*>(growth));
 }
 
 template <bool Paged>

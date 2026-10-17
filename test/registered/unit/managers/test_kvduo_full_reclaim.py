@@ -649,3 +649,39 @@ def test_request_summary_can_skip_unused_touch_scores_without_changing_safety():
     assert torch.equal(original[2], optimized[2])
     assert optimized[2].tolist() == [1, 0, 0, 0]
     assert not optimized[1].any()
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_multi_request_candidate_translation_is_batched(ratio):
+    c, physical, width = make_request_reclaim_coordinator([3, 6, 4], ratio=ratio)
+    translate = c.mem_pool_device.translate_loc_from_full_to_compressed
+    c.mem_pool_device.translate_loc_from_full_to_compressed = MagicMock(wraps=translate)
+    original = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
+    assert c.reclaim_kvduo_full_pages(c.page_size) == 6 * c.page_size
+    c.mem_pool_device.translate_loc_from_full_to_compressed.assert_called_once()
+    inputs = c.mem_pool_device.translate_loc_from_full_to_compressed.call_args.args[0]
+    expected = torch.cat(
+        [
+            c.req_to_token_pool.req_to_token[i, : n * c.page_size * ratio]
+            for i, n in enumerate([3, 6, 4])
+        ]
+    )
+    assert torch.equal(inputs, expected)
+    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
+    assert torch.equal(mapping[:width], original[:width])
+    assert torch.equal(mapping[2 * width :], original[2 * width :])
+    assert physical.free_pages == 6
+
+
+def test_candidate_translation_bounds_temporary_indices_for_long_requests():
+    c, physical, width = make_request_reclaim_coordinator([35000, 33000], ratio=4)
+    translate = c.mem_pool_device.translate_loc_from_full_to_compressed
+    c.mem_pool_device.translate_loc_from_full_to_compressed = MagicMock(wraps=translate)
+    original = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
+    assert c.reclaim_kvduo_full_pages(c.page_size) == 35000 * c.page_size
+    calls = c.mem_pool_device.translate_loc_from_full_to_compressed.call_args_list
+    assert len(calls) == 3
+    assert all(call.args[0].numel() <= 1 << 18 for call in calls)
+    mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
+    assert not mapping[: 35000 * c.page_size].any()
+    assert torch.equal(mapping[width:], original[width:])
