@@ -63,7 +63,11 @@ def _warmup(backing, page_size, storage_layers, top_k, paged, block_size=256):
         torch.empty((1, 1), dtype=torch.int32, device=device),
     )
 
-    from sglang.kernels.ops.kvcache.kvduo_frequency import launch_resolve, merge
+    from sglang.kernels.ops.kvcache.kvduo_frequency import (
+        launch_resolve,
+        merge,
+        merge_target,
+    )
     from sglang.srt.mem_cache.sparsity.core.kvduo_frequency import (
         FrequencyBuffer,
         pack_frequency,
@@ -131,6 +135,7 @@ def _warmup(backing, page_size, storage_layers, top_k, paged, block_size=256):
     for slot in survivors:
         freq[slot] = 3
     buffer.frequency.copy_(pack_frequency(freq, device=device))
+    merge_target(buffer, k=k, minimum=minimum, top_k=top_k, paged=paged, workspace={})
     merged, kept = merge(
         buffer,
         payload,

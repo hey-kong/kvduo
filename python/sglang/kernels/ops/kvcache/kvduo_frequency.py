@@ -15,6 +15,7 @@ def module(top_k, paged, block_size=256):
         cuda_files=["kvduo_frequency.cuh"],
         cuda_wrappers=[
             ("resolve", f"resolve_frequency<{args}>"),
+            ("merge_target", "frequency_merge_target"),
             ("merge", f"merge_frequency<{make_cpp_args(paged)}>"),
         ],
     )
@@ -55,6 +56,25 @@ def resolve(
         block_size=getattr(c, "swap_in_block_size", 256),
         full_rows_resolved=full_rows_resolved,
     )
+
+
+def merge_target(buffer, *, k, minimum, top_k, paged, workspace):
+    device = buffer.tokens.device
+    if "target" not in workspace:
+        workspace["target"] = torch.empty(1, dtype=torch.int32, device=device)
+        workspace["host_target"] = torch.empty(1, dtype=torch.int32, pin_memory=True)
+    result = workspace["target"]
+    module(top_k, paged).merge_target(
+        buffer.tokens.data_ptr(),
+        buffer.frequency.data_ptr(),
+        buffer.tokens.numel(),
+        k,
+        minimum,
+        result.data_ptr(),
+        torch.cuda.current_stream(device).cuda_stream,
+    )
+    workspace["host_target"].copy_(result)
+    return int(workspace["host_target"].item())
 
 
 def merge(
