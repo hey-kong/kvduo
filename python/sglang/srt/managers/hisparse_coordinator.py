@@ -4086,7 +4086,7 @@ class HiSparseCoordinator:
         tail_cleanup=False,
         included_prefill_pages: int = 0,
     ) -> int:
-        """Drain ready old Tails before expanding a pressure FULL reclaim."""
+        """Reclaim FULL first, retaining old Tails until pressure requires them."""
         if not self.enable_mixed_residency or num_tokens <= 0:
             return 0
         if self.decode_producer_stream is not None:
@@ -4094,21 +4094,24 @@ class HiSparseCoordinator:
                 self.decode_producer_stream
             )
         self.wait_for_pending_backup()
-        reclaimed = 0
-        if not (release_all or tail_cleanup or request_indices is not None):
-            # Clean accumulated expired pages using the existing backup wait.
-            reclaimed = self._cleanup_kvduo_old_tails()
-            num_tokens -= reclaimed
-            if num_tokens <= 0:
-                return reclaimed
-        return reclaimed + self._reclaim_kvduo_full_pages_ready(
+        pressure = not (release_all or tail_cleanup or request_indices is not None)
+        minimum_before = self._kvduo_mandatory_hot_pages() if pressure else 0
+        reclaimed = self._reclaim_kvduo_full_pages_ready(
             num_tokens,
             reserve_hot_minimum=reserve_hot_minimum,
             request_indices=request_indices,
             release_all=release_all,
             tail_cleanup=tail_cleanup,
             included_prefill_pages=included_prefill_pages,
+            defer_old_tails=pressure,
         )
+        if pressure:
+            added_minimum = max(
+                0, self._kvduo_mandatory_hot_pages() - minimum_before
+            ) * self.page_size
+            if reclaimed - added_minimum < num_tokens:
+                reclaimed += self._cleanup_kvduo_old_tails()
+        return reclaimed
 
     def _reclaim_kvduo_full_pages_ready(
         self,
@@ -4119,6 +4122,7 @@ class HiSparseCoordinator:
         release_all=False,
         tail_cleanup=False,
         included_prefill_pages: int = 0,
+        defer_old_tails: bool = False,
     ) -> int:
         """Select and release pages after ordering old readers and backup."""
         hint = (
@@ -4211,6 +4215,14 @@ class HiSparseCoordinator:
                     if cursor >= end:
                         break
                 candidates.extend(range(cursor, end, self.page_size))
+                if defer_old_tails:
+                    record = self._kvduo_hot_tail_starts.get(req_idx)
+                    if record is not None and record[0] == generation:
+                        retries = self._kvduo_tail_retry_pages.get(req_idx, ())
+                        candidates = [
+                            offset for offset in candidates
+                            if offset < record[1] and offset not in retries
+                        ]
             if not candidates:
                 continue
             candidate_meta.extend((req_idx, offset) for offset in candidates)

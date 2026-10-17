@@ -276,7 +276,7 @@ def test_first_token_on_new_page_expires_only_oldest_tail(ratio, protected_pages
 
 
 @pytest.mark.parametrize("ratio", [1, 4])
-def test_pressure_drains_deferred_tail_once_without_prefill_planning(ratio, caplog):
+def test_pressure_uses_old_tail_when_full_reclaim_is_insufficient(ratio, caplog):
     c, physical, _ = hot_request(ratio)
     c._has_pending_backup = True
     c._backup_done_event = MagicMock()
@@ -286,21 +286,19 @@ def test_pressure_drains_deferred_tail_once_without_prefill_planning(ratio, capl
     free = physical.free_pages
     c.wait_for_pending_backup.reset_mock()
     c._backup_done_event.query.reset_mock()
-    c._kvduo_full_reclaim_prefill_plan = MagicMock(
-        side_effect=AssertionError("Tail cleanup must not plan extra Prefill reclaim")
-    )
+    c._kvduo_full_reclaim_prefill_plan = MagicMock(return_value=None)
     with caplog.at_level("INFO"):
         assert c.reclaim_kvduo_full_pages(c.page_size) == c.page_size
     assert physical.free_pages == free + 1
     c.wait_for_pending_backup.assert_called_once()
     c._backup_done_event.query.assert_not_called()
-    c._kvduo_full_reclaim_prefill_plan.assert_not_called()
+    c._kvduo_full_reclaim_prefill_plan.assert_called_once()
     assert not c._kvduo_tail_cleanup_pending
     assert "KVDuo old Tail cleanup completed" in caplog.text
     assert "KVDuo FULL request reclaim completed" not in caplog.text
 
 
-def test_pressure_reclaims_full_only_for_deficit_left_after_tail(caplog):
+def test_pressure_preserves_old_tail_when_other_full_pages_suffice(caplog):
     from test_kvduo_full_reclaim import make_request_reclaim_coordinator
 
     c, physical, _ = make_request_reclaim_coordinator([4, 6])
@@ -310,18 +308,16 @@ def test_pressure_reclaims_full_only_for_deficit_left_after_tail(caplog):
     c.wait_for_pending_backup.reset_mock()
     c._reclaim_kvduo_full_pages_ready = MagicMock(wraps=c._reclaim_kvduo_full_pages_ready)
     with caplog.at_level("INFO"):
-        # One old Tail page, followed by six FULL pages from the other request.
-        assert c.reclaim_kvduo_full_pages(2 * c.page_size) == 7 * c.page_size
-    assert physical.free_pages == free + 7
+        assert c.reclaim_kvduo_full_pages(2 * c.page_size) == 6 * c.page_size
+    assert physical.free_pages == free + 6
     calls = c._reclaim_kvduo_full_pages_ready.call_args_list
-    assert len(calls) == 2
-    assert calls[0].kwargs["tail_cleanup"] is True
-    assert calls[1].args == (c.page_size,)
-    assert calls[1].kwargs["tail_cleanup"] is False
+    assert len(calls) == 1
+    assert calls[0].kwargs["defer_old_tails"] is True
+    assert calls[0].kwargs["tail_cleanup"] is False
     c.wait_for_pending_backup.assert_called_once()
-    assert caplog.text.index("KVDuo old Tail cleanup completed") < caplog.text.index(
-        "KVDuo FULL request reclaim completed"
-    )
+    assert "KVDuo old Tail cleanup completed" not in caplog.text
+    assert "KVDuo FULL request reclaim completed" in caplog.text
+    assert c.mem_pool_device.full_to_hisparse_device_index_mapping[8:10].any()
 
 
 @pytest.mark.parametrize("protected", ["host", "shared", "in_use"])
@@ -360,4 +356,19 @@ def test_pressure_batches_tail_pages_accumulated_across_boundaries(ratio):
     assert physical.free_pages == free + 5
     assert not mapping[12:22].any()
     assert torch.equal(mapping[22:], before[22:])
+    c.wait_for_pending_backup.assert_called_once()
+
+
+def test_pressure_uses_tail_only_after_insufficient_full_reclaim(caplog):
+    from test_kvduo_full_reclaim import make_request_reclaim_coordinator
+
+    c, _, _ = make_request_reclaim_coordinator([4, 6])
+    c.reclaim_kvduo_full_pages(c.page_size, request_indices={0})
+    c._active_kvduo_reqs[0].kv.kv_allocated_len += c.page_size
+    c.wait_for_pending_backup.reset_mock()
+    with caplog.at_level("INFO"):
+        assert c.reclaim_kvduo_full_pages(8 * c.page_size) == 7 * c.page_size
+    assert caplog.text.index("KVDuo FULL request reclaim completed") < caplog.text.index(
+        "KVDuo old Tail cleanup completed"
+    )
     c.wait_for_pending_backup.assert_called_once()
