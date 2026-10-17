@@ -289,16 +289,18 @@ def test_decode_defers_when_full_reclaim_cannot_fund_new_mixed_minima():
 
 
 @pytest.mark.parametrize("ratio", [1, 4])
-def test_prefill_demotes_full_before_first_decode_but_never_merges_hot(ratio):
+def test_prefill_preserves_active_full_before_first_decode_and_never_merges_hot(ratio):
     c, physical, req = make_full_coordinator(layers=2, ratio=ratio)
     c._kvduo_decode_order.clear()
     req.kv_committed_len = req.kv.kv_allocated_len
     req.full_untruncated_fill_ids = list(range(req.kv_committed_len + 1))
-    assert c.reserve_kvduo_prefill(1) is not None
-    assert physical.free_pages == 6
-    assert c._kvduo_mandatory_hot_pages() == 2
-    assert c._kvduo_reserved_prefill_pages() == 1
-    assert c._mixed_slots[0]
+    before = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
+    assert c.reserve_kvduo_prefill(1) is None
+    assert physical.free_pages == 0
+    assert c._kvduo_mandatory_hot_pages() == 0
+    assert c._kvduo_reserved_prefill_pages() == 0
+    assert not c._mixed_slots[0]
+    assert torch.equal(before, c.mem_pool_device.full_to_hisparse_device_index_mapping)
     c.reclaim_kvduo_hot_pages.assert_not_called()
 
 
@@ -317,13 +319,13 @@ def test_prefill_full_protection_preserves_incoming_prefix_and_earlier_reservati
     physical.free_pages = 1
     first = coordinator.reserve_kvduo_prefill(1)
     second = coordinator.reserve_kvduo_prefill(1, prefix_indices=torch.arange(4))
-    assert first is not None and second is not None
+    assert first is not None and second is None
     mapping = coordinator.mem_pool_device.full_to_hisparse_device_index_mapping
     assert torch.all(mapping[:4] > 0)
     assert req.kvduo_radix_insert_len == 4
-    assert physical.free_pages == 5
-    assert coordinator._kvduo_mandatory_hot_pages() == 2
-    assert coordinator._kvduo_reserved_prefill_pages() == 2
+    assert physical.free_pages == 1
+    assert coordinator._kvduo_mandatory_hot_pages() == 0
+    assert coordinator._kvduo_reserved_prefill_pages() == 1
 
 
 @pytest.mark.parametrize("ratio", [1, 4])

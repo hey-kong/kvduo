@@ -50,17 +50,13 @@ def reserve(c, req, tree=None, end=2):
 
 
 @pytest.mark.parametrize("used,admitted", [(60, True), (62, False)])
-def test_eighty_percent_boundary_blocks_before_active_full_reclaim(used, admitted):
+@pytest.mark.parametrize("free_pages", [0, 4])
+def test_history_and_physical_budgets_must_both_fit(used, admitted, free_pages):
     c, physical, _, req, tree = setup(used)
-    physical.free_pages = 0
-
-    def reclaim(*args, **kwargs):
-        physical.free_pages = 4
-        return 8
-
-    c.reclaim_kvduo_full_pages.side_effect = reclaim
-    assert (reserve(c, req, tree) is not None) is admitted
-    assert c.reclaim_kvduo_full_pages.call_count == int(admitted)
+    physical.free_pages = free_pages
+    c.reclaim_kvduo_full_pages.side_effect = AssertionError("active FULL reclaim")
+    assert (reserve(c, req, tree) is not None) is (admitted and free_pages > 0)
+    c.reclaim_kvduo_full_pages.assert_not_called()
     c.reclaim_kvduo_hot_pages.assert_not_called()
     req.set_finish_with_abort.assert_not_called()
 

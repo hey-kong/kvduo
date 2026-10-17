@@ -354,7 +354,7 @@ def test_host_restore_and_chunk_share_exact_reservation_and_cancellation_release
 
 @pytest.mark.parametrize("path", ["new", "chunk"])
 @pytest.mark.parametrize("dsv4", [False, True])
-def test_physical_shortage_tries_full_but_never_hot(path, dsv4):
+def test_physical_shortage_never_reclaims_active_full_or_hot(path, dsv4):
     c, physical = ready_coordinator(extra=4)
     adder, req = adder_and_req(c, dsv4=dsv4, chunk=16 if path == "chunk" else None)
     c.reclaim_kvduo_hot_pages = MagicMock(
@@ -378,7 +378,7 @@ def test_physical_shortage_tries_full_but_never_hot(path, dsv4):
     assert physical.free_pages == 0
     assert all(torch.equal(bank, old) for bank, old in zip(banks, before))
     c.reclaim_kvduo_hot_pages.assert_not_called()
-    c.reclaim_kvduo_full_pages.assert_called_once()
+    c.reclaim_kvduo_full_pages.assert_not_called()
 
 
 def test_admission_retries_real_surplus_and_does_not_hold_hot_growth_after_cancel():
@@ -482,13 +482,13 @@ def test_physical_budget_is_rechecked_after_prefix_lock():
     adder.tree_cache.inc_lock_ref.side_effect = lock
     assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
     adder.tree_cache.inc_lock_ref.assert_called_once()
-    c.reclaim_kvduo_full_pages.assert_called_once()
+    c.reclaim_kvduo_full_pages.assert_not_called()
     assert not adder.can_run_list
 
 
 @pytest.mark.parametrize("local_free_pages", [1, 16])
 @pytest.mark.parametrize("path", ["new", "chunk"])
-def test_physical_reservation_uses_tp_minimum_before_full_reclaim(
+def test_physical_reservation_uses_tp_minimum_without_full_reclaim(
     monkeypatch, local_free_pages, path
 ):
     c, physical = ready_coordinator()
@@ -511,5 +511,5 @@ def test_physical_reservation_uses_tp_minimum_before_full_reclaim(
         assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
     else:
         assert adder.add_chunked_req(req) is req
-    c.reclaim_kvduo_full_pages.assert_called_once()
+    c.reclaim_kvduo_full_pages.assert_not_called()
     assert not adder.can_run_list

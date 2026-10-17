@@ -149,8 +149,8 @@ def _prefill_tp_worker(rank, path):
             ) as gather:
                 token = c._reserve_kvduo_prefill_physical(need)
             assert (token is not None) == (scenario == "fit")
-            assert reduce.call_count == (2 if scenario == "short" else 1)
-            assert gather.call_count == (1 if scenario == "short" else 0)
+            assert reduce.call_count == 1
+            assert gather.call_count == 0
             if token is None:
                 assert not c._kvduo_prefill_reservations
             dist.barrier()

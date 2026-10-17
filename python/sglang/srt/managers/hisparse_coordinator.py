@@ -3325,7 +3325,7 @@ class HiSparseCoordinator:
         prefix_indices: torch.Tensor | None = None,
         prefill_req=None,
     ) -> int | None:
-        """Reclaim FULL only, preserving decode minima and prefill holds."""
+        """Use free/idle-cache pages only, preserving decode minima and holds."""
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         prefill_key = (
             self._kvduo_prefill_key(prefill_req) if prefill_req is not None else None
@@ -3347,48 +3347,7 @@ class HiSparseCoordinator:
             if minimum_required != -negative_maximum:
                 return None
         if free < required:
-            protected = {
-                id(self._kvduo_prefill_lifecycle[key])
-                for key in self._kvduo_prefill_reservation_requests.values()
-                if key in self._kvduo_prefill_lifecycle
-            }
-            protected.add(id(prefill_req))
-            # The active registry is populated only after complete prefill
-            # staging. It also includes requests that have not decoded yet.
-            candidates = {
-                slot
-                for slot, req in self._active_kvduo_reqs.items()
-                if id(req) not in protected
-                and not getattr(req, "hisparse_staging", False)
-            }
-            if not self._kvduo_consensus(tuple(sorted(candidates))):
-                return None
-            self.reclaim_kvduo_full_pages(
-                (required - free) * self.page_size,
-                reserve_hot_minimum=True,
-                request_indices=candidates,
-                protected_full=(
-                    self.mem_pool_device.translate_loc_from_full_to_compressed(
-                        prefix_indices
-                    )
-                    if prefix_indices is not None and prefix_indices.numel()
-                    else None
-                ),
-            )
-            # FULL demotion creates per-layer minimum HOT obligations. Never
-            # spend those pages on prefill, and never fall back to HOT merge.
-            required = (
-                pages
-                + self._kvduo_reserved_prefill_pages()
-                + self._kvduo_mandatory_hot_pages()
-                + self._kvduo_next_decode_pages()
-            )
-            free = (
-                self._kvduo_common_available(allocator.available_size())
-                // self.page_size
-            )
-            if free < required:
-                return None
+            return None
         token = self._kvduo_prefill_next_reservation
         self._kvduo_prefill_next_reservation += 1
         if prefill_key is not None:

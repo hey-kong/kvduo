@@ -559,7 +559,7 @@ def test_coordinator_passes_actual_mixed_state_to_request_selection():
 
 
 @pytest.mark.parametrize("prefill_pages,admitted", [(3, True), (4, False)])
-def test_prefill_uses_surplus_then_attempts_only_full_after_decode_reclaim(
+def test_prefill_uses_surplus_without_further_reclaim_after_decode_reclaim(
     prefill_pages, admitted
 ):
     from types import MethodType
@@ -578,7 +578,7 @@ def test_prefill_uses_surplus_then_attempts_only_full_after_decode_reclaim(
     calls = c.reclaim_kvduo_full_pages.call_count
     token = c.reserve_kvduo_prefill(prefill_pages)
     assert (token is not None) == admitted
-    assert c.reclaim_kvduo_full_pages.call_count == calls + int(not admitted)
+    assert c.reclaim_kvduo_full_pages.call_count == calls
     c.reclaim_kvduo_hot_pages.assert_not_called()
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
     assert c.kvduo_req_hot_capacity[:, 0].tolist() == [4, 4]
