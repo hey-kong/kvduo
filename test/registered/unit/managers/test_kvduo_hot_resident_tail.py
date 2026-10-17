@@ -268,3 +268,69 @@ def test_first_token_on_new_page_expires_only_oldest_tail(ratio, protected_pages
     c.begin_kvduo_schedule_boundary()
     c.reclaim_kvduo_full_pages.assert_not_called()
     c._kvduo_consensus.assert_not_called()
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_pressure_drains_deferred_tail_once_without_prefill_planning(ratio, caplog):
+    c, physical, _ = hot_request(ratio)
+    c._has_pending_backup = True
+    c._backup_done_event = MagicMock()
+    c._backup_done_event.query.return_value = False
+    c.begin_kvduo_schedule_boundary()
+    assert c._kvduo_tail_cleanup_pending
+    free = physical.free_pages
+    c.wait_for_pending_backup.reset_mock()
+    c._backup_done_event.query.reset_mock()
+    c._kvduo_full_reclaim_prefill_plan = MagicMock(
+        side_effect=AssertionError("Tail cleanup must not plan extra Prefill reclaim")
+    )
+    with caplog.at_level("INFO"):
+        assert c.reclaim_kvduo_full_pages(c.page_size) == c.page_size
+    assert physical.free_pages == free + 1
+    c.wait_for_pending_backup.assert_called_once()
+    c._backup_done_event.query.assert_not_called()
+    c._kvduo_full_reclaim_prefill_plan.assert_not_called()
+    assert not c._kvduo_tail_cleanup_pending
+    assert "KVDuo old Tail cleanup completed" in caplog.text
+    assert "KVDuo FULL request reclaim completed" not in caplog.text
+
+
+def test_pressure_reclaims_full_only_for_deficit_left_after_tail(caplog):
+    from test_kvduo_full_reclaim import make_request_reclaim_coordinator
+
+    c, physical, _ = make_request_reclaim_coordinator([4, 6])
+    assert c.reclaim_kvduo_full_pages(c.page_size, request_indices={0}) == 4 * c.page_size
+    c._active_kvduo_reqs[0].kv.kv_allocated_len += c.page_size
+    free = physical.free_pages
+    c.wait_for_pending_backup.reset_mock()
+    c._reclaim_kvduo_full_pages_ready = MagicMock(wraps=c._reclaim_kvduo_full_pages_ready)
+    with caplog.at_level("INFO"):
+        # One old Tail page, followed by six FULL pages from the other request.
+        assert c.reclaim_kvduo_full_pages(2 * c.page_size) == 7 * c.page_size
+    assert physical.free_pages == free + 7
+    calls = c._reclaim_kvduo_full_pages_ready.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["tail_cleanup"] is True
+    assert calls[1].args == (c.page_size,)
+    assert calls[1].kwargs["tail_cleanup"] is False
+    c.wait_for_pending_backup.assert_called_once()
+    assert caplog.text.index("KVDuo old Tail cleanup completed") < caplog.text.index(
+        "KVDuo FULL request reclaim completed"
+    )
+
+
+@pytest.mark.parametrize("protected", ["host", "shared", "in_use"])
+def test_pressure_tail_retry_keeps_protected_pages(protected):
+    c, physical, req = hot_request()
+    if protected == "host":
+        c.full_host_version[12:14] = 0
+    elif protected == "shared":
+        req.cache_protected_len = 14
+    else:
+        c._kvduo_pressure_protected = torch.tensor([12])
+    free = physical.free_pages
+    before = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
+    assert c.reclaim_kvduo_full_pages(c.page_size) == 0
+    assert physical.free_pages == free
+    assert torch.equal(c.mem_pool_device.full_to_hisparse_device_index_mapping, before)
+    assert c._kvduo_tail_retry_pages[0] == {12}
