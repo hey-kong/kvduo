@@ -90,6 +90,9 @@ def adder_and_req(
     adder.token_to_kv_pool_allocator = budget_allocator(
         coordinator, dsv4=dsv4, logical_size=logical_size, swa_size=swa_size
     )
+    coordinator.token_to_kv_pool_allocator.logical_attn_allocator = (
+        adder.token_to_kv_pool_allocator.logical_attn_allocator
+    )
     adder.page_size = adder.token_to_kv_pool_allocator.page_size
     adder.rem_chunk_tokens = chunk
     adder.rem_input_tokens = 100
@@ -128,6 +131,7 @@ def adder_and_req(
         cache_protected_len=2,
         retracted_stain=False,
         kvduo_residency_plan=object(),
+        set_finish_with_abort=MagicMock(),
         needs_host_load_back=lambda: bool(host_hit),
     )
     req.set_extend_range = lambda start, end: setattr(
@@ -168,8 +172,8 @@ def test_physical_blocked_chunk_does_not_reserve_or_protect_a_plan(pool):
         coordinator,
         dsv4=True,
         chunk=16,
-        logical_size=8 if pool == "logical" else 1024,
-        swa_size=16 if pool == "swa" else 1024,
+        logical_size=0 if pool == "logical" else 1024,
+        swa_size=0 if pool == "swa" else 1024,
     )
     req.prefix_indices = torch.arange(8, dtype=torch.int64)
     req.full_untruncated_fill_ids = list(range(40))
@@ -198,7 +202,9 @@ def test_physical_admission_preserves_logical_and_swa_budget_rejections(path, po
         wraps=coordinator.reserve_kvduo_prefill
     )
     if path == "new":
-        assert adder.add_one_req(req, False, None) is AddReqResult.NO_TOKEN
+        assert adder.add_one_req(req, False, None) is (
+            AddReqResult.OTHER if pool == "logical" else AddReqResult.NO_TOKEN
+        )
     else:
         assert adder.add_chunked_req(req) is req
     coordinator.reserve_kvduo_prefill.assert_not_called()
@@ -239,7 +245,11 @@ def test_generic_kvduo_chunk_cannot_use_fallback_to_bypass_empty_logical_pool():
 
 def test_logical_budget_is_rechecked_after_prefix_lock_before_reservation():
     coordinator, physical = ready_coordinator()
-    adder, req = actual_budget_adder_and_req(coordinator, logical_size=0)
+    adder, req = actual_budget_adder_and_req(coordinator, logical_size=1024)
+    inventory = (
+        adder.token_to_kv_pool_allocator.logical_attn_allocator.full_attn_allocator
+    )
+    inventory.alloc(1024)
     adder.tree_cache.full_evictable_size.return_value = 32
     coordinator.reserve_kvduo_prefill = MagicMock()
 
@@ -291,7 +301,8 @@ def test_multiple_prefills_charge_logical_swa_offsets_and_separate_physical_rese
     assert physical.free_pages == 6
     assert coordinator._kvduo_mandatory_hot_pages() == 0
     assert len(adder.kvduo_prefill_reservations) == 2
-    # A third prefill cannot consume the scheduler headroom and reservations.
+    # A third prefill cannot consume earlier physical reservations.
+    physical.free_pages = 3
     _, third = actual_budget_adder_and_req(coordinator)
     third.full_untruncated_fill_ids = list(range(16))
     assert adder.add_one_req(third, False, None) is AddReqResult.OTHER
@@ -343,15 +354,13 @@ def test_host_restore_and_chunk_share_exact_reservation_and_cancellation_release
 
 @pytest.mark.parametrize("path", ["new", "chunk"])
 @pytest.mark.parametrize("dsv4", [False, True])
-def test_physical_shortage_waits_without_reclaiming_hot_or_active_full(path, dsv4):
+def test_physical_shortage_tries_full_but_never_hot(path, dsv4):
     c, physical = ready_coordinator(extra=4)
     adder, req = adder_and_req(c, dsv4=dsv4, chunk=16 if path == "chunk" else None)
     c.reclaim_kvduo_hot_pages = MagicMock(
         side_effect=AssertionError("prefill HOT reclaim")
     )
-    c.reclaim_kvduo_full_pages = MagicMock(
-        side_effect=AssertionError("prefill FULL reclaim")
-    )
+    c.reclaim_kvduo_full_pages = MagicMock(return_value=0)
     banks = (
         c.req_device_buffer_tokens,
         c.req_device_buffer_token_locs,
@@ -369,7 +378,7 @@ def test_physical_shortage_waits_without_reclaiming_hot_or_active_full(path, dsv
     assert physical.free_pages == 0
     assert all(torch.equal(bank, old) for bank, old in zip(banks, before))
     c.reclaim_kvduo_hot_pages.assert_not_called()
-    c.reclaim_kvduo_full_pages.assert_not_called()
+    c.reclaim_kvduo_full_pages.assert_called_once()
 
 
 def test_admission_retries_real_surplus_and_does_not_hold_hot_growth_after_cancel():
@@ -410,39 +419,25 @@ def test_host_rejected_prefill_does_not_protect_physical_pages(path):
 
 
 @pytest.mark.parametrize("dsv4", [False, True])
-def test_new_prefill_uses_default_physical_headroom_and_retries_after_reclaim(dsv4):
+def test_new_prefill_reserves_only_chunk_physical_footprint(dsv4):
     c, physical = ready_coordinator()
     adder, req = adder_and_req(c, dsv4=dsv4, chunk=8 if dsv4 else 2)
     if dsv4:
         req.prefix_indices = torch.arange(8, dtype=torch.int64)
         req.full_untruncated_fill_ids = list(range(32))
-    # Current chunk fits, but the ordinary whole-input + page budget does not.
     physical.free_pages = 1
-    c.reserve_kvduo_prefill = MagicMock(wraps=c.reserve_kvduo_prefill)
-    total = (
-        len(req.full_untruncated_fill_ids) - len(req.prefix_indices) + adder.page_size
-    )
-    assert adder.rem_total_tokens > total
-    assert physical.free_pages > 0
-    assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
-    c.reserve_kvduo_prefill.assert_not_called()
-    assert not adder.can_run_list and not hasattr(req, "extend_range")
-    assert not c._kvduo_prefill_host_reservations
-    # Decode can release space; a later pass does not require a request to finish.
-    physical.free_pages = 16
     assert adder.add_one_req(req, False, None) is AddReqResult.CONTINUE
     assert adder.can_run_list == [req]
+    assert c._kvduo_reserved_prefill_pages() == 1
+    c.reclaim_kvduo_full_pages.assert_not_called()
 
 
 def test_chunk_keeps_running_decode_headroom_in_physical_pool():
     c, physical = ready_coordinator()
-    physical.free_pages = 1
+    physical.free_pages = 2
     adder, req = actual_budget_adder_and_req(c, path="chunk", running_max_new=8)
-    c.reserve_kvduo_prefill = MagicMock(wraps=c.reserve_kvduo_prefill)
-    assert adder.rem_total_tokens == 1016
-    assert adder._kvduo_scheduler_physical_budget() == 0
+    c._kvduo_next_decode_pages = MagicMock(return_value=1)
     assert adder.add_chunked_req(req) is req
-    c.reserve_kvduo_prefill.assert_not_called()
     assert not hasattr(req, "extend_range")
     physical.free_pages = 3
     assert adder.add_chunked_req(req) is req
@@ -463,50 +458,37 @@ def test_impossible_prompt_is_rejected_before_physical_headroom_wait(pool):
     assert not c._kvduo_prefill_reservations
 
 
-@pytest.mark.parametrize("free_pages,admitted", [(4, False), (5, False), (6, True)])
-def test_kvduo_matches_default_swa_admission_with_same_physical_inventory(
-    free_pages, admitted
+@pytest.mark.parametrize("free_pages", [4, 5, 6])
+def test_kvduo_uses_execution_footprint_instead_of_whole_prompt_physical_gate(
+    free_pages,
 ):
     c, physical = ready_coordinator()
     physical.free_pages = free_pages
     kvduo, req = actual_budget_adder_and_req(c, running_max_new=8)
-    ordinary, ordinary_req = actual_budget_adder_and_req(c, running_max_new=8)
-    ordinary.kvduo_coordinator = None
-    # The ordinary SWA composite has full storage matching physical capacity;
-    # KVDuo retains a larger logical inventory behind its physical composite.
-    ordinary.token_to_kv_pool_allocator = (
-        ordinary.token_to_kv_pool_allocator.logical_attn_allocator
-    )
-    ordinary.token_to_kv_pool_allocator.full_attn_allocator = (
-        PagedTokenToKVPoolAllocator(free_pages * 8, 8, torch.int64, "cpu", None, False)
-    )
     req.sampling_params.max_new_tokens = 8
-    ordinary_req.sampling_params.max_new_tokens = 8
-    assert kvduo._kvduo_scheduler_physical_budget() == ordinary.rem_total_tokens
-    kvduo.add_one_req(req, False, None)
-    ordinary.add_one_req(ordinary_req, False, None)
-    assert bool(kvduo.can_run_list) == bool(ordinary.can_run_list) == admitted
+    assert kvduo.add_one_req(req, False, None) is AddReqResult.CONTINUE
+    assert c._kvduo_reserved_prefill_pages() == 2
 
 
 def test_physical_budget_is_rechecked_after_prefix_lock():
     c, physical = ready_coordinator()
     physical.free_pages = 5
     adder, req = actual_budget_adder_and_req(c)
-    c.reserve_kvduo_prefill = MagicMock()
 
     def lock(_):
         physical.free_pages = 1
+        return SimpleNamespace(swa_uuid_for_lock=None)
 
     adder.tree_cache.inc_lock_ref.side_effect = lock
     assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
     adder.tree_cache.inc_lock_ref.assert_called_once()
-    c.reserve_kvduo_prefill.assert_not_called()
+    c.reclaim_kvduo_full_pages.assert_called_once()
     assert not adder.can_run_list
 
 
 @pytest.mark.parametrize("local_free_pages", [1, 16])
 @pytest.mark.parametrize("path", ["new", "chunk"])
-def test_physical_gate_uses_tp_minimum_before_reservation(
+def test_physical_reservation_uses_tp_minimum_before_full_reclaim(
     monkeypatch, local_free_pages, path
 ):
     c, physical = ready_coordinator()
@@ -514,18 +496,20 @@ def test_physical_gate_uses_tp_minimum_before_reservation(
     adder, req = actual_budget_adder_and_req(c, path=path, running_max_new=8)
     c.tp_world_size = 2
     c.tp_group = object()
-    c.reserve_kvduo_prefill = MagicMock()
+    c._kvduo_consensus = MagicMock(return_value=True)
+    c._reserve_kvduo_prefill_host = MagicMock(return_value=True)
 
     def reduce(value, *, op, group):
         assert op == torch.distributed.ReduceOp.MIN and group is c.tp_group
-        value.fill_(8)
+        if value.numel() == 3:
+            value[0] = 0
+        elif value.item() <= physical.available_size():
+            value.fill_(0)
 
-    collective = MagicMock(side_effect=reduce)
-    monkeypatch.setattr(torch.distributed, "all_reduce", collective)
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
     if path == "new":
         assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
     else:
         assert adder.add_chunked_req(req) is req
-    collective.assert_called_once()
-    c.reserve_kvduo_prefill.assert_not_called()
+    c.reclaim_kvduo_full_pages.assert_called_once()
     assert not adder.can_run_list

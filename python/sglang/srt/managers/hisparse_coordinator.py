@@ -2804,6 +2804,8 @@ class HiSparseCoordinator:
         # Remaining FULL footprint of admitted chunks, including first decode.
         self._kvduo_prefill_future_pages = {}
         self._kvduo_prefill_previous_future = {}
+        self._kvduo_prefill_history = {}
+        self._kvduo_prefill_previous_history = {}
         self._kvduo_prefill_new_host_reservations = set()
         self._kvduo_prefill_generation = 0
         self._kvduo_prefill_reservation_requests = {}
@@ -2998,6 +3000,7 @@ class HiSparseCoordinator:
                     self.finish_kvduo_prefill_reservation(token, cancelled=True)
             self._release_kvduo_prefill_host(key)
             self._kvduo_prefill_future_pages.pop(key, None)
+            self._kvduo_prefill_history.pop(key, None)
             del self._kvduo_prefill_lifecycle[key]
         if request is not None and hasattr(request, "kvduo_prefill_generation"):
             del request.kvduo_prefill_generation
@@ -3056,6 +3059,12 @@ class HiSparseCoordinator:
             return
         prefill_key = self._kvduo_prefill_reservation_requests.pop(token, None)
         previous = self._kvduo_prefill_previous_future.pop(token, 0)
+        previous_history = self._kvduo_prefill_previous_history.pop(token, None)
+        if cancelled and prefill_key is not None:
+            if previous_history is None:
+                self._kvduo_prefill_history.pop(prefill_key, None)
+            else:
+                self._kvduo_prefill_history[prefill_key] = previous_history
         new_host = token in self._kvduo_prefill_new_host_reservations
         self._kvduo_prefill_new_host_reservations.discard(token)
         if cancelled and prefill_key is not None:
@@ -3100,7 +3109,61 @@ class HiSparseCoordinator:
                 "reduce the prompt length or increase kvduo host_ratio"
             )
             return False
+        inventory, limit = self._kvduo_history_admission_budget()
+        if (
+            full_end + inventory.page_size - 1
+        ) // inventory.page_size * inventory.page_size > limit:
+            req.set_finish_with_abort(
+                "KVDuo prompt and first decode exceed the 80% history admission "
+                "budget; reduce the prompt length or increase logical capacity"
+            )
+            return False
         return True
+
+    def _kvduo_prefill_history_need(self, req, end: int) -> int:
+        logical = self.token_to_kv_pool_allocator.logical_attn_allocator
+        page = getattr(logical, "full_attn_allocator", logical).page_size
+        allocated = max(
+            len(req.prefix_indices),
+            getattr(getattr(req, "kv", None), "kv_allocated_len", 0),
+        )
+        return max(0, (end + page - 1) // page - (allocated + page - 1) // page) * page
+
+    def _kvduo_history_admission_budget(self):
+        logical = self.token_to_kv_pool_allocator.logical_attn_allocator
+        inventory = getattr(logical, "full_attn_allocator", logical)
+        backing = getattr(logical, "_kvcache", None)
+        history_capacity = inventory.size
+        if self.is_dsv4_hisparse and backing is not None:
+            for name, compression in (("c4_indexer_kv_pool", 4), ("c128_kv_pool", 128)):
+                pool = getattr(backing, name, None)
+                if pool is not None:
+                    history_capacity = min(history_capacity, pool.size * compression)
+        limit = history_capacity // inventory.page_size * 4 // 5 * inventory.page_size
+        return inventory, limit
+
+    def _check_kvduo_prefill_history(self, req, key, end: int, tree_cache) -> bool:
+        # Indexer and C128 are addressed by the same FULL logical page inventory.
+        # Charge the entire remaining prompt, not just the next physical chunk.
+        inventory, limit = self._kvduo_history_admission_budget()
+        capacity = inventory.size
+        if key in self._kvduo_prefill_history:
+            # Honor an admitted chunked prompt even if intervening decode has
+            # used some of the 20% headroom. Ordinary allocation checks still apply.
+            return True
+        pending = sum(
+            self._kvduo_prefill_history_need(other, target)
+            for other_key, (other, target) in self._kvduo_prefill_history.items()
+            if other_key != key
+            and getattr(other, "kvduo_prefill_generation", None) == other_key[1]
+        )
+        needed = pending + self._kvduo_prefill_history_need(req, end)
+        free = self._kvduo_common_available(inventory.available_size())
+        deficit = max(0, capacity - free + needed - limit)
+        if deficit and tree_cache is not None:
+            tree_cache.evict(EvictParams(num_tokens=deficit))
+            free = self._kvduo_common_available(inventory.available_size())
+        return capacity - free + needed <= limit
 
     def reserve_kvduo_prefill(
         self,
@@ -3140,6 +3203,10 @@ class HiSparseCoordinator:
                 )
             if not self.check_kvduo_prefill_total_capacity(prefill_req):
                 return None
+            if not self._check_kvduo_prefill_history(
+                prefill_req, prefill_key, full_end, tree_cache
+            ):
+                return None
         new_host_reservation = (
             needs_host and prefill_key not in self._kvduo_prefill_host_reservations
         )
@@ -3163,6 +3230,11 @@ class HiSparseCoordinator:
                 self._kvduo_prefill_reservations[token][0] = pages
                 future[prefill_key] = total - pages
                 self._kvduo_prefill_previous_future[token] = previous
+                if needs_host:
+                    self._kvduo_prefill_previous_history[token] = (
+                        self._kvduo_prefill_history.get(prefill_key)
+                    )
+                    self._kvduo_prefill_history[prefill_key] = (prefill_req, full_end)
                 if new_host_reservation or (not needs_host and not previous):
                     self._kvduo_prefill_new_host_reservations.add(token)
             return token
@@ -3198,11 +3270,7 @@ class HiSparseCoordinator:
         prefix_indices: torch.Tensor | None = None,
         prefill_req=None,
     ) -> int | None:
-        """Admit against actual free pages after mandatory capacity and holds.
-
-        Decode-owned FULL reclaim may leave surplus for the next boundary;
-        this path never increases that reclaim to fit a waiting prefill.
-        """
+        """Reclaim FULL only, preserving decode minima and prefill holds."""
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         prefill_key = (
             self._kvduo_prefill_key(prefill_req) if prefill_req is not None else None
@@ -3224,7 +3292,48 @@ class HiSparseCoordinator:
             if minimum_required != -negative_maximum:
                 return None
         if free < required:
-            return None
+            protected = {
+                id(self._kvduo_prefill_lifecycle[key])
+                for key in self._kvduo_prefill_reservation_requests.values()
+                if key in self._kvduo_prefill_lifecycle
+            }
+            protected.add(id(prefill_req))
+            # The active registry is populated only after complete prefill
+            # staging. It also includes requests that have not decoded yet.
+            candidates = {
+                slot
+                for slot, req in self._active_kvduo_reqs.items()
+                if id(req) not in protected
+                and not getattr(req, "hisparse_staging", False)
+            }
+            if not self._kvduo_consensus(tuple(sorted(candidates))):
+                return None
+            self.reclaim_kvduo_full_pages(
+                (required - free) * self.page_size,
+                reserve_hot_minimum=True,
+                request_indices=candidates,
+                protected_full=(
+                    self.mem_pool_device.translate_loc_from_full_to_compressed(
+                        prefix_indices
+                    )
+                    if prefix_indices is not None and prefix_indices.numel()
+                    else None
+                ),
+            )
+            # FULL demotion creates per-layer minimum HOT obligations. Never
+            # spend those pages on prefill, and never fall back to HOT merge.
+            required = (
+                pages
+                + self._kvduo_reserved_prefill_pages()
+                + self._kvduo_mandatory_hot_pages()
+                + self._kvduo_next_decode_pages()
+            )
+            free = (
+                self._kvduo_common_available(allocator.available_size())
+                // self.page_size
+            )
+            if free < required:
+                return None
         token = self._kvduo_prefill_next_reservation
         self._kvduo_prefill_next_reservation += 1
         if prefill_key is not None:
@@ -3851,6 +3960,7 @@ class HiSparseCoordinator:
         request_indices=None,
         release_all=False,
         tail_cleanup=False,
+        protected_full=None,
     ) -> int:
         """Demote eligible request-owned FULL pages using the configured policy.
 
@@ -3984,13 +4094,20 @@ class HiSparseCoordinator:
                 self._kvduo_consensus(())
             return 0
         logical_pages = torch.cat(candidate_pages, dim=0)
+        pressure_protected = getattr(self, "_kvduo_pressure_protected", None)
+        if protected_full is not None:
+            pressure_protected = (
+                protected_full
+                if pressure_protected is None
+                else torch.cat((pressure_protected, protected_full))
+            )
         physical_pages, _, valid = summarize_kvduo_full_pages(
             logical_pages,
             self.mem_pool_device.full_to_hisparse_device_index_mapping,
             self.full_data_version,
             self.full_host_version,
             self.full_last_touch,
-            getattr(self, "_kvduo_pressure_protected", None),
+            pressure_protected,
             compute_touch=False,
         )
 

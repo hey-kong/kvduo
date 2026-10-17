@@ -160,8 +160,10 @@ def test_waiting_chunk_protects_hbm_only_after_independent_budgets(dsv4, blocked
     assert result is (
         AddReqResult.NO_TOKEN if blocked_by == "logical" else AddReqResult.OTHER
     )
-    assert c._kvduo_prefill_plan_uncovered_pages() == 0
-    if blocked_by != "host":
+    assert c._kvduo_prefill_plan_uncovered_pages() == (
+        2 if blocked_by == "physical" else 0
+    )
+    if blocked_by == "logical":
         reserve.assert_not_called()
     else:
         assert reserve.call_args.args[0] == 2
