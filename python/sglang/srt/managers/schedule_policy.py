@@ -666,7 +666,6 @@ class PrefillAdder:
             self._kvduo_prefill_enabled()
             and total_tokens >= self._kvduo_scheduler_physical_budget()
         ):
-            self.kvduo_coordinator.check_kvduo_prefill_total_capacity(req)
             self.kvduo_prefill_blocked = True
             return True
         return False
@@ -935,10 +934,6 @@ class PrefillAdder:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
-            if self._kvduo_prefill_enabled():
-                _rem_tokens = min(
-                    _rem_tokens, int(self._kvduo_scheduler_physical_budget())
-                )
             if self.is_hybrid_swa:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM
@@ -970,6 +965,19 @@ class PrefillAdder:
         )
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        if self._kvduo_prefill_enabled():
+            physical_budget = int(self._kvduo_scheduler_physical_budget())
+            if physical_budget <= 0:
+                self.kvduo_coordinator.preview_kvduo_prefill_reclaim(
+                    req,
+                    len(req.prefix_indices) + new_len,
+                    new_len + max(0, self.rem_total_token_offset),
+                    self.tree_cache,
+                )
+                self.kvduo_prefill_blocked = True
+                return req
+            new_len = min(new_len, physical_budget)
+            truncated = cand_extend_input_len > new_len
         admitted, _ = self._reserve_kvduo_prefill(
             req, len(req.prefix_indices) + new_len
         )
@@ -1176,8 +1184,6 @@ class PrefillAdder:
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
-        if self._kvduo_scheduler_physical_blocked(req, total_tokens):
-            return AddReqResult.OTHER
 
         if self.is_hybrid_swa:
             # host-hit prefix is loaded back, not re-prefilled, so the SWA peak is
@@ -1210,8 +1216,6 @@ class PrefillAdder:
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
-            if self._kvduo_scheduler_physical_blocked(req, total_tokens):
-                return AddReqResult.OTHER
 
             if self.is_hybrid_swa:
                 # self.rem_swa_tokens may decrease after the lock acquisition
@@ -1256,6 +1260,16 @@ class PrefillAdder:
                     waiting_queue_len=self.waiting_queue_len,
                 )
             ):
+                return AddReqResult.OTHER
+
+            physical_tokens = total_tokens
+            if self._kvduo_scheduler_physical_blocked(req, physical_tokens):
+                self.kvduo_coordinator.preview_kvduo_prefill_reclaim(
+                    req,
+                    planned_end,
+                    physical_tokens + max(0, self.rem_total_token_offset),
+                    self.tree_cache,
+                )
                 return AddReqResult.OTHER
 
             admitted, reservation = self._reserve_kvduo_prefill(req, planned_end)

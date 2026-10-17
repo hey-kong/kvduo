@@ -2524,7 +2524,9 @@ class HiSparseCoordinator:
         shortfall = max(0, sum(applicants.values()) - (common_free - reserved_pages))
         if shortfall > 0:
             self.reclaim_kvduo_full_pages(
-                shortfall * self.page_size, reserve_hot_minimum=True
+                shortfall * self.page_size,
+                reserve_hot_minimum=True,
+                included_prefill_pages=self._kvduo_prefill_plan_uncovered_pages(),
             )
 
             # A FULL donor can be in this replay batch. Publish every donor's
@@ -2818,6 +2820,7 @@ class HiSparseCoordinator:
 
     def _init_kvduo_capacity_state(self, requests: int) -> None:
         self._kvduo_hot_request_order = []
+        self._kvduo_full_prefill_hint = None
         self._kvduo_next_prefill_pages = 0
         self._kvduo_next_prefill_key = None
         self._kvduo_prefill_lifecycle = {}
@@ -3003,6 +3006,7 @@ class HiSparseCoordinator:
         state_cache = getattr(self, "kvduo_prefill_host_cache", None)
         if state_cache is not None:
             state_cache.poll()
+        self._kvduo_full_prefill_hint = None
         self._kvduo_next_prefill_pages = 0
         self._kvduo_next_prefill_key = None
         self._cleanup_kvduo_old_tails()
@@ -3010,6 +3014,7 @@ class HiSparseCoordinator:
     def kvduo_prefill_batch_allocated(self) -> None:
         # Allocations have completed. They now occupy physical pages rather
         # than requiring an additional next-plan protection.
+        self._kvduo_full_prefill_hint = None
         self._kvduo_next_prefill_pages = 0
         self._kvduo_next_prefill_key = None
 
@@ -3041,6 +3046,12 @@ class HiSparseCoordinator:
             self._kvduo_prefill_history.pop(key, None)
             self._kvduo_prefill_future_pages.pop(key, None)
             del self._kvduo_prefill_lifecycle[key]
+            hint = self._kvduo_full_prefill_hint
+            if hint is not None and hint[0] == key:
+                self._kvduo_full_prefill_hint = None
+            if self._kvduo_next_prefill_key == key:
+                self._kvduo_next_prefill_key = None
+                self._kvduo_next_prefill_pages = 0
         if request is not None and hasattr(request, "kvduo_prefill_generation"):
             del request.kvduo_prefill_generation
 
@@ -3181,6 +3192,39 @@ class HiSparseCoordinator:
             free = self._kvduo_common_available(pool.available_size() // page)
         return capacity - free + pending + need <= limit
 
+    def preview_kvduo_prefill_reclaim(self, req, end, physical_tokens, tree_cache):
+        """Record one plan without synchronizing budgets on every blocked step."""
+        if self._kvduo_full_prefill_hint is not None:
+            return
+        if not self.check_kvduo_prefill_total_capacity(req):
+            return
+        key = self._kvduo_prefill_key(req)
+        pages = max(
+            self.kvduo_prefill_pages(len(req.prefix_indices), end),
+            (physical_tokens + self.compress_ratio * self.page_size - 1)
+            // (self.compress_ratio * self.page_size),
+        )
+        self._kvduo_full_prefill_hint = (key, pages, tree_cache)
+
+    def _kvduo_full_reclaim_prefill_plan(self):
+        hint = self._kvduo_full_prefill_hint
+        if hint is None:
+            return None
+        key, pages, tree_cache = hint
+        req = self._kvduo_prefill_lifecycle.get(key)
+        if req is None or (callable(getattr(req, "finished", None)) and req.finished()):
+            return None
+        if not self._kvduo_prefill_history_ready(req, key, tree_cache):
+            return None
+        new_host = key not in self._kvduo_prefill_host_reservations
+        try:
+            if self._reserve_kvduo_prefill_host(req, key):
+                return key, pages
+        finally:
+            if new_host:
+                self._release_kvduo_prefill_host(key)
+        return None
+
     def reserve_kvduo_prefill(
         self,
         pages: int,
@@ -3255,6 +3299,8 @@ class HiSparseCoordinator:
             return token
         finally:
             if token is None:
+                if needs_host and self._kvduo_full_prefill_hint is None:
+                    self._kvduo_full_prefill_hint = (prefill_key, total, tree_cache)
                 if previous:
                     future[prefill_key] = previous
                 if new_host_reservation:
@@ -3938,6 +3984,7 @@ class HiSparseCoordinator:
         request_indices=None,
         release_all=False,
         tail_cleanup=False,
+        included_prefill_pages: int = 0,
     ) -> int:
         """Demote eligible request-owned FULL pages using the configured policy.
 
@@ -3952,6 +3999,11 @@ class HiSparseCoordinator:
                 self.decode_producer_stream
             )
         self.wait_for_pending_backup()
+        hint = (
+            self._kvduo_full_reclaim_prefill_plan()
+            if not (release_all or tail_cleanup or request_indices is not None)
+            else None
+        )
         tree_cache = getattr(self, "kvduo_tree_cache", None)
         plan_prefix = getattr(tree_cache, "kvduo_reclaimable_prefix", None)
         can_transfer = (
@@ -4115,6 +4167,9 @@ class HiSparseCoordinator:
         page_owners = [owner_indices[req_idx] for req_idx, _ in candidate_meta]
         costs = [minimum_costs.get(req_idx, 0) for req_idx in owners]
         needed = (num_tokens + self.page_size - 1) // self.page_size
+        if hint is not None:
+            # Optional growth's shortage already includes its plan protection.
+            needed += max(0, hint[1] - included_prefill_pages)
         admission_order = []
         for req_idx in owners:
             record = self._kvduo_decode_order.get(req_idx)
@@ -4226,6 +4281,14 @@ class HiSparseCoordinator:
                     intervals[-1] = (intervals[-1][0], max(intervals[-1][1], hi))
                 else:
                     intervals.append((lo, hi))
+        if (
+            hint is not None
+            and len(selected)
+            - sum(minimum_costs.get(owner, 0) for owner in first_holes)
+            >= needed
+        ):
+            self._kvduo_next_prefill_key, self._kvduo_next_prefill_pages = hint
+            self._kvduo_full_prefill_hint = None
         if tail_cleanup:
             self._publish_kvduo_tail_progress(progress)
         else:

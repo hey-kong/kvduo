@@ -685,3 +685,89 @@ def test_candidate_translation_bounds_temporary_indices_for_long_requests():
     mapping = c.mem_pool_device.full_to_hisparse_device_index_mapping
     assert not mapping[: 35000 * c.page_size].any()
     assert torch.equal(mapping[width:], original[width:])
+
+
+def install_prefill_hint(c, pages):
+    key = ("waiting", 1)
+    c._kvduo_prefill_lifecycle[key] = SimpleNamespace(finished=lambda: False)
+    c._kvduo_full_prefill_hint = (key, pages, None)
+    c._kvduo_prefill_history_ready = MagicMock(return_value=True)
+    c._reserve_kvduo_prefill_host = MagicMock(return_value=True)
+    return key
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_decode_reclaims_multiple_full_requests_for_one_waiting_prefill(ratio):
+    c, physical, _ = make_request_reclaim_coordinator([4, 4, 4], ratio=ratio)
+    key = install_prefill_hint(c, 5)
+    assert (
+        c.reclaim_kvduo_full_pages(c.page_size, reserve_hot_minimum=True)
+        == 8 * c.page_size
+    )
+    assert c._mixed_slots == [True, True, False]
+    assert physical.free_pages - c._kvduo_mandatory_hot_pages() == 6
+    assert c._kvduo_next_prefill_key == key
+    assert c._kvduo_next_prefill_pages == 5
+    assert c._kvduo_full_prefill_hint is None
+    c.reclaim_kvduo_hot_pages.assert_not_called()
+    c.kvduo_prefill_batch_allocated()
+    assert c._kvduo_next_prefill_pages == 0
+
+
+def test_optional_growth_does_not_count_prefill_protection_twice():
+    c, _, _ = make_request_reclaim_coordinator([4, 4, 4])
+    install_prefill_hint(c, 5)
+    assert (
+        c.reclaim_kvduo_full_pages(6 * c.page_size, included_prefill_pages=5)
+        == 8 * c.page_size
+    )
+    assert c._mixed_slots == [True, True, False]
+
+
+def test_unfunded_prefill_hint_never_increases_hot_merge_target():
+    c, _, _ = make_request_reclaim_coordinator([4])
+    install_prefill_hint(c, 20)
+    result = HiSparseCoordinator._reclaim_for_physical_allocation(
+        c, c.page_size, reserve_hot_minimum=True
+    )
+    assert result.remaining_shortfall_bytes == 0
+    c.reclaim_kvduo_hot_pages.assert_not_called()
+    assert c._kvduo_next_prefill_pages == 0
+
+
+def test_expired_prefill_hint_does_not_expand_full_reclaim():
+    c, _, _ = make_request_reclaim_coordinator([4, 4, 4])
+    key = install_prefill_hint(c, 20)
+    del c._kvduo_prefill_lifecycle[key]
+    assert c.reclaim_kvduo_full_pages(c.page_size) == 4 * c.page_size
+    assert c._mixed_slots == [True, False, False]
+
+
+@pytest.mark.parametrize("kwargs", [{"release_all": True}, {"request_indices": {0}}])
+def test_targeted_cleanup_does_not_fund_waiting_prefill(kwargs):
+    c, _, _ = make_request_reclaim_coordinator([4])
+    install_prefill_hint(c, 1)
+    assert c.reclaim_kvduo_full_pages(c.page_size, **kwargs) == 4 * c.page_size
+    assert c._kvduo_next_prefill_pages == 0
+    assert c._kvduo_full_prefill_hint is not None
+
+
+def test_cancelled_prefill_clears_reclaim_hint_and_optional_protection():
+    c, _, _ = make_request_reclaim_coordinator([4])
+    key = install_prefill_hint(c, 5)
+    request = c._kvduo_prefill_lifecycle[key]
+    c._kvduo_next_prefill_key = key
+    c._kvduo_next_prefill_pages = 5
+    c._end_kvduo_prefill_lifecycle(None, request)
+    assert c._kvduo_full_prefill_hint is None
+    assert c._kvduo_next_prefill_pages == 0
+    assert c._kvduo_next_prefill_key is None
+
+
+def test_reclaim_does_not_expand_for_prefill_above_history_budget():
+    c, _, _ = make_request_reclaim_coordinator([4, 4, 4])
+    install_prefill_hint(c, 20)
+    c._kvduo_prefill_history_ready.return_value = False
+    assert c.reclaim_kvduo_full_pages(c.page_size) == 4 * c.page_size
+    assert c._mixed_slots == [True, False, False]
+    c._reserve_kvduo_prefill_host.assert_not_called()
