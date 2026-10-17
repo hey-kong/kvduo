@@ -559,7 +559,7 @@ def test_coordinator_passes_actual_mixed_state_to_request_selection():
 
 
 @pytest.mark.parametrize("prefill_pages,admitted", [(3, True), (4, False)])
-def test_prefill_rechecks_only_real_surplus_after_decode_request_reclaim(
+def test_prefill_uses_surplus_then_attempts_only_full_after_decode_reclaim(
     prefill_pages, admitted
 ):
     from types import MethodType
@@ -567,8 +567,6 @@ def test_prefill_rechecks_only_real_surplus_after_decode_request_reclaim(
     c, p, req = make_full_coordinator(layers=2)
     req.decode_batch_idx = 0
     c.reclaim_kvduo_full_pages = MagicMock(wraps=c.reclaim_kvduo_full_pages)
-    assert c.reserve_kvduo_prefill(prefill_pages) is None
-    c.reclaim_kvduo_full_pages.assert_not_called()
     c._reclaim_for_physical_allocation = MethodType(
         HiSparseCoordinator._reclaim_for_physical_allocation, c
     )
@@ -580,7 +578,8 @@ def test_prefill_rechecks_only_real_surplus_after_decode_request_reclaim(
     calls = c.reclaim_kvduo_full_pages.call_count
     token = c.reserve_kvduo_prefill(prefill_pages)
     assert (token is not None) == admitted
-    assert c.reclaim_kvduo_full_pages.call_count == calls
+    assert c.reclaim_kvduo_full_pages.call_count == calls + int(not admitted)
+    c.reclaim_kvduo_hot_pages.assert_not_called()
     c.prepare_kvduo_graph_replay(torch.tensor([0]))
     assert c.kvduo_req_hot_capacity[:, 0].tolist() == [4, 4]
     assert p.free_pages == 3

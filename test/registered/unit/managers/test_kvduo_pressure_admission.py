@@ -200,8 +200,8 @@ def make_full_coordinator(*, pages=8, layers=1, ratio=1, initial_pages=2):
     coordinator.req_to_token_pool = SimpleNamespace(
         req_to_token=torch.arange(full_count).view(1, -1)
     )
-    coordinator.mem_pool_device.translate_loc_from_full_to_compressed = lambda indices: (
-        indices[ratio - 1 :: ratio] // ratio
+    coordinator.mem_pool_device.translate_loc_from_full_to_compressed = (
+        lambda indices: (indices[ratio - 1 :: ratio] // ratio)
     )
     coordinator.mem_pool_device.full_to_hisparse_device_index_mapping = torch.arange(
         coordinator.page_size, coordinator.page_size + count
@@ -289,15 +289,16 @@ def test_decode_defers_when_full_reclaim_cannot_fund_new_mixed_minima():
 
 
 @pytest.mark.parametrize("ratio", [1, 4])
-def test_prefill_never_demotes_active_full_even_with_net_reclaimable_pages(ratio):
+def test_prefill_demotes_full_before_first_decode_but_never_merges_hot(ratio):
     c, physical, req = make_full_coordinator(layers=2, ratio=ratio)
-    before = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
-    assert c.reserve_kvduo_prefill(1) is None
-    assert physical.free_pages == 0
-    assert c._kvduo_mandatory_hot_pages() == 0
-    assert not c._kvduo_reserved_prefill_pages()
-    assert not c._mixed_slots[0]
-    assert torch.equal(c.mem_pool_device.full_to_hisparse_device_index_mapping, before)
+    c._kvduo_decode_order.clear()
+    req.kv_committed_len = req.kv.kv_allocated_len
+    req.full_untruncated_fill_ids = list(range(req.kv_committed_len + 1))
+    assert c.reserve_kvduo_prefill(1) is not None
+    assert physical.free_pages == 6
+    assert c._kvduo_mandatory_hot_pages() == 2
+    assert c._kvduo_reserved_prefill_pages() == 1
+    assert c._mixed_slots[0]
     c.reclaim_kvduo_hot_pages.assert_not_called()
 
 
@@ -316,13 +317,13 @@ def test_prefill_full_protection_preserves_incoming_prefix_and_earlier_reservati
     physical.free_pages = 1
     first = coordinator.reserve_kvduo_prefill(1)
     second = coordinator.reserve_kvduo_prefill(1, prefix_indices=torch.arange(4))
-    assert first is not None and second is None
+    assert first is not None and second is not None
     mapping = coordinator.mem_pool_device.full_to_hisparse_device_index_mapping
     assert torch.all(mapping[:4] > 0)
     assert req.kvduo_radix_insert_len == 4
-    assert physical.free_pages == 1
-    assert coordinator._kvduo_mandatory_hot_pages() == 0
-    assert coordinator._kvduo_reserved_prefill_pages() == 1
+    assert physical.free_pages == 5
+    assert coordinator._kvduo_mandatory_hot_pages() == 2
+    assert coordinator._kvduo_reserved_prefill_pages() == 2
 
 
 @pytest.mark.parametrize("ratio", [1, 4])
@@ -397,3 +398,24 @@ def test_mandatory_hot_allocation_cannot_spend_reserved_prefill_pages(allow_recl
     assert physical.free_pages == 1
     assert coordinator.kvduo_req_hot_capacity[0, 0].item() == 0
     assert coordinator._kvduo_reserved_prefill_pages() == 1
+
+
+@pytest.mark.parametrize(
+    "protected_by", ["staging", "incoming", "earlier_batch_member"]
+)
+def test_prefill_full_reclaim_excludes_requests_in_prefill_use(protected_by):
+    c, physical, req = make_full_coordinator(layers=2)
+    kwargs = {}
+    if protected_by == "staging":
+        req.hisparse_staging = True
+    elif protected_by == "incoming":
+        kwargs["prefill_req"] = req
+    else:
+        key = c._kvduo_prefill_key(req)
+        c._kvduo_prefill_reservation_requests[99] = key
+        c._kvduo_prefill_reservations[99] = [0]
+    before = c.mem_pool_device.full_to_hisparse_device_index_mapping.clone()
+    assert c.reserve_kvduo_prefill(1, **kwargs) is None
+    assert physical.free_pages == 0
+    assert torch.equal(before, c.mem_pool_device.full_to_hisparse_device_index_mapping)
+    c.reclaim_kvduo_hot_pages.assert_not_called()

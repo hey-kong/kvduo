@@ -36,7 +36,7 @@ def test_chunk_admission_pauses_and_resumes_without_whole_prompt_hold():
     assert adder.kvduo_prefill_blocked
     assert not adder.can_run_list
     assert req.extend_range.end == 6
-    c.reclaim_kvduo_full_pages.assert_not_called()
+    c.reclaim_kvduo_full_pages.assert_called_once()
     # Decode/request completion has released space at a later boundary.
     physical.free_pages = 2
     adder.kvduo_prefill_blocked = False

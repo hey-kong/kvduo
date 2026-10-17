@@ -135,7 +135,12 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
             indices.view(-1, coordinator.page_size)[:, 0].tolist()
         )
 
+    from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+
     coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+        logical_attn_allocator=PagedTokenToKVPoolAllocator(
+            4096, coordinator.page_size, torch.int64, "cpu", None, False
+        ),
         hisparse_attn_allocator=physical,
         free_hisparse_indices=MagicMock(side_effect=free),
     )
