@@ -366,3 +366,20 @@ def test_tp_merge_allows_different_local_pages_and_survivor_counts(tmp_path):
         join=True,
         start_method="spawn",
     )
+
+
+@pytest.mark.parametrize("pages,released", [(2, 0), (4, 2)])
+def test_successful_merge_logs_actual_capacity_and_release(caplog, pages, released):
+    c, _ = make_merge_coordinator({(0, 0): pages})
+    with caplog.at_level("INFO"):
+        assert c._merge_kvduo_hot_pages(0, 0) == released * c.page_size
+    messages = [
+        r.getMessage()
+        for r in caplog.records
+        if "KVDuo HOT merge completed" in r.getMessage()
+    ]
+    assert messages == [
+        "KVDuo HOT merge completed: req_pool_idx=0, layer_id=0, "
+        f"physical_blocks_before={pages}, physical_blocks_after=2, "
+        f"released_physical_blocks={released}, hot_entries_per_block=4"
+    ]

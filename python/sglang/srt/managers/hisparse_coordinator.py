@@ -2748,6 +2748,17 @@ class HiSparseCoordinator:
             released,
             self.page_size,
         )
+        logger.info(
+            "KVDuo HOT merge completed: req_pool_idx=%d, layer_id=%d, "
+            "physical_blocks_before=%d, physical_blocks_after=%d, "
+            "released_physical_blocks=%d, hot_entries_per_block=%d",
+            req_idx,
+            layer_id,
+            len(pages),
+            len(kept),
+            len(released),
+            self.hot_page_size,
+        )
         return len(released) * self.page_size
 
     def reclaim_kvduo_hot_pages(self, num_tokens):
