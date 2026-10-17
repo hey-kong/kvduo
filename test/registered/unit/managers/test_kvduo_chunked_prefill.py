@@ -134,7 +134,7 @@ def test_kvduo_keeps_chunked_prefill_enabled():
     assert json.loads(args.hisparse_config) == {
         "top_k": 512,
         "device_buffer_size": 8192,
-        "host_to_device_ratio": 2,
+        "host_to_device_ratio": 2.5,
         "swap_in_block_size": 960,
     }
 

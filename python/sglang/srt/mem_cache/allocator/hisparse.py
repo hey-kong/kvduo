@@ -1,3 +1,4 @@
+import math
 import weakref
 
 import torch
@@ -21,7 +22,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: torch.device,
         kvcache: HiSparseDSATokenToKVPool,
         need_sort: bool,
-        host_to_device_ratio: int = 2,
+        host_to_device_ratio: float = 2,
         logical_size: int | None = None,
     ):
         if logical_size is not None and (
@@ -32,7 +33,13 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         self._kvcache = kvcache
         self._size_full = (
-            size * host_to_device_ratio if logical_size is None else logical_size
+            (
+                math.ceil(size * host_to_device_ratio / page_size) * page_size
+                if getattr(kvcache, "enable_kvduo", False)
+                else size * host_to_device_ratio
+            )
+            if logical_size is None
+            else logical_size
         )
         self._size_hisparse = size
         self.compress_ratio = 1

@@ -305,7 +305,7 @@ def collect_model_override_declarations(
             for _, declared in declarations:
                 ratio = declared.get("swa_full_tokens_ratio", ratio)
             declarations.append(
-                ("kvduo_swa_default", {"swa_full_tokens_ratio": ratio / 2})
+                ("kvduo_swa_default", {"swa_full_tokens_ratio": ratio / 2.5})
             )
     return declarations
 

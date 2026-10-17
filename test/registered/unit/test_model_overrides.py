@@ -847,7 +847,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "flashinfer_trtllm_routed",
         )
 
-    def test_kvduo_halves_effective_model_swa_default(self):
+    def test_kvduo_scales_effective_model_swa_default(self):
         from sglang.srt.server_args import ServerArgs
 
         for arch, baseline in (("NoSuchArch", 0.8), ("DeepseekV4ForCausalLM", 0.1)):
@@ -880,7 +880,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             effective = declared.get("swa_full_tokens_ratio", effective)
                         expected = supplied
                         if supplied == ServerArgs.swa_full_tokens_ratio:
-                            expected = baseline / 2 if kvduo else baseline
+                            expected = baseline / 2.5 if kvduo else baseline
                         self.assertEqual(effective, expected)
                         self.assertEqual(args.swa_full_tokens_ratio, supplied)
                         self.assertEqual(

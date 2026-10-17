@@ -180,7 +180,10 @@ def test_generic_planning_preserves_distinct_physical_and_logical_sizes(logical_
     if logical_tokens:
         assert config.kvduo_logical_tokens == 1024
     else:
-        assert config.kvduo_logical_tokens == 2 * config.max_total_num_tokens
+        assert (
+            config.kvduo_logical_tokens
+            == (int(2.5 * config.max_total_num_tokens) + 63) // 64 * 64
+        )
     pool = HiSparseDSATokenToKVPool(
         size=config.max_total_num_tokens,
         logical_size=config.kvduo_logical_tokens,
@@ -301,3 +304,26 @@ def test_physical_reduction_reports_missing_headroom_without_shrinking_logical(c
     assert restored.physical_tokens == 100
     assert restored.logical_tokens == 200
     assert not caplog.records
+
+
+@pytest.mark.parametrize("extra", [0, 1000])
+def test_fractional_logical_ratio_uses_integer_aligned_capacity(extra):
+    plan = plan_gpu_budget(1000, extra, 8, 2, 10, 2.51, 8)
+    assert plan.logical_tokens == 248
+    assert isinstance(plan.logical_tokens, int)
+    assert isinstance(plan.physical_tokens, int)
+    assert plan.allocated_bytes <= 1000 + extra
+
+
+def test_dsv4_fractional_ratio_constraint_path_has_integer_sizes():
+    planner = dsv4(ratio=2.5)
+    config = planner.calculate_pool_sizes_from_max_tokens(8192, 256)
+    for name in (
+        "full_max_total_num_tokens",
+        "c4_max_total_num_tokens",
+        "c128_max_total_num_tokens",
+        "swa_max_total_num_tokens",
+    ):
+        assert isinstance(getattr(config, name), int)
+    profiled = planner.calculate_pool_sizes(1 << 28, 256)
+    assert isinstance(profiled.full_max_total_num_tokens, int)

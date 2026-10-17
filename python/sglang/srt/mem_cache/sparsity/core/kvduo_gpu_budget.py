@@ -1,6 +1,7 @@
 """Physical-cache targets and separately budgeted logical backing for KVDuo."""
 
 import logging
+import math
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ def plan_gpu_budget(
     limit = budget + extra_budget
     # Fix the address-space target before sizing physical storage. Reducing
     # the physical pool must not silently reduce indexer/history capacity.
-    logical = logical_tokens or target * logical_ratio
+    logical = logical_tokens or math.ceil(target * logical_ratio)
     logical = (logical + page_size - 1) // page_size * page_size
     physical = min(
         target, logical, int((limit - logical * logical_bytes) // physical_bytes)

@@ -25,7 +25,7 @@ def test_host_size_config_and_independent_hbm_alias(value):
     )
     args._handle_kvduo_aliases()
     assert parse_kvduo_config(args).host_size == value
-    assert parse_hisparse_config(args).host_to_device_ratio == 2
+    assert parse_hisparse_config(args).host_to_device_ratio == 2.5
 
 
 def test_defaults_match_hicache_auto_semantics():
@@ -176,14 +176,14 @@ def test_dsv4_hbm_layout_is_independent_of_host_size():
             ps=SimpleNamespace(pp_size=1, attn_dp_size=1),
         )
         plan = DSV4PoolConfigurator(kvc)
-        assert plan.c4_shrink_factor == 2
+        assert plan.c4_shrink_factor == 2.5
         results.append((plan.bytes_per_full_token, plan._compute_dsv4_sizes(8192, 256)))
     assert results[0] == results[1] == results[2]
     sizes = results[0][1]
-    assert sizes.full_max_total_num_tokens == 2 * 4 * sizes.c4_max_total_num_tokens
+    assert sizes.c4_max_total_num_tokens == int(sizes.full_max_total_num_tokens // (2.5 * 4))
 
 
-@pytest.mark.parametrize("raw", ["0", "-1", "true", "1.5", '"2"', "null"])
+@pytest.mark.parametrize("raw", ["0", "-1", "true", "0.5", "NaN", "Infinity", '"2"', "null"])
 def test_invalid_logical_capacity_ratio(raw):
     with pytest.raises(ValueError, match="logical_capacity_ratio"):
         parse_kvduo_config(
@@ -192,7 +192,7 @@ def test_invalid_logical_capacity_ratio(raw):
 
 
 @pytest.mark.parametrize("host_size", [0, 0.5, 64])
-@pytest.mark.parametrize("logical_ratio", [2, 4])
+@pytest.mark.parametrize("logical_ratio", [1.5, 2, 2.5, 4])
 def test_generic_logical_slots_survive_physical_offload(host_size, logical_ratio):
     import torch
     from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool

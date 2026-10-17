@@ -73,7 +73,7 @@ class KVDuoConfig:
 
     top_k: int = 2048
     host_size: float = 0
-    logical_capacity_ratio: int = 2
+    logical_capacity_ratio: float = 2.5
     logical_capacity_tokens: int = 0
     swap_in_block_size: int = 960
     tail_protected_pages: int = 2

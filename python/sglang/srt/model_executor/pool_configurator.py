@@ -14,6 +14,7 @@ Two entry points, same core computation:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -393,7 +394,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 "_kvduo_profiled_logical",
                 self._kvduo_logical_target or max_total_num_tokens * self._kvduo_ratio,
             )
-            logical = (logical + page_size - 1) // page_size * page_size
+            logical = (math.ceil(logical) + page_size - 1) // page_size * page_size
             max_total_num_tokens = min(max_total_num_tokens, logical)
         return MemoryPoolConfig(
             max_total_num_tokens=max_total_num_tokens, kvduo_logical_tokens=logical
@@ -854,7 +855,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,
-            c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
+            c4_max_total_num_tokens=int(full_token // (4 * self.c4_shrink_factor)),
             c128_max_total_num_tokens=full_token // 128,
             c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,
             c128_state_pool_size=0,
@@ -1016,8 +1017,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return self._to_config(sizes)
 
     def _kvduo_sizes(self, physical, logical, page_size):
-        physical = physical // page_size * page_size
-        logical = logical // page_size * page_size
+        physical = int(physical // page_size) * page_size
+        logical = int(logical // page_size) * page_size
         if physical <= 0 or logical < physical:
             raise ValueError(
                 "KVDuo requires nonempty physical capacity covered by logical slots"
