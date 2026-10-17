@@ -444,3 +444,87 @@ def test_merge_target_counts_valid_threes_before_mutation(count):
             buffer, k=k, minimum=1, top_k=512, paged=False, workspace=workspace
         ) == max(1, (count + k - 1) // k)
     assert unpack_frequency(buffer.frequency, capacity) == [3] * capacity
+
+
+@pytest.mark.parametrize("block_size", [256, 960])
+@pytest.mark.parametrize("capacity", [513, 1009, 4097])
+def test_packed_hit_updates_preserve_neighbors_and_duplicate_counts(
+    block_size, capacity
+):
+    c, buffers, selected, requests, lengths, output, backing, host = fixture()
+    c.swap_in_block_size = block_size
+    b = FrequencyBuffer.empty(
+        torch.arange(3072, 3072 + capacity, dtype=torch.int32, device="cuda")
+    )
+    live = min(capacity, 1024)
+    b.tokens[:live] = torch.arange(live, dtype=torch.int32, device="cuda")
+    c.kvduo_hot_pointers[0, 1].copy_(
+        torch.tensor(b.pointers(), dtype=torch.int64, device="cuda")
+    )
+    c.kvduo_req_hot_capacity_gpu[0, 1] = capacity
+    run = lambda: resolve(c, 0, requests, lengths, selected, output)
+    selected[1] = torch.arange(512, device="cuda") % live
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for observe in (1, 0, 1):
+        freq = [(i * 7 + i // 16) % 4 for i in range(capacity)]
+        b.frequency.copy_(pack_frequency(freq, device="cuda"))
+        # Include duplicate accesses, word/warp boundaries, and the final live slot.
+        ids = [(i * 17) % live for i in range(512)]
+        ids[:16] = [live - 1] * 16
+        selected[1].copy_(torch.tensor(ids, dtype=torch.int32, device="cuda"))
+        c.kvduo_observe.fill_(observe)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = freq[:]
+        if observe:
+            for token in ids:
+                expected[token] = min(3, expected[token] + 1)
+        assert unpack_frequency(b.frequency, capacity) == expected
+        assert output[1].tolist() == [3072 + token for token in ids]
+        assert c.kvduo_hot_growth_events[0, 1].item() == 0
+
+
+def test_forced_no_shrink_merge_decays_in_place_without_payload_changes():
+    capacity, k = 576, 64
+    backing = torch.arange(1024 * 4, device="cuda", dtype=torch.int32).view(-1, 4)
+    b = FrequencyBuffer.empty(
+        torch.arange(64, 64 + capacity, dtype=torch.int32, device="cuda")
+    )
+    tokens = [i if i % 11 else -1 for i in range(capacity)]
+    freq = [i % 4 for i in range(capacity)]
+    b.tokens.copy_(torch.tensor(tokens, dtype=torch.int32, device="cuda"))
+    b.frequency.copy_(pack_frequency(freq, device="cuda"))
+    b.selected.fill_(1)
+    pointers = torch.tensor(b.pointers(), dtype=torch.int64, device="cuda")
+    published_capacity = torch.tensor([capacity], dtype=torch.int32, device="cuda")
+    growth = torch.ones(1, dtype=torch.int32, device="cuda")
+    before = backing.clone()
+    workspace = {}
+    for _ in range(2):
+        expected = plan_frequency_merge(tokens, freq, k, capacity // k)
+        new, kept = merge(
+            b,
+            backing,
+            k=k,
+            minimum=capacity // k,
+            paged=False,
+            top_k=512,
+            item_bytes=16,
+            workspace=workspace,
+            publication=(pointers, published_capacity, growth),
+        )
+        torch.cuda.synchronize()
+        assert new is b
+        assert kept == expected.kept_pages
+        assert b.tokens.tolist() == list(expected.tokens)
+        assert unpack_frequency(b.frequency, capacity) == list(expected.frequency)
+        assert torch.equal(backing, before)
+        assert pointers.tolist() == b.pointers()
+        assert published_capacity.item() == capacity
+        assert growth.item() == 0
+        assert not b.selected.any()
+        assert workspace == {}
+        tokens, freq = list(expected.tokens), list(expected.frequency)

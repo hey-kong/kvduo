@@ -152,3 +152,15 @@ def _warmup(backing, page_size, storage_layers, top_k, paged, block_size=256):
         or sorted(merged.tokens[merged.tokens >= 0].tolist()) != survivors
     ):
         raise RuntimeError("KVDuo frequency merge warmup failed")
+    decayed, _ = merge(
+        merged,
+        payload,
+        k=k,
+        minimum=minimum,
+        paged=paged,
+        top_k=top_k,
+        item_bytes=backing[0].numel() * backing.element_size(),
+        publication=(pointers[0], published_capacity, growth),
+    )
+    if decayed is not merged or bool((decayed.tokens >= 0).any().item()):
+        raise RuntimeError("KVDuo in-place frequency decay warmup failed")

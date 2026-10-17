@@ -16,6 +16,7 @@ def module(top_k, paged, block_size=256):
         cuda_wrappers=[
             ("resolve", f"resolve_frequency<{args}>"),
             ("merge_target", "frequency_merge_target"),
+            ("decay", "decay_frequency"),
             ("merge", f"merge_frequency<{make_cpp_args(paged)}>"),
         ],
     )
@@ -115,6 +116,19 @@ def merge(
         ):
             raise ValueError("Invalid KVDuo merge publication layout")
     pages = capacity // k
+    if minimum == pages:
+        # TP may force the current capacity to retain another rank's survivors.
+        # No page moves or releases are possible; preserve addresses and prune
+        # locally in stream order without allocating or downloading a plan.
+        module(top_k, paged).decay(
+            buffer.tokens.data_ptr(),
+            buffer.frequency.data_ptr(),
+            buffer.selected.data_ptr(),
+            capacity,
+            publication[2].data_ptr() if publication is not None else 0,
+            torch.cuda.current_stream(backing.device).cuda_stream,
+        )
+        return buffer, tuple(range(pages))
     # The plan initializes all output token/location/frequency entries.
     storage = (
         torch.empty_like(buffer.tokens),
