@@ -18,7 +18,6 @@ from sglang.kernels.ops.kvcache.kvduo_full_decode import (
     begin_kvduo_decode,
 )
 from sglang.kernels.ops.kvcache.kvduo_full_reclaim import (
-    select_kvduo_full_pages,
     select_kvduo_full_requests,
     summarize_kvduo_full_pages,
 )
@@ -162,7 +161,6 @@ class HiSparseCoordinator:
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
         tail_protected_pages: int = 0,
-        full_reclaim_policy: str = "request",
         decode_emergency_reclaim: bool = False,
         kvduo_host_size: float | None = None,
     ):
@@ -181,9 +179,6 @@ class HiSparseCoordinator:
         self.swap_in_block_size = swap_in_block_size
         self.tail_protected_pages = tail_protected_pages
         self.enable_mixed_residency = tail_protected_pages > 0
-        if full_reclaim_policy not in ("request", "page"):
-            raise ValueError("full_reclaim_policy must be 'request' or 'page'")
-        self.full_reclaim_policy = full_reclaim_policy
         if not isinstance(decode_emergency_reclaim, bool):
             raise ValueError("decode_emergency_reclaim must be a boolean")
         self.decode_emergency_reclaim = decode_emergency_reclaim
@@ -1497,7 +1492,6 @@ class HiSparseCoordinator:
         allow_full_reclaim: bool = True,
         hot_minimum_credit: int = 0,
         allow_emergency_hot_reclaim: bool = False,
-        preferred_full_requests=(),
     ) -> KVDuoPressureResult:
         """Reclaim physical KV pages while protecting pending allocations.
 
@@ -1602,18 +1596,6 @@ class HiSparseCoordinator:
             if reserve_hot_minimum:
                 reclaimed_slots = 0
                 remaining = max(0, need_size + minimum_slots - available_slots())
-                if self.full_reclaim_policy == "page":
-                    for req_idx, demand in preferred_full_requests:
-                        if remaining <= 0:
-                            break
-                        reclaimed_slots += self.reclaim_kvduo_full_pages(
-                            min(remaining, demand),
-                            reserve_hot_minimum=True,
-                            request_indices={req_idx},
-                        )
-                        remaining = max(
-                            0, need_size + minimum_slots - available_slots()
-                        )
                 if remaining > 0:
                     reclaimed_slots += self.reclaim_kvduo_full_pages(
                         remaining, reserve_hot_minimum=True
@@ -1728,7 +1710,6 @@ class HiSparseCoordinator:
         if not self.enable_mixed_residency:
             return self._reclaim_for_physical_allocation(0)
         pages = 0
-        preferred = {}
         if self.is_dsv4_hisparse:
             page = self.page_size
             for req in requests:
@@ -1738,29 +1719,12 @@ class HiSparseCoordinator:
                 compressed_len = next_len // self.compress_ratio
                 if (compressed_len - 1) % page == 0:
                     pages += 1
-                    preferred[req.req_pool_idx] = self.page_size
         else:
             logical_page = self.token_to_kv_pool_allocator.page_size
             for req in requests:
                 if req.kv_committed_len % logical_page == 0:
                     pages += 1
-                    preferred[req.req_pool_idx] = self.page_size
-        for req_idx in sorted(self._kvduo_pending_hot_minimum):
-            if req_idx not in self._active_kvduo_reqs:
-                continue
-            missing = sum(
-                max(
-                    0,
-                    self.min_hot_pages
-                    - int(self.kvduo_req_hot_capacity[layer, req_idx])
-                    // self.hot_page_size,
-                )
-                for layer in range(self.mem_pool_device.layer_num)
-            )
-            if missing:
-                preferred[req_idx] = (
-                    preferred.get(req_idx, 0) + missing * self.page_size
-                )
+
         host_slots = self._kvduo_decode_host_slots(requests)
         required_host_slots = host_slots + sum(
             reservation[1]
@@ -1794,7 +1758,6 @@ class HiSparseCoordinator:
         return self._reclaim_for_physical_allocation(
             pages * self.page_size,
             reserve_hot_minimum=True,
-            preferred_full_requests=tuple(sorted(preferred.items())),
             allow_emergency_hot_reclaim=(
                 self.decode_emergency_reclaim and pages + minimum_pages > 0
             ),
@@ -1814,7 +1777,7 @@ class HiSparseCoordinator:
             "physical_free_pages=%d, pending_hot_minimum_pages=%d, "
             "prefill_reserved_pages=%d, host_available=%d, "
             "host_prefill_reserved=%d, reclaimed_bytes=%d, shortfall_bytes=%d, "
-            "full_reclaim_policy=%s, decode_emergency_reclaim=%s",
+            "decode_emergency_reclaim=%s",
             pressure.reason.name if pressure is not None else "LOGICAL_OR_SWA_SHORTAGE",
             (
                 pressure.detail
@@ -1837,7 +1800,6 @@ class HiSparseCoordinator:
             ),
             pressure.reclaimed_bytes if pressure is not None else 0,
             pressure.remaining_shortfall_bytes if pressure is not None else 0,
-            self.full_reclaim_policy,
             self.decode_emergency_reclaim,
         )
 
@@ -2547,25 +2509,9 @@ class HiSparseCoordinator:
 
         shortfall = max(0, sum(applicants.values()) - (common_free - reserved_pages))
         if shortfall > 0:
-            if self.full_reclaim_policy == "page":
-                for req_idx in sorted({req for _, req in applicants}):
-                    if shortfall == 0:
-                        break
-                    demand = sum(
-                        pages
-                        for (_, req), pages in applicants.items()
-                        if req == req_idx
-                    )
-                    self.reclaim_kvduo_full_pages(
-                        min(shortfall, demand) * self.page_size,
-                        reserve_hot_minimum=True,
-                        request_indices={req_idx},
-                    )
-                    shortfall = growth_shortfall()
-            if shortfall > 0:
-                self.reclaim_kvduo_full_pages(
-                    shortfall * self.page_size, reserve_hot_minimum=True
-                )
+            self.reclaim_kvduo_full_pages(
+                shortfall * self.page_size, reserve_hot_minimum=True
+            )
 
             # A FULL donor can be in this replay batch. Publish every donor's
             # compulsory HOT minimum before optional growth or graph execution.
@@ -4030,8 +3976,7 @@ class HiSparseCoordinator:
 
         minimum_costs = {}
         owners = sorted({req_idx for req_idx, _ in candidate_meta})
-        request_policy = self.full_reclaim_policy == "request"
-        if reserve_hot_minimum or (request_policy and not release_all):
+        if reserve_hot_minimum or not release_all:
             # The first FULL demotion needs minimum HOT capacity in EVERY
             # logical layer. An allocation cannot count these as free space,
             # or make a fully resident request mixed without room to execute.
@@ -4053,34 +3998,24 @@ class HiSparseCoordinator:
         page_owners = [owner_indices[req_idx] for req_idx, _ in candidate_meta]
         costs = [minimum_costs.get(req_idx, 0) for req_idx in owners]
         needed = (num_tokens + self.page_size - 1) // self.page_size
-        if request_policy:
-            admission_order = []
-            for req_idx in owners:
-                record = self._kvduo_decode_order.get(req_idx)
-                admission_order.append(
-                    record[1]
-                    if record is not None
-                    and record[0] == self._kvduo_request_generation[req_idx]
-                    else torch.iinfo(torch.int64).max
-                )
-            selected = select_kvduo_full_requests(
-                valid,
-                page_owners,
-                costs,
-                admission_order,
-                needed,
-                release_all=release_all,
-                mixed_owners=[self._mixed_slots[req_idx] for req_idx in owners],
+        admission_order = []
+        for req_idx in owners:
+            record = self._kvduo_decode_order.get(req_idx)
+            admission_order.append(
+                record[1]
+                if record is not None
+                and record[0] == self._kvduo_request_generation[req_idx]
+                else torch.iinfo(torch.int64).max
             )
-        else:
-            selected = select_kvduo_full_pages(
-                page_touch,
-                valid,
-                page_owners,
-                costs,
-                needed,
-                release_all=release_all,
-            )
+        selected = select_kvduo_full_requests(
+            valid,
+            page_owners,
+            costs,
+            admission_order,
+            needed,
+            release_all=release_all,
+            mixed_owners=[self._mixed_slots[req_idx] for req_idx in owners],
+        )
 
         selection = tuple(candidate_meta[i] for i in selected)
         progress = ()
@@ -4176,7 +4111,7 @@ class HiSparseCoordinator:
                     intervals.append((lo, hi))
         if tail_cleanup:
             self._publish_kvduo_tail_progress(progress)
-        elif request_policy:
+        else:
             logger.info(
                 "KVDuo FULL request reclaim completed: requests=%d, "
                 "released_physical_blocks=%d, physical_block_tokens=%d",

@@ -13,9 +13,7 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def hot_request(ratio=1):
-    c, p, req = make_full_coordinator(
-        pages=10, ratio=ratio, full_reclaim_policy="request"
-    )
+    c, p, req = make_full_coordinator(pages=10, ratio=ratio)
     req.kv.kv_allocated_len = 8 * c.page_size * ratio
     assert c.kvduo_residency_mode(0) is KVDuoResidencyMode.FULL_RESIDENT
     c.reclaim_kvduo_full_pages(c.page_size, reserve_hot_minimum=True)
@@ -125,9 +123,7 @@ def test_busy_decode_producer_is_stream_ordered_not_required_to_be_idle(monkeypa
 def test_long_output_scans_each_expired_page_once(monkeypatch, ratio):
     import sglang.srt.managers.hisparse_coordinator as module
 
-    c, _, req = make_full_coordinator(
-        pages=108, ratio=ratio, full_reclaim_policy="request"
-    )
+    c, _, req = make_full_coordinator(pages=108, ratio=ratio)
     req.kv.kv_allocated_len = 8 * c.page_size * ratio
     c.reclaim_kvduo_full_pages(c.page_size, reserve_hot_minimum=True)
     summarize = MagicMock(wraps=module.summarize_kvduo_full_pages)

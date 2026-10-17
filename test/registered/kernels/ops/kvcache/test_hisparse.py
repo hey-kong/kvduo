@@ -861,23 +861,21 @@ def test_full_page_touch_aggregation_keeps_outputs_counts_and_page_age(compact):
 def test_full_reclaim_gpu_selection_scans_multiple_tiles_and_charges_interleaved_owners(
     needed, costs, release_all
 ):
-    from sglang.kernels.ops.kvcache.kvduo_full_reclaim import select_kvduo_full_pages
+    from sglang.kernels.ops.kvcache.kvduo_full_reclaim import select_kvduo_full_requests
 
     generator = torch.Generator().manual_seed(782)
     owners = [0] * 130 + [1] * 131 + [2] * 128 + [3] * 132
-    scores = torch.randint(0, 20, (len(owners),), generator=generator)
     valid = (torch.rand(len(owners), generator=generator) > 0.2).int()
-    scores[-2:] = torch.iinfo(torch.int64).max
     valid[-2:] = torch.tensor([0, 1])
-    expected = select_kvduo_full_pages(
-        scores, valid, owners, costs, needed, release_all=release_all
+    expected = select_kvduo_full_requests(
+        valid, owners, costs, list(range(len(costs))), needed, release_all=release_all
     )
     assert (
-        select_kvduo_full_pages(
-            scores.to(DEVICE),
+        select_kvduo_full_requests(
             valid.to(DEVICE),
             owners,
             costs,
+            list(range(len(costs))),
             needed,
             release_all=release_all,
         )
@@ -892,7 +890,7 @@ def test_full_reclaim_gpu_summary_and_selection_match_cpu_with_multiple_requests
     page_size, release_all, index_dtype
 ):
     from sglang.kernels.ops.kvcache.kvduo_full_reclaim import (
-        select_kvduo_full_pages,
+        select_kvduo_full_requests,
         summarize_kvduo_full_pages,
     )
 
@@ -918,12 +916,12 @@ def test_full_reclaim_gpu_summary_and_selection_match_cpu_with_multiple_requests
         torch.equal(actual.cpu(), expected) for actual, expected in zip(gpu, cpu)
     )
     owners, costs = [0] * 4 + [1] * 4 + [2] * 4, [1, 2, 1]
-    expected = select_kvduo_full_pages(
-        cpu[1], cpu[2], owners, costs, 2, release_all=release_all
+    expected = select_kvduo_full_requests(
+        cpu[2], owners, costs, [0, 1, 2], 2, release_all=release_all
     )
     assert (
-        select_kvduo_full_pages(
-            gpu[1], gpu[2], owners, costs, 2, release_all=release_all
+        select_kvduo_full_requests(
+            gpu[2], owners, costs, [0, 1, 2], 2, release_all=release_all
         )
         == expected
     )

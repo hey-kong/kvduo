@@ -129,7 +129,6 @@ def test_decode_shortage_uses_pressure_path_and_preserves_budget_rejection(short
         c._reclaim_for_physical_allocation.assert_called_once_with(
             64,
             reserve_hot_minimum=True,
-            preferred_full_requests=((0, 128 if shortage == "minimum" else 64),),
             allow_emergency_hot_reclaim=False,
         )
 

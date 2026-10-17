@@ -60,7 +60,6 @@ def make_stack(monkeypatch, *, layers=3, top_k=64, start_layer=0, dtype=torch.bf
         tp_group=None,
         tail_protected_pages=2,
     )
-    assert c.full_reclaim_policy == "request"
     c._active_kvduo_reqs = {
         req: SimpleNamespace(hisparse_staging=False) for req in range(2)
     }

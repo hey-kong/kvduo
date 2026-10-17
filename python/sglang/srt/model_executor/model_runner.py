@@ -820,7 +820,6 @@ class ModelRunner:
         hisparse_cfg = parse_hisparse_config(self.server_args)
         tail_protected_pages = 0
         kvduo_host_size = None
-        full_reclaim_policy = "page"
         decode_emergency_reclaim = False
         if self.server_args.enable_kvduo:
             from sglang.srt.mem_cache.sparsity import parse_kvduo_config
@@ -828,7 +827,6 @@ class ModelRunner:
             kvduo_cfg = parse_kvduo_config(self.server_args)
             kvduo_host_size = kvduo_cfg.host_size
             tail_protected_pages = kvduo_cfg.tail_protected_pages
-            full_reclaim_policy = kvduo_cfg.full_reclaim_policy
             decode_emergency_reclaim = kvduo_cfg.decode_emergency_reclaim
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
@@ -848,7 +846,6 @@ class ModelRunner:
             kvduo_host_size=kvduo_host_size,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
             tail_protected_pages=tail_protected_pages,
-            full_reclaim_policy=full_reclaim_policy,
             decode_emergency_reclaim=decode_emergency_reclaim,
         )
 

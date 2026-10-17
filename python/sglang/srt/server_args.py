@@ -2696,8 +2696,7 @@ class ServerArgs:
             help=(
                 "A JSON object for KVDuo. host_size is the per-rank Host KV "
                 "budget in GB (0: automatic). Example: "
-                '\'{"top_k": 2048, "host_size": 0, "tail_protected_pages": 2, '
-                '"full_reclaim_policy": "request"}\''
+                '\'{"top_k": 2048, "host_size": 0, "tail_protected_pages": 2}\''
             )
         ),
         NS("memory"),
