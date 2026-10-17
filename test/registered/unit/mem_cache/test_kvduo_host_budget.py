@@ -1,4 +1,4 @@
-"""Explicit Host budgets must not change HBM allocation or exceed payload bytes."""
+"""Host ratios must not change HBM allocation and must size real payloads."""
 
 import json
 from types import SimpleNamespace
@@ -16,30 +16,30 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-@pytest.mark.parametrize("value", [0, 0.5, 64])
-def test_host_size_config_and_independent_hbm_alias(value):
+@pytest.mark.parametrize("value", [0.5, 2, 4])
+def test_host_ratio_config_and_independent_hbm_alias(value):
     args = ServerArgs(
         model_path="dummy",
         enable_kvduo=True,
-        kvduo_config=json.dumps({"host_size": value}),
+        kvduo_config=json.dumps({"host_ratio": value}),
     )
     args._handle_kvduo_aliases()
-    assert parse_kvduo_config(args).host_size == value
+    assert parse_kvduo_config(args).host_ratio == value
     assert parse_hisparse_config(args).host_to_device_ratio == 2.5
 
 
 def test_defaults_match_hicache_auto_semantics():
-    assert ServerArgs(model_path="dummy").hicache_size == 0
-    assert parse_kvduo_config(SimpleNamespace(kvduo_config=None)).host_size == 0
-    plan = plan_host_budget(0, 100, 20, {"c4": 1000, "indexer": 100}, {"swa": 50})
+    assert ServerArgs(model_path="dummy").hicache_ratio == 2.0
+    assert parse_kvduo_config(SimpleNamespace(kvduo_config=None)).host_ratio == 2.0
+    plan = plan_host_budget(2, 100, 20, {"c4": 1000, "indexer": 100}, {"swa": 50})
     assert (plan.full_pages, plan.swa_pages) == (200, 40)
     assert plan.allocated_bytes == 200 * 1100 + 40 * 50
 
 
-@pytest.mark.parametrize("raw", ["-1", "true", "null", '"64"', "NaN", "Infinity"])
-def test_invalid_host_size(raw):
-    with pytest.raises(ValueError, match="host_size"):
-        parse_kvduo_config(SimpleNamespace(kvduo_config='{"host_size":' + raw + "}"))
+@pytest.mark.parametrize("raw", ["0", "-1", "true", "null", '"64"', "NaN", "Infinity"])
+def test_invalid_host_ratio(raw):
+    with pytest.raises(ValueError, match="host_ratio"):
+        parse_kvduo_config(SimpleNamespace(kvduo_config='{"host_ratio":' + raw + "}"))
 
 
 def test_removed_ratio_rejected_only_for_kvduo():
@@ -51,20 +51,22 @@ def test_removed_ratio_rejected_only_for_kvduo():
     assert cfg.host_to_device_ratio == 4
 
 
-@pytest.mark.parametrize("budget", [1120, 5000, 12521, 1000000])
-def test_fixed_budget_rounds_down_all_pools(budget):
-    plan = plan_host_budget(
-        budget / 1e9, 100, 20, {"c4": 1000, "indexer": 100}, {"swa": 20}
-    )
-    assert plan.allocated_bytes <= budget
-    assert plan.full_pages >= 1 and plan.swa_pages >= 1
-    n = plan.full_pages + 1
-    assert n * 1100 + max(1, n * 20 // 100) * 20 > budget
+@pytest.mark.parametrize("ratio", [0.75, 1, 1.5, 2, 3.25])
+def test_ratio_scales_each_pool_by_device_page_capacity(ratio):
+    plan = plan_host_budget(ratio, 101, 21, {"c4": 1000, "indexer": 100}, {"swa": 20})
+    assert plan.full_pages == int(101 * ratio)
+    assert plan.swa_pages == int(21 * ratio)
+    assert plan.allocated_bytes == plan.full_pages * 1100 + plan.swa_pages * 20
 
 
-def test_too_small_budget_fails_before_allocation():
+def test_too_small_ratio_fails_before_allocation():
     with pytest.raises(ValueError, match="cannot fit"):
-        plan_host_budget(1119 / 1e9, 100, 20, {"c4": 1100}, {"swa": 20})
+        plan_host_budget(0.001, 100, 20, {"c4": 1100}, {"swa": 20})
+
+
+def test_removed_host_size_is_rejected():
+    with pytest.raises(ValueError, match="host_size"):
+        parse_kvduo_config(SimpleNamespace(kvduo_config='{"host_size": 0}'))
 
 
 def test_dsv4_budget_matches_actual_host_buffers(monkeypatch):
@@ -78,7 +80,7 @@ def test_dsv4_budget_matches_actual_host_buffers(monkeypatch):
     allocator = c.token_to_kv_pool_allocator
     mapping = allocator.full_to_hisparse_device_index_mapping.clone()
     gpu_free = allocator.hisparse_attn_allocator.available_size()
-    for budget in (0, 0.01, 0.02):
+    for budget in (0.5, 2, 3):
         plan = plan_dsv4_host_budget(allocator, budget)
         c.mem_pool_host = DeepSeekV4PagedHostPool(
             "budget_test_c4",
@@ -119,7 +121,7 @@ def test_generic_host_exact_pages_and_existing_default(monkeypatch):
         host_to_device_ratio=1,
     )
     page_bytes = 64 * 16 * 2 * 2
-    plan = plan_host_budget((page_bytes * 3 + 100) / 1e9, 4, 0, {"kv": page_bytes}, {})
+    plan = plan_host_budget(0.75, 4, 0, {"kv": page_bytes}, {})
     kw = dict(
         device_pool=pool,
         host_to_device_ratio=2,
@@ -141,23 +143,15 @@ def test_generic_host_exact_pages_and_existing_default(monkeypatch):
     assert legacy.size == (2 * 256 // 64 + 1) * 64
 
 
-def test_fixed_budget_pp_sync_stays_within_limit(monkeypatch):
-    import sglang.srt.mem_cache.pool_host.base as base
-
-    monkeypatch.setattr(base, "sync_fixed_hicache_size", lambda n, size: n // 2)
-    plan = plan_host_budget(0.001, 100, 20, {"c4": 1000}, {"swa": 20})
-    assert plan.allocated_bytes <= plan.budget_bytes
-
-
-def test_dsv4_hbm_layout_is_independent_of_host_size():
+def test_dsv4_hbm_layout_is_independent_of_host_ratio():
     from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
     results = []
-    for host_size in (0, 16, 128):
+    for host_ratio in (0.5, 2, 4):
         args = ServerArgs(
             model_path="dummy",
             enable_kvduo=True,
-            kvduo_config=json.dumps({"host_size": host_size}),
+            kvduo_config=json.dumps({"host_ratio": host_ratio}),
         )
         args._handle_kvduo_aliases()
         args.swa_full_tokens_ratio = 0.1
@@ -191,9 +185,9 @@ def test_invalid_logical_capacity_ratio(raw):
         )
 
 
-@pytest.mark.parametrize("host_size", [0, 0.5, 64])
+@pytest.mark.parametrize("host_ratio", [0.5, 2, 4])
 @pytest.mark.parametrize("logical_ratio", [1.5, 2, 2.5, 4])
-def test_generic_logical_slots_survive_physical_offload(host_size, logical_ratio):
+def test_generic_logical_slots_survive_physical_offload(host_ratio, logical_ratio):
     import torch
     from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
     from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
@@ -202,7 +196,7 @@ def test_generic_logical_slots_survive_physical_offload(host_size, logical_ratio
         model_path="dummy",
         enable_kvduo=True,
         kvduo_config=json.dumps(
-            {"host_size": host_size, "logical_capacity_ratio": logical_ratio}
+            {"host_ratio": host_ratio, "logical_capacity_ratio": logical_ratio}
         ),
     )
     args._handle_kvduo_aliases()
@@ -264,7 +258,7 @@ def test_dsv4_logical_and_indexer_capacity_survive_full_offload(monkeypatch):
     assert indexer.shape[0] * 64 >= kv.c4_logical_size
     assert physical.alloc(64) is not None
     # Automatic Host sizing uses physical capacity, not logical overcommit.
-    budget = plan_dsv4_host_budget(allocator, 0)
+    budget = plan_dsv4_host_budget(allocator, 2)
     assert budget.full_pages == 2 * physical.size // physical.page_size
 
 

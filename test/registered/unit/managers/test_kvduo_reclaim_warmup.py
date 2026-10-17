@@ -46,7 +46,7 @@ def test_only_kvduo_waits_for_warmup_before_startup_returns(
         device_buffer_size=8192,
         host_to_device_ratio=2,
         swap_in_block_size=960,
-        host_size=0,
+        host_ratio=2.0,
         tail_protected_pages=2,
         decode_emergency_reclaim=False,
         max_relative_miss_increase=0.1,

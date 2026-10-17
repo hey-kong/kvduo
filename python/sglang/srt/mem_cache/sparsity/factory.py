@@ -141,7 +141,7 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
 
     known = {
         "top_k",
-        "host_size",
+        "host_ratio",
         "logical_capacity_ratio",
         "logical_capacity_tokens",
         "swap_in_block_size",
@@ -168,14 +168,14 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         or logical_tokens < 0
     ):
         raise ValueError("logical_capacity_tokens must be a non-negative integer")
-    host_size = values.get("host_size", 0)
+    host_ratio = values.get("host_ratio", 2.0)
     if (
-        isinstance(host_size, bool)
-        or not isinstance(host_size, (int, float))
-        or not math.isfinite(host_size)
-        or host_size < 0
+        isinstance(host_ratio, bool)
+        or not isinstance(host_ratio, (int, float))
+        or not math.isfinite(host_ratio)
+        or host_ratio <= 0
     ):
-        raise ValueError("host_size must be a finite non-negative number in GB")
+        raise ValueError("host_ratio must be a finite positive number")
     block_size = values.get("swap_in_block_size", DEFAULT_SWAP_IN_BLOCK_SIZE)
     tail_pages = values.get("tail_protected_pages", DEFAULT_TAIL_PROTECTED_PAGES)
     fields = {
@@ -198,7 +198,7 @@ def parse_kvduo_config(server_args) -> KVDuoConfig:
         raise ValueError("decode_emergency_reclaim must be a boolean")
     return KVDuoConfig(
         top_k=top_k,
-        host_size=host_size,
+        host_ratio=host_ratio,
         logical_capacity_ratio=logical_ratio,
         logical_capacity_tokens=logical_tokens,
         swap_in_block_size=block_size,

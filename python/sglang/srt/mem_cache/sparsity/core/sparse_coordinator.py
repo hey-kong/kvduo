@@ -72,7 +72,7 @@ class KVDuoConfig:
     """Configuration for full-page/hot-entry mixed KV residency."""
 
     top_k: int = 2048
-    host_size: float = 0
+    host_ratio: float = 2.0
     logical_capacity_ratio: float = 2.5
     logical_capacity_tokens: int = 0
     swap_in_block_size: int = 960

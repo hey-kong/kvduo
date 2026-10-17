@@ -728,7 +728,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self.c4_shrink_factor > 1:
             if getattr(kvc.server_args, "enable_kvduo", False):
                 logger.info(
-                    "KVDuo logical capacity ratio = %s (independent of host_size)",
+                    "KVDuo logical capacity ratio = %s (independent of host_ratio)",
                     self.c4_shrink_factor,
                 )
             else:

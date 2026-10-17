@@ -53,13 +53,13 @@ class TestKVDuoConfig(unittest.TestCase):
             SimpleNamespace(
                 kvduo_config=(
                     '{"top_k": 8, "tail_protected_pages": 3, '
-                    '"host_size": 4.5, "swap_in_block_size": 256}'
+                    '"host_ratio": 4.5, "swap_in_block_size": 256}'
                 )
             )
         )
         self.assertEqual(config.top_k, 8)
         self.assertEqual(config.tail_protected_pages, 3)
-        self.assertEqual(config.host_size, 4.5)
+        self.assertEqual(config.host_ratio, 4.5)
         self.assertEqual(config.swap_in_block_size, 256)
 
     def test_rejects_removed_n_alias(self):
