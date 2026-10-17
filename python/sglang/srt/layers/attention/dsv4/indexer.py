@@ -801,6 +801,7 @@ class C4IndexerBackendMixin:
         touch_clock_advanced = False
         full_fused = False
         full_decode = getattr(forward_batch, "kvduo_full_decode", False)
+        mixed_full_decode = getattr(forward_batch, "kvduo_mixed_full_decode", False)
         if capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
@@ -842,7 +843,7 @@ class C4IndexerBackendMixin:
             )
         ):
             full_spec = None
-            if full_decode:
+            if full_decode or mixed_full_decode:
                 layer = token_to_kv_pool.layer_mapping[
                     c4_indexer.layer_id
                 ].compress_layer_id
@@ -850,6 +851,7 @@ class C4IndexerBackendMixin:
                     layer,
                     forward_batch.req_pool_indices,
                     hisparse_coordinator.top_k_device_locs_buffer[:query_rows],
+                    **({"mixed": True} if mixed_full_decode else {}),
                 )
             topk_transform_512_v2(
                 logits,
@@ -864,7 +866,7 @@ class C4IndexerBackendMixin:
                 ),
                 **(
                     {"full_metadata": full_spec}
-                    if full_decode
+                    if full_decode or mixed_full_decode
                     else (
                         {"touch_clock": hisparse_coordinator.full_touch_clock}
                         if hisparse_decode
@@ -904,7 +906,14 @@ class C4IndexerBackendMixin:
                         top_k_result=raw_indices,
                         layer_id=compress_layer_id,
                         **(
-                            {"touch_clock_advanced": True}
+                            {
+                                "touch_clock_advanced": True,
+                                **(
+                                    {"full_rows_resolved": True}
+                                    if mixed_full_decode
+                                    else {}
+                                ),
+                            }
                             if touch_clock_advanced
                             else {}
                         ),

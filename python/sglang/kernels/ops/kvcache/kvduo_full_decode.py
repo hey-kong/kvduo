@@ -24,6 +24,7 @@ class KVDuoFullTopK:
     layer: int
     layer_stride: int
     page_size: int
+    hot_capacities: torch.Tensor | None = None
 
     def native_metadata(self, scores, raw_indices):
         """Validate FULL banks and transport their addresses as FFI scalars."""
@@ -73,6 +74,19 @@ class KVDuoFullTopK:
             if not pointer:
                 raise ValueError(f"KVDuo FULL metadata {name} has incompatible layout")
             pointers.append(pointer)
+        hot_pointer = 0
+        if self.hot_capacities is not None:
+            capacity = self.hot_capacities
+            if (
+                capacity.shape != (requests,)
+                or capacity.dtype != torch.int32
+                or capacity.device != scores.device
+                or not capacity.is_contiguous()
+            ):
+                raise ValueError(
+                    "KVDuo FULL metadata hot_capacities has incompatible layout"
+                )
+            hot_pointer = capacity.data_ptr()
         return (
             *pointers,
             requests,
@@ -82,6 +96,7 @@ class KVDuoFullTopK:
             self.layer,
             self.layer_stride,
             self.page_size,
+            hot_pointer,
         )
 
 

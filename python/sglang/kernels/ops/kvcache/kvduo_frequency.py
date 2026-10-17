@@ -20,7 +20,9 @@ def module(top_k, paged, block_size=256):
     )
 
 
-def resolve(coordinator, layer, requests, lengths, selected, output):
+def resolve(
+    coordinator, layer, requests, lengths, selected, output, *, full_rows_resolved=False
+):
     c = coordinator
     if selected.dtype != torch.int32 or selected.stride(-1) != 1:
         raise ValueError("KVDuo top-k requires contiguous int32 rows")
@@ -51,6 +53,7 @@ def resolve(coordinator, layer, requests, lengths, selected, output):
         c.kvduo_hot_growth_events[layer],
         c.kvduo_frequency_scratch,
         block_size=getattr(c, "swap_in_block_size", 256),
+        full_rows_resolved=full_rows_resolved,
     )
 
 
@@ -192,6 +195,7 @@ def launch_resolve(
     scratch,
     *,
     block_size=256,
+    full_rows_resolved=False,
 ):
     # Raw-pointer FFI avoids Torch/TensorView conversion inside CUDA Graph and
     # inference-mode contexts. Validate geometry before crossing that boundary.
@@ -262,4 +266,5 @@ def launch_resolve(
         mapping.numel(),
         host_locs.stride(0),
         torch.cuda.current_stream(device).cuda_stream,
+        full_rows_resolved,
     )

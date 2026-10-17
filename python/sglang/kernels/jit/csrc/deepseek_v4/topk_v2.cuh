@@ -77,6 +77,7 @@ struct KVDuoFullParams {
   int64_t logical_size = 0;
   int64_t location_base = 0;
   int64_t layer = 0;
+  const int32_t* hot_capacities = nullptr;
   int page_bits = 0;
 };
 
@@ -139,6 +140,8 @@ SGL_DEVICE void resolve_full(const TopKLaunchParams& params, uint32_t row) {
     if (threadIdx.x == 0) __assert_fail("KVDuo FULL TopK invalid request slot", __FILE__, __LINE__, __func__);
     return;
   }
+  // Zero capacity is the FULL-only invariant; HOT minima are published before replay.
+  if (full.hot_capacities && full.hot_capacities[rid] > 0) return;
   __shared__ int hits;
   if (threadIdx.x == 0) {
     hits = 0;
@@ -643,7 +646,8 @@ struct TopKKernel {
       int64_t logical_size,
       int64_t layer,
       int64_t layer_stride,
-      int64_t full_page_size) {
+      int64_t full_page_size,
+      uint64_t hot_capacities) {
     using namespace host;
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
@@ -682,6 +686,7 @@ struct TopKKernel {
         .logical_size = logical_size,
         .location_base = layer * layer_stride,
         .layer = layer,
+        .hot_capacities = reinterpret_cast<const int32_t*>(hot_capacities),
         .page_bits = static_cast<int>(std::countr_zero(static_cast<uint64_t>(full_page_size))),
     };
     transform_impl(

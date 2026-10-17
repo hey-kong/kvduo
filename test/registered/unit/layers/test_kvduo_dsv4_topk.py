@@ -355,3 +355,27 @@ def test_topk_v2_rejects_invalid_clock_before_launch(monkeypatch, raw_only, cloc
         )
     load.assert_not_called()
     load.assert_not_called()
+
+
+def test_mixed_graph_fuses_full_rows_but_still_runs_hot_resolver(indexer_case):
+    case = indexer_case()
+    case.batch.kvduo_mixed_full_decode = True
+    c = case.backend.hisparse_coordinator
+    c.top_k_device_locs_buffer = torch.empty_like(case.output)
+    c.kvduo_full_topk_metadata = MagicMock(
+        side_effect=lambda layer, requests, output, mixed: SimpleNamespace(
+            output=output
+        )
+    )
+    case.run()
+    c.kvduo_full_topk_metadata.assert_called_once()
+    args = c.kvduo_full_topk_metadata.call_args.args
+    assert args[0] == 2 and args[1] is case.batch.req_pool_indices
+    assert args[2].data_ptr() == c.top_k_device_locs_buffer.data_ptr()
+    assert c.kvduo_full_topk_metadata.call_args.kwargs == {"mixed": True}
+    assert "full_metadata" in case.v2.call_args.kwargs
+    assert "touch_clock" not in case.v2.call_args.kwargs
+    call = c.swap_in_selected_pages.call_args.kwargs
+    assert call["full_rows_resolved"] and call["touch_clock_advanced"]
+    assert call["top_k_result"].data_ptr() == case.raw.data_ptr()
+    assert call["top_k_result"].shape == case.raw.shape
