@@ -91,18 +91,12 @@ __global__ __launch_bounds__(Block) void frequency_resolve(
     status[rid] = 0;
     if (observe[0]) growth[rid] = 0;
   }
-  for (int i = tid; i < H; i += blockDim.x) {
-    keys[i] = -1;
-    vals[i] = INT_MAX;
-    counts[i] = 0;
-  }
-  for (int i = tid; i < K; i += blockDim.x)
-    resolved[i] = -1;
   __syncthreads();
+  int local_accesses = 0, local_full_hits = 0;
   for (int i = tid; i < K; i += blockDim.x) {
     const int token = selected[i];
     if (token < 0 || token >= length) continue;
-    atomicAdd(&accesses, 1);
+    ++local_accesses;
     const int64_t logical = lookup[rid * lookup_stride + token];
     if (logical < 0 || logical >= logical_size) {
       atomicExch(&error, 1);
@@ -112,23 +106,21 @@ __global__ __launch_bounds__(Block) void frequency_resolve(
     if (loc > 0) {
       out[i] = int(loc + location_base);
       atomicMax(reinterpret_cast<unsigned long long*>(touches + logical), (unsigned long long)clock[0]);
-      atomicAdd(&full_hits, 1);
+      ++local_full_hits;
     } else {
       if (host_locs[rid * host_stride + token] < 0 || versions[logical] != host_versions[logical]) {
         atomicExch(&error, 1);
         continue;
       }
-      int h = hash_slot(token, H);
-      while (true) {
-        const int old = atomicCAS(keys + h, -1, token);
-        if (old == -1 || old == token) {
-          atomicMin(vals + h, i);
-          atomicAdd(counts + h, 1);
-          break;
-        }
-        h = (h + 1) % H;
-      }
     }
+  }
+  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+    local_accesses += __shfl_down_sync(FULL_WARP_MASK, local_accesses, offset, WARP_SIZE);
+    local_full_hits += __shfl_down_sync(FULL_WARP_MASK, local_full_hits, offset, WARP_SIZE);
+  }
+  if (tid % WARP_SIZE == 0) {
+    if (local_accesses) atomicAdd(&accesses, local_accesses);
+    if (local_full_hits) atomicAdd(&full_hits, local_full_hits);
   }
   __syncthreads();
   if (error) {
@@ -149,6 +141,30 @@ __global__ __launch_bounds__(Block) void frequency_resolve(
     }
     return;
   }
+  // FULL-only selections never initialize or touch HOT scratch.
+  for (int i = tid; i < H; i += blockDim.x) {
+    keys[i] = -1;
+    vals[i] = INT_MAX;
+    counts[i] = 0;
+  }
+  for (int i = tid; i < K; i += blockDim.x)
+    resolved[i] = -1;
+  __syncthreads();
+  for (int i = tid; i < K; i += blockDim.x) {
+    const int token = selected[i];
+    if (token < 0 || token >= length || out[i] >= 0) continue;
+    int h = hash_slot(token, H);
+    while (true) {
+      const int old = atomicCAS(keys + h, -1, token);
+      if (old == -1 || old == token) {
+        atomicMin(vals + h, i);
+        atomicAdd(counts + h, 1);
+        break;
+      }
+      h = (h + 1) % H;
+    }
+  }
+  __syncthreads();
   // One scan of actual capacity, with a top-k-sized hash table. No capacity
   // dependent shared memory, LRU permutation or compile-time capacity limit.
   for (int slot = tid; slot < capacity; slot += blockDim.x) {

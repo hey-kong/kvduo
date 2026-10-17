@@ -345,3 +345,35 @@ def test_graph_replay_after_batched_publication_and_metadata_reuse():
         assert c.kvduo_req_hot_capacity_gpu[0, 1].item() == buffers[1].tokens.numel()
         assert c.kvduo_resolver_stats[0, 1].tolist() == [512, 512]
         assert torch.equal(backing[output[1].long()].cpu(), host[512:])
+
+
+@pytest.mark.parametrize("block_size", [256, 960])
+@pytest.mark.parametrize("padded", [False, True])
+def test_mixed_batch_full_row_skips_hot_scratch_with_real_h2d(block_size, padded):
+    c, buffers, selected, requests, lengths, output, backing, host = fixture()
+    c.swap_in_block_size = block_size
+    if padded:
+        selected[0, 256:] = -1
+        selected[0, :256] = 1  # Count duplicate FULL accesses individually.
+    c.kvduo_frequency_scratch.fill_(12345)
+    run = lambda: resolve(c, 0, requests, lengths, selected, output)
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        buffers[1].tokens.fill_(-1)
+        buffers[1].frequency.zero_()
+        backing[buffers[1].locations.long()] = -999
+        c.kvduo_frequency_scratch.fill_(12345)
+        c.kvduo_resolver_stats.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.all(c.kvduo_frequency_scratch[0] == 12345)
+        assert c.kvduo_resolver_stats[0, 0].tolist() == [0, 256 if padded else 512]
+        assert c.kvduo_resolver_stats[0, 1].tolist()[0] == 512
+        assert torch.equal(backing[output[1].long()], host[512:1024].cuda())
+        valid = selected[0] >= 0
+        assert torch.equal(output[0, valid], selected[0, valid])
+        assert torch.all(output[0, ~valid] == -1)
