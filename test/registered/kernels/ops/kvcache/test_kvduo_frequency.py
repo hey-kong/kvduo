@@ -377,3 +377,51 @@ def test_mixed_batch_full_row_skips_hot_scratch_with_real_h2d(block_size, padded
         valid = selected[0] >= 0
         assert torch.equal(output[0, valid], selected[0, valid])
         assert torch.all(output[0, ~valid] == -1)
+
+
+@pytest.mark.parametrize("k,pages", [(17, 41), (64, 257), (4992, 35)])
+def test_parallel_merge_reuses_workspace_and_matches_stable_reference(k, pages):
+    workspace = {}
+    capacity = k * pages
+    # Exercise both page-selection branches, packed-word boundary sharing,
+    # no-release decay, full compaction, and repeated use of dirty scratch.
+    for pattern in ("all", "mixed", "none", "mixed"):
+        backing = torch.arange(
+            (capacity + 64) * 4, dtype=torch.int32, device="cuda"
+        ).view(-1, 4)
+        b = FrequencyBuffer.empty(
+            torch.arange(64, capacity + 64, dtype=torch.int32, device="cuda")
+        )
+        tokens = [s if pattern == "all" or s % 11 else -1 for s in range(capacity)]
+        freq = [
+            3 if pattern == "all" else 0 if pattern == "none" else (s * 7 + s // k) % 4
+            for s in range(capacity)
+        ]
+        b.tokens.copy_(torch.tensor(tokens, dtype=torch.int32, device="cuda"))
+        b.frequency.copy_(pack_frequency(freq, device="cuda"))
+        expected = plan_frequency_merge(tokens, freq, k, 2)
+        before = backing.clone()
+        old_addresses = {name: value.data_ptr() for name, value in workspace.items()}
+        new, kept = merge(
+            b,
+            backing,
+            k=k,
+            minimum=2,
+            paged=False,
+            top_k=512,
+            item_bytes=16,
+            workspace=workspace,
+        )
+        assert kept == expected.kept_pages
+        assert new.tokens.tolist() == list(expected.tokens)
+        assert unpack_frequency(new.frequency, new.tokens.numel()) == list(
+            expected.frequency
+        )
+        valid = new.tokens >= 0
+        assert torch.equal(
+            backing[new.locations[valid].long()], before[new.tokens[valid].long() + 64]
+        )
+        assert all(
+            workspace[name].data_ptr() == address
+            for name, address in old_addresses.items()
+        )

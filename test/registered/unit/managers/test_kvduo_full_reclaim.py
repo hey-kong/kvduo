@@ -4,7 +4,6 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-
 from sglang.kernels.ops.kvcache.kvduo_full_reclaim import (
     select_kvduo_full_requests,
     summarize_kvduo_full_pages,
@@ -417,6 +416,7 @@ def local_pressure_coordinator(counts, *, ratio=1):
 @pytest.mark.parametrize("protection", ["none", "shared", "prefill", "tp"])
 def test_full_reclaim_transfers_exclusive_radix_prefix_before_demotion(protection):
     from array import array
+
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
@@ -467,11 +467,10 @@ def test_full_reclaim_transfers_exclusive_radix_prefix_before_demotion(protectio
         allocator.free_segment.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "blocked", ["tail", "host", "minimum", "unselected"]
-)
+@pytest.mark.parametrize("blocked", ["tail", "host", "minimum", "unselected"])
 def test_full_reclaim_does_not_detach_unused_prefix(blocked):
     from array import array
+
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
@@ -628,3 +627,25 @@ def test_full_reclaim_released_intervals_are_generation_bound(ratio):
     mapping.copy_(original)
     assert c.reclaim_kvduo_full_pages(c.page_size) == 6 * c.page_size
     assert c._kvduo_released_full_offsets[0][0] == c._kvduo_request_generation[0]
+
+
+def test_request_summary_can_skip_unused_touch_scores_without_changing_safety():
+    from sglang.kernels.ops.kvcache.kvduo_full_reclaim import summarize_kvduo_full_pages
+
+    pages = torch.arange(16).view(4, 4)
+    mapping = torch.arange(16) + 64
+    versions = torch.ones(16, dtype=torch.int64)
+    host_versions = versions.clone()
+    host_versions[5] = 0
+    mapping[10] = 0
+    touches = torch.arange(16) * 100
+    original = summarize_kvduo_full_pages(
+        pages, mapping, versions, host_versions, touches, pages[3]
+    )
+    optimized = summarize_kvduo_full_pages(
+        pages, mapping, versions, host_versions, touches, pages[3], compute_touch=False
+    )
+    assert torch.equal(original[0], optimized[0])
+    assert torch.equal(original[2], optimized[2])
+    assert optimized[2].tolist() == [1, 0, 0, 0]
+    assert not optimized[1].any()

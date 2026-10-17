@@ -1,3 +1,4 @@
+#include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
 
 #include "hisparse.cuh"
@@ -16,6 +17,7 @@ __device__ void freq_add(unsigned* words, int slot, int count) {
   unsigned old = atomicAdd(ptr, 0u), assumed;
   do {
     assumed = old;
+    if (((assumed >> shift) & 3) == 3) return;
     unsigned value = min(3, int((assumed >> shift) & 3) + count);
     old = atomicCAS(ptr, assumed, (assumed & ~(3u << shift)) | (value << shift));
   } while (old != assumed);
@@ -372,37 +374,91 @@ __global__ void frequency_merge_plan(
   for (int s = tid; s < capacity; s += blockDim.x)
     if (tokens[s] >= 0 && ((frequency[s / 16] >> (2 * (s % 16))) & 3) == 3) atomicAdd(counts + s / k, 1);
   __syncthreads();
+  using Reduce = cub::BlockReduce<unsigned long long, 256>;
+  using Scan = cub::BlockScan<int, 256>;
+  __shared__ typename Reduce::TempStorage reduce_storage;
+  __shared__ typename Scan::TempStorage scan_storage;
+  __shared__ int empty;
+  unsigned long long local_total = 0;
+  for (int p = tid; p < pages; p += blockDim.x)
+    local_total += counts[p];
+  const auto total = Reduce(reduce_storage).Sum(local_total);
   if (!tid) {
-    int total = 0;
-    for (int p = 0; p < pages; ++p)
-      total += counts[p];
-    target = max(minimum, (total + k - 1) / k);
-    for (int i = 0; i < target; ++i) {
-      int best = -1;
-      for (int p = 0; p < pages; ++p)
-        if (!summary[p + 2] && (best < 0 || counts[p] > counts[best])) best = p;
-      summary[best + 2] = 1;
-    }
-    int rank = 0, empty = 0;
-    for (int p = 0; p < pages; ++p)
-      if (summary[p + 2]) ranks[p] = rank++;
-    for (int s = 0; s < capacity; ++s)
-      if (ranks[s / k] >= 0 && !(tokens[s] >= 0 && ((frequency[s / 16] >> (2 * (s % 16))) & 3) == 3))
-        available[empty++] = s;
-    // Sources are exclusively on released pages and destinations on kept pages.
-    for (int s = 0; s < capacity; ++s)
-      if (ranks[s / k] < 0 && tokens[s] >= 0 && ((frequency[s / 16] >> (2 * (s % 16))) & 3) == 3) {
-        const int dst = available[moved], out = ranks[dst / k] * k + dst % k;
-        new_tokens[out] = tokens[s];
-        new_frequency[out / 16] |= 1u << (2 * (out % 16));
-        sources[moved] = locations[s];
-        destinations[moved] = locations[dst];
-        ++moved;
+    target = max(minimum, int((total + k - 1) / k));
+    empty = 0;
+  }
+  __syncthreads();
+  if (target == pages) {
+    for (int p = tid; p < pages; p += blockDim.x)
+      summary[p + 2] = 1;
+    __syncthreads();
+  } else if (pages <= 32) {
+    if (!tid) {
+      for (int i = 0; i < target; ++i) {
+        int best = -1;
+        for (int p = 0; p < pages; ++p)
+          if (!summary[p + 2] && (best < 0 || counts[p] > counts[best])) best = p;
+        summary[best + 2] = 1;
       }
+    }
+    __syncthreads();
+  } else {
+    for (int i = 0; i < target; ++i) {
+      unsigned long long best = 0;
+      for (int p = tid; p < pages; p += blockDim.x)
+        if (!summary[p + 2])
+          best = max(best, (static_cast<unsigned long long>(counts[p]) << 32) | (0xffffffffu - unsigned(p)));
+      const auto winner = Reduce(reduce_storage).Reduce(best, cub::Max());
+      if (!tid) summary[int(0xffffffffu - unsigned(winner)) + 2] = 1;
+      __syncthreads();
+    }
+  }
+  // Stable scans preserve page and slot tie-breaking without serial capacity scans.
+  int page_rank = 0;
+  for (int start = 0; start < pages; start += 256) {
+    int rank, total_kept;
+    const int p = start + tid;
+    const bool keep = p < pages && summary[p + 2];
+    Scan(scan_storage).ExclusiveSum(int(keep), rank, total_kept);
+    if (keep) ranks[p] = page_rank + rank;
+    page_rank += total_kept;
+    __syncthreads();
+  }
+  if (target < pages) {
+    for (int start = 0; start < capacity; start += 256) {
+      const int s = start + tid;
+      const bool free =
+          s < capacity && ranks[s / k] >= 0 && !(tokens[s] >= 0 && ((frequency[s / 16] >> (2 * (s % 16))) & 3) == 3);
+      int rank, total_free;
+      Scan(scan_storage).ExclusiveSum(int(free), rank, total_free);
+      if (free) available[empty + rank] = s;
+      __syncthreads();
+      if (!tid) empty += total_free;
+      __syncthreads();
+    }
+    for (int start = 0; start < capacity; start += 256) {
+      const int s = start + tid;
+      const bool move =
+          s < capacity && ranks[s / k] < 0 && tokens[s] >= 0 && ((frequency[s / 16] >> (2 * (s % 16))) & 3) == 3;
+      int rank, total_moved;
+      Scan(scan_storage).ExclusiveSum(int(move), rank, total_moved);
+      if (move) {
+        const int index = moved + rank, dst = available[index];
+        const int out = ranks[dst / k] * k + dst % k;
+        new_tokens[out] = tokens[s];
+        atomicOr(new_frequency + out / 16, 1u << (2 * (out % 16)));
+        sources[index] = locations[s];
+        destinations[index] = locations[dst];
+      }
+      __syncthreads();
+      if (!tid) moved += total_moved;
+      __syncthreads();
+    }
+  }
+  if (!tid) {
     summary[0] = target;
     summary[1] = moved;
   }
-  __syncthreads();
   for (int s = tid; s < capacity; s += blockDim.x)
     if (ranks[s / k] >= 0) {
       const int out = ranks[s / k] * k + s % k;

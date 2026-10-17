@@ -5,7 +5,6 @@ from collections import Counter
 from collections.abc import Sequence
 
 import torch
-
 from sglang.kernels.jit.utils import load_jit
 
 
@@ -29,6 +28,8 @@ def summarize_kvduo_full_pages(
     host_versions: torch.Tensor,
     touches: torch.Tensor,
     protected: torch.Tensor | None = None,
+    *,
+    compute_touch: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse FULL address, version, and page-age gathering without mutating inputs."""
     if logical_pages.ndim != 2 or logical_pages.size(1) <= 0:
@@ -77,7 +78,7 @@ def summarize_kvduo_full_pages(
             mapping.data_ptr(),
             data_versions.data_ptr(),
             host_versions.data_ptr(),
-            touches.data_ptr(),
+            touches.data_ptr() if compute_touch else 0,
             protected_pages.data_ptr() if protected_pages is not None else 0,
             physical.data_ptr(),
             scores.data_ptr(),
@@ -93,11 +94,14 @@ def summarize_kvduo_full_pages(
                 in_range & (physical > 0) & (host_versions[safe] == data_versions[safe])
             ).all(dim=1)
         )
-        scores.copy_(
-            touches[safe]
-            .masked_fill(~in_range, torch.iinfo(torch.int64).min)
-            .amax(dim=1)
-        )
+        if compute_touch:
+            scores.copy_(
+                touches[safe]
+                .masked_fill(~in_range, torch.iinfo(torch.int64).min)
+                .amax(dim=1)
+            )
+        else:
+            scores.zero_()
         if protected_pages is not None:
             valid.bitwise_and_(1 - protected_pages)
     return physical, scores, valid

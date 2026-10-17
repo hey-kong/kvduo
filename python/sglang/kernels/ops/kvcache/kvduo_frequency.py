@@ -3,7 +3,6 @@
 import functools
 
 import torch
-
 from sglang.kernels.jit.utils import load_jit, make_cpp_args
 
 
@@ -55,7 +54,18 @@ def resolve(coordinator, layer, requests, lengths, selected, output):
     )
 
 
-def merge(buffer, backing, *, k, minimum, paged, top_k, item_bytes, publication=None):
+def merge(
+    buffer,
+    backing,
+    *,
+    k,
+    minimum,
+    paged,
+    top_k,
+    item_bytes,
+    publication=None,
+    workspace=None,
+):
     from sglang.srt.mem_cache.sparsity.core.kvduo_frequency import FrequencyBuffer
 
     capacity = buffer.tokens.numel()
@@ -82,11 +92,33 @@ def merge(buffer, backing, *, k, minimum, paged, top_k, item_bytes, publication=
         ):
             raise ValueError("Invalid KVDuo merge publication layout")
     pages = capacity // k
-    new = FrequencyBuffer.empty(torch.empty_like(buffer.locations))
-    sources = torch.empty(capacity, dtype=torch.int64, device=backing.device)
-    destinations = torch.empty_like(sources)
-    work = torch.empty(capacity + 2 * pages, dtype=torch.int32, device=backing.device)
-    summary = torch.empty(pages + 2, dtype=torch.int32, device=backing.device)
+    # The plan initializes all output token/location/frequency entries.
+    storage = (
+        torch.empty_like(buffer.tokens),
+        torch.empty_like(buffer.locations),
+        torch.empty_like(buffer.frequency),
+        torch.zeros_like(buffer.selected),
+    )
+    new = FrequencyBuffer._view(storage, capacity)
+    # One coordinator stream serializes merges; retain only scratch, never live metadata.
+    if workspace is None:
+        workspace = {}
+
+    def reserve(name, size, dtype):
+        value = workspace.get(name)
+        if value is None or value.numel() < size or value.device != backing.device:
+            value = torch.empty(size, dtype=dtype, device=backing.device)
+            workspace[name] = value
+        return value[:size]
+
+    sources = reserve("sources", capacity, torch.int64)
+    destinations = reserve("destinations", capacity, torch.int64)
+    work = reserve("work", capacity + 2 * pages, torch.int32)
+    summary = reserve("summary", pages + 2, torch.int32)
+    host_summary = workspace.get("host_summary")
+    if host_summary is None or host_summary.numel() < pages + 2:
+        host_summary = torch.empty(pages + 2, dtype=torch.int32, pin_memory=True)
+        workspace["host_summary"] = host_summary
     module(top_k, paged).merge(
         *(
             t.data_ptr()
@@ -116,7 +148,8 @@ def merge(buffer, backing, *, k, minimum, paged, top_k, item_bytes, publication=
         new.selected.data_ptr(),
         torch.cuda.current_stream(backing.device).cuda_stream,
     )
-    target, moved, *keep = summary.cpu().tolist()
+    host_summary[: pages + 2].copy_(summary)
+    target, moved, *keep = host_summary[: pages + 2].tolist()
     if (
         not minimum <= target <= pages
         or sum(keep) != target

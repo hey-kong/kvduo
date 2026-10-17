@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-
 from sglang.kernels.ops.kvcache.kvduo_control import pack_kvduo_feedback
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -42,6 +41,7 @@ def _tp_worker(rank, path):
         c, allocator = fixture()(layers=2, requests=70, free_pages=8 + rank * 3)
         c.tp_world_size = 2
         c.tp_group = dist.group.WORLD
+        packet_address = None
         for scenario in ("same", "different", "protected", "all_bits", "empty"):
             applicants = {(0, 0): 1, (0, 63): 1, (1, 69): 1}
             protected = 2
@@ -61,6 +61,9 @@ def _tp_worker(rank, path):
                 free, consistent = c._kvduo_optional_growth_resources(
                     protected, applicants
                 )
+            address = c._kvduo_growth_resource_packet.data_ptr()
+            assert packet_address is None or packet_address == address
+            packet_address = address
             assert free == 8
             assert consistent == (scenario not in ("different", "protected"))
             assert reduce.call_count == 1 and gather.call_count == 0
@@ -120,3 +123,58 @@ def test_replay_no_local_growth_still_participates_in_tp_consensus(tmp_path):
         join=True,
         start_method="spawn",
     )
+
+
+def _prefill_tp_worker(rank, path):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{path}",
+        world_size=2,
+        rank=rank,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        c, allocator = fixture()(layers=1, requests=1, free_pages=8 + rank)
+        c.tp_world_size = 2
+        c.tp_group = dist.group.WORLD
+        c._kvduo_mandatory_hot_pages = lambda: 0
+        c._kvduo_next_decode_pages = lambda: 0
+        c._reclaim_kvduo_radix_pages = lambda *args: None
+        for scenario, need in (("fit", 8), ("short", 9), ("different", 2 + rank)):
+            c._kvduo_prefill_reservations.clear()
+            with patch.object(
+                dist, "all_reduce", wraps=dist.all_reduce
+            ) as reduce, patch.object(
+                dist, "all_gather_object", wraps=dist.all_gather_object
+            ) as gather:
+                token = c._reserve_kvduo_prefill_physical(need)
+            assert (token is not None) == (scenario == "fit")
+            assert reduce.call_count == 1 and gather.call_count == 0
+            if token is None:
+                assert not c._kvduo_prefill_reservations
+            dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_prefill_agrees_on_required_and_common_capacity_in_one_collective(tmp_path):
+    torch.multiprocessing.start_processes(
+        _prefill_tp_worker,
+        args=(str(tmp_path / "gloo-prefill"),),
+        nprocs=2,
+        join=True,
+        start_method="spawn",
+    )
+
+
+def test_buffer_publication_updates_only_selected_owners():
+    from sglang.kernels.ops.kvcache.kvduo_control import publish_kvduo_buffers
+
+    pointers = torch.full((2, 3, 4), 99, dtype=torch.int64)
+    capacities = torch.full((2, 3), 99, dtype=torch.int32)
+    packet = torch.tensor([[1, 64, 10, 11, 12, 13], [5, 0, 0, 0, 0, 0]])
+    publish_kvduo_buffers(packet, pointers, capacities)
+    assert pointers[0, 1].tolist() == [10, 11, 12, 13]
+    assert capacities[0, 1] == 64 and capacities[1, 2] == 0
+    assert pointers[1, 2].tolist() == [0] * 4
+    assert (pointers.view(-1, 4)[[0, 2, 3, 4]] == 99).all()

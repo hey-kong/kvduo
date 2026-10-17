@@ -3,6 +3,8 @@
 
 #include <sgl_kernel/utils.cuh>
 
+#include <cassert>
+
 namespace {
 
 template <int BLOCK>
@@ -56,6 +58,35 @@ void kvduo_pack_feedback(
       L.unwrap(),
       R.unwrap(),
       active);
+}
+
+__global__ void kvduo_publish_buffers_kernel(
+    const int64_t* packet, int64_t* pointers, int32_t* capacities, int64_t updates, int64_t owners) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= updates) return;
+  const int64_t* row = packet + i * 6;
+  const int64_t owner = row[0];
+  if (owner < 0 || owner >= owners) {
+    __assert_fail("Invalid KVDuo publication owner", __FILE__, __LINE__, __func__);
+    return;
+  }
+  for (int j = 0; j < 4; ++j)
+    pointers[owner * 4 + j] = row[j + 2];
+  capacities[owner] = row[1];
+}
+
+void kvduo_publish_buffers(
+    uint64_t packet, uint64_t pointers, uint64_t capacities, int64_t updates, int64_t owners, uint64_t stream) {
+  using namespace host;
+  RuntimeCheck(updates >= 0 && owners > 0, "Invalid KVDuo publication extent");
+  if (!updates) return;
+  LaunchKernel((updates + 127) / 128, 128, reinterpret_cast<cudaStream_t>(stream))(
+      kvduo_publish_buffers_kernel,
+      reinterpret_cast<const int64_t*>(packet),
+      reinterpret_cast<int64_t*>(pointers),
+      reinterpret_cast<int32_t*>(capacities),
+      updates,
+      owners);
 }
 
 }  // namespace

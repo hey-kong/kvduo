@@ -51,13 +51,14 @@ __global__ void kvduo_full_page_summary_kernel(
     if (logical >= 0 && logical < logical_size) {
       physical = mapping[logical];
       valid &= physical > 0 && host_versions[logical] == data_versions[logical];
-      touch = FullTouchMax{}(touch, touches[logical]);
+      if (touches) touch = FullTouchMax{}(touch, touches[logical]);
     } else {
       valid = 0;
     }
     physical_pages[index] = physical;
   }
-  const int64_t page_touch = TouchReduce(storage.touch).Reduce(touch, FullTouchMax{});
+  int64_t page_touch = 0;
+  if (touches) page_touch = TouchReduce(storage.touch).Reduce(touch, FullTouchMax{});
   __syncthreads();
   const int invalid_threads = ValidReduce(storage.valid).Sum(1 - valid);
   if (tid == 0) {
@@ -109,8 +110,7 @@ __global__ void kvduo_full_request_select_kernel(
           if (chosen[owner] || gain <= 0) continue;
           if (best < 0 || gain > best_gain ||
               (gain == best_gain &&
-               (mixed[owner] > mixed[best] ||
-                (mixed[owner] == mixed[best] && admission[owner] < admission[best])))) {
+               (mixed[owner] > mixed[best] || (mixed[owner] == mixed[best] && admission[owner] < admission[best])))) {
             best = owner;
             best_gain = gain;
           }
@@ -201,7 +201,7 @@ void kvduo_full_page_summary(
   RuntimeCheck(page_size.unwrap() > 0 && logical_size > 0, "Invalid FULL page geometry");
   if (pages.unwrap() == 0) return;
   RuntimeCheck(
-      mapping && data_versions && host_versions && touches && physical_pages && scores && valid_pages,
+      mapping && data_versions && host_versions && physical_pages && scores && valid_pages,
       "FULL summary pointers must be non-null");
   LaunchKernel(pages.unwrap(), BLOCK_SIZE, device.unwrap())(
       kvduo_full_page_summary_kernel<BLOCK_SIZE, LogicalT>,
