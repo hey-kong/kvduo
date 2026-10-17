@@ -201,7 +201,7 @@ void kvduo_full_page_summary(
   RuntimeCheck(page_size.unwrap() > 0 && logical_size > 0, "Invalid FULL page geometry");
   if (pages.unwrap() == 0) return;
   RuntimeCheck(
-      mapping && data_versions && host_versions && touches && physical_pages && scores && valid_pages,
+      mapping && data_versions && host_versions && physical_pages && scores && valid_pages,
       "FULL summary pointers must be non-null");
   LaunchKernel(pages.unwrap(), BLOCK_SIZE, device.unwrap())(
       kvduo_full_page_summary_kernel<BLOCK_SIZE, LogicalT>,

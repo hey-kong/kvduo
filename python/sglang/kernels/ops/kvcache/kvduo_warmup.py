@@ -43,7 +43,13 @@ def _warmup(backing, page_size, storage_layers, top_k, paged, block_size=256):
     for dtype in (torch.int32, torch.int64):
         pages = indices.to(dtype).view(4, page_size)
         _, scores, valid = summarize_kvduo_full_pages(
-            pages, mapping, versions, versions, indices, indices[:1]
+            pages,
+            mapping,
+            versions,
+            versions,
+            indices,
+            indices[:1],
+            compute_touch=False,
         )
         if not select_kvduo_full_requests(valid, [0, 0, 1, 1], [0, 1], [0, 1], 1):
             raise RuntimeError("KVDuo FULL request warmup failed")

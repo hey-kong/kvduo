@@ -132,3 +132,28 @@ def test_summary_without_touch_scores_preserves_full_safety_checks(dtype):
     assert torch.equal(original[2], optimized[2])
     assert optimized[2][:4].tolist() == [0, 0, 0, 1]
     assert not optimized[1].any()
+
+
+@pytest.mark.parametrize("missing", [0, 1, 2, 5, 6, 7])
+def test_summary_native_entry_rejects_missing_required_pointer(missing):
+    from sglang.kernels.ops.kvcache.kvduo_full_reclaim import _jit_full_reclaim_module
+
+    pages = torch.arange(64, dtype=torch.int64, device="cuda").view(1, 64)
+    mapping = pages.flatten() + 64
+    versions = torch.ones_like(mapping)
+    physical = torch.empty_like(pages)
+    scores = torch.empty(1, dtype=torch.int64, device="cuda")
+    valid = torch.empty(1, dtype=torch.int32, device="cuda")
+    pointers = [
+        mapping.data_ptr(),
+        versions.data_ptr(),
+        versions.data_ptr(),
+        0,
+        0,
+        physical.data_ptr(),
+        scores.data_ptr(),
+        valid.data_ptr(),
+    ]
+    pointers[missing] = 0
+    with pytest.raises(Exception, match="FULL summary pointers must be non-null"):
+        _jit_full_reclaim_module().summarize_i64(pages, *pointers, mapping.numel())

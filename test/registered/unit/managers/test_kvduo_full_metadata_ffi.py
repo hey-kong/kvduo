@@ -112,10 +112,11 @@ def test_invalid_full_metadata_fails_before_jit_load_or_pointer_launch(
     loader.assert_not_called()
 
 
+@pytest.mark.parametrize("compute_touch", [False, True])
 @pytest.mark.parametrize("protected", [False, True])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_full_summary_dispatch_passes_only_logical_pages_as_a_tensor(
-    monkeypatch, protected, dtype
+    monkeypatch, protected, dtype, compute_touch
 ):
     pages = torch.arange(128, dtype=dtype).reshape(2, 64)
     banks = [torch.arange(128, dtype=torch.int64) for _ in range(4)]
@@ -127,11 +128,14 @@ def test_full_summary_dispatch_passes_only_logical_pages_as_a_tensor(
         "_jit_full_reclaim_module",
         lambda: SimpleNamespace(summarize_i32=native, summarize_i64=native),
     )
-    outputs = kvduo_full_reclaim.summarize_kvduo_full_pages(pages, *banks, protection)
+    outputs = kvduo_full_reclaim.summarize_kvduo_full_pages(
+        pages, *banks, protection, compute_touch=compute_touch
+    )
     args = native.call_args.args
     assert args[0] is pages
     assert all(isinstance(value, int) for value in args[1:])
-    assert args[1:5] == tuple(bank.data_ptr() for bank in banks)
+    assert args[1:4] == tuple(bank.data_ptr() for bank in banks[:3])
+    assert args[4] == (banks[3].data_ptr() if compute_touch else 0)
     assert bool(args[5]) == protected
     assert args[6:9] == tuple(output.data_ptr() for output in outputs)
     assert args[9] == 128
