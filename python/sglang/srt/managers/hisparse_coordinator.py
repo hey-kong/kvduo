@@ -2822,6 +2822,8 @@ class HiSparseCoordinator:
         self._kvduo_next_prefill_key = None
         self._kvduo_prefill_lifecycle = {}
         self._kvduo_prefill_host_reservations = {}
+        self._kvduo_prefill_history = {}
+        self._kvduo_prefill_new_history = {}
         # Remaining FULL footprint of admitted chunks, including first decode.
         self._kvduo_prefill_future_pages = {}
         self._kvduo_prefill_previous_future = {}
@@ -3018,6 +3020,7 @@ class HiSparseCoordinator:
                 if prefill == key:
                     self.finish_kvduo_prefill_reservation(token, cancelled=True)
             self._release_kvduo_prefill_host(key)
+            self._kvduo_prefill_history.pop(key, None)
             self._kvduo_prefill_future_pages.pop(key, None)
             del self._kvduo_prefill_lifecycle[key]
         if request is not None and hasattr(request, "kvduo_prefill_generation"):
@@ -3075,6 +3078,9 @@ class HiSparseCoordinator:
         reservation = self._kvduo_prefill_reservations.pop(token, None)
         if reservation is None:
             return
+        history_key = self._kvduo_prefill_new_history.pop(token, None)
+        if cancelled and history_key is not None:
+            self._kvduo_prefill_history.pop(history_key, None)
         prefill_key = self._kvduo_prefill_reservation_requests.pop(token, None)
         previous = self._kvduo_prefill_previous_future.pop(token, 0)
         new_host = token in self._kvduo_prefill_new_host_reservations
@@ -3123,6 +3129,40 @@ class HiSparseCoordinator:
             return False
         return True
 
+    def _kvduo_prefill_history_ready(self, req, key, tree_cache):
+        # FULL logical pages also index the permanently resident indexer/C128
+        # backing. Count complete prompts, not only the chunk about to execute.
+        if key in self._kvduo_prefill_history:
+            return True
+        logical = self.token_to_kv_pool_allocator.logical_attn_allocator
+        pool = getattr(logical, "full_attn_allocator", logical)
+        page = pool.page_size
+        capacity = pool.size // page
+        limit = capacity * 4 // 5
+
+        def outstanding(request):
+            allocated = max(
+                len(request.prefix_indices),
+                getattr(getattr(request, "kv", None), "kv_allocated_len", 0),
+            )
+            end = len(request.full_untruncated_fill_ids)
+            return max(0, (end + page - 1) // page - (allocated + page - 1) // page)
+
+        need = outstanding(req)
+        if (len(req.full_untruncated_fill_ids) + page - 1) // page > limit:
+            req.set_finish_with_abort(
+                "KVDuo prompt exceeds the 80% history admission budget; "
+                "reduce the prompt length or increase logical capacity"
+            )
+            return False
+        pending = sum(outstanding(r) for r in self._kvduo_prefill_history.values())
+        free = self._kvduo_common_available(pool.available_size() // page)
+        shortage = capacity - free + pending + need - limit
+        if shortage > 0 and tree_cache is not None:
+            tree_cache.evict(EvictParams(num_tokens=shortage * page))
+            free = self._kvduo_common_available(pool.available_size() // page)
+        return capacity - free + pending + need <= limit
+
     def reserve_kvduo_prefill(
         self,
         pages: int,
@@ -3161,6 +3201,11 @@ class HiSparseCoordinator:
                 )
             if not self.check_kvduo_prefill_total_capacity(prefill_req):
                 return None
+        new_history = needs_host and prefill_key not in self._kvduo_prefill_history
+        if new_history and not self._kvduo_prefill_history_ready(
+            prefill_req, prefill_key, tree_cache
+        ):
+            return None
         new_host_reservation = (
             needs_host and prefill_key not in self._kvduo_prefill_host_reservations
         )
@@ -3181,6 +3226,9 @@ class HiSparseCoordinator:
                 prefill_req=prefill_req,
             )
             if token is not None and prefill_key is not None:
+                if new_history:
+                    self._kvduo_prefill_history[prefill_key] = prefill_req
+                    self._kvduo_prefill_new_history[token] = prefill_key
                 self._kvduo_prefill_reservations[token][0] = pages
                 future[prefill_key] = total - pages
                 self._kvduo_prefill_previous_future[token] = previous

@@ -136,6 +136,9 @@ def make_coordinator(*, top_k=2, layers=1, requests=1, free_pages=64):
         )
 
     coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+        logical_attn_allocator=SimpleNamespace(
+            size=1000000, page_size=2, available_size=lambda: 1000000
+        ),
         hisparse_attn_allocator=physical,
         free_hisparse_indices=MagicMock(side_effect=free),
     )

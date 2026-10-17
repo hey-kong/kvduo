@@ -880,7 +880,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             effective = declared.get("swa_full_tokens_ratio", effective)
                         expected = supplied
                         if supplied == ServerArgs.swa_full_tokens_ratio:
-                            expected = baseline / 2.5 if kvduo else baseline
+                            expected = baseline / 4 if kvduo else baseline
                         self.assertEqual(effective, expected)
                         self.assertEqual(args.swa_full_tokens_ratio, supplied)
                         self.assertEqual(
