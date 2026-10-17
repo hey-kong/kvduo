@@ -891,7 +891,7 @@ class ServerArgs:
                 "The ratio of SWA layer KV tokens / full layer KV tokens, regardless "
                 "of the number of swa:full layers. It should be between 0 and 1. "
                 "E.g. 0.5 means if each swa layer has 50 tokens, then each full "
-                "layer has 100 tokens. KVDuo uses 1/2.5 of the model-specific default "
+                "layer has 100 tokens. KVDuo uses 1/4 of the model-specific default "
                 "ratio when this option is left at its default."
             ),
             resolvable=True,
