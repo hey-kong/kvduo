@@ -515,6 +515,7 @@ def test_physical_gate_uses_tp_minimum_before_reservation(
     c.tp_world_size = 2
     c.tp_group = object()
     c.reserve_kvduo_prefill = MagicMock()
+    c.preview_kvduo_prefill_reclaim = MagicMock()
 
     def reduce(value, *, op, group):
         assert op == torch.distributed.ReduceOp.MIN and group is c.tp_group
@@ -529,3 +530,46 @@ def test_physical_gate_uses_tp_minimum_before_reservation(
     collective.assert_called_once()
     c.reserve_kvduo_prefill.assert_not_called()
     assert not adder.can_run_list
+
+
+@pytest.mark.parametrize("path", ["new", "chunk"])
+def test_physical_block_records_prefill_hint_without_admission_or_host_pin(path):
+    c, physical = ready_coordinator()
+    adder, req = actual_budget_adder_and_req(c, path=path, running_max_new=8)
+    if path == "new":
+        assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
+    else:
+        assert adder.add_chunked_req(req) is req
+    assert c._kvduo_full_prefill_hint is not None
+    assert not c._kvduo_prefill_host_reservations
+    assert not c._kvduo_prefill_reservations
+    assert not adder.can_run_list
+    assert physical.free_pages == 0
+
+
+@pytest.mark.parametrize("gate", ["history", "host"])
+def test_prefill_hint_requires_independent_capacity(gate):
+    c, _ = ready_coordinator()
+    adder, req = adder_and_req(c)
+    if gate == "history":
+        c._kvduo_prefill_history_ready = MagicMock(return_value=False)
+    else:
+        c._reserve_kvduo_prefill_host = MagicMock(return_value=False)
+    c.preview_kvduo_prefill_reclaim(req, 4, 16, adder.tree_cache)
+    assert c._kvduo_full_reclaim_prefill_plan() is None
+    assert not c._kvduo_prefill_host_reservations
+
+
+def test_blocked_prefill_preview_does_not_synchronize_budgets():
+    c, _ = ready_coordinator()
+    adder, req = adder_and_req(c)
+    c._kvduo_prefill_history_ready = MagicMock(
+        side_effect=AssertionError("early history check")
+    )
+    c._reserve_kvduo_prefill_host = MagicMock(
+        side_effect=AssertionError("early Host check")
+    )
+    c.preview_kvduo_prefill_reclaim(req, 4, 16, adder.tree_cache)
+    assert c._kvduo_full_prefill_hint is not None
+    c._kvduo_prefill_history_ready.assert_not_called()
+    c._reserve_kvduo_prefill_host.assert_not_called()
