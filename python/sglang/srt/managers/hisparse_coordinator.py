@@ -1596,8 +1596,8 @@ class HiSparseCoordinator:
             ) // self._physical_page_bytes()
             if not allow_full_reclaim:
                 return 0
+            reclaimed_slots = self._cleanup_kvduo_old_tails()
             if reserve_hot_minimum:
-                reclaimed_slots = 0
                 remaining = max(0, need_size + minimum_slots - available_slots())
                 if remaining > 0:
                     reclaimed_slots += self.reclaim_kvduo_full_pages(
@@ -1605,8 +1605,10 @@ class HiSparseCoordinator:
                     )
                     remaining = max(0, need_size + minimum_slots - available_slots())
             else:
-                reclaimed_slots = self.reclaim_kvduo_full_pages(pages * self.page_size)
-                remaining = pages * self.page_size - reclaimed_slots
+                remaining = max(0, pages * self.page_size - reclaimed_slots)
+                if remaining > 0:
+                    reclaimed_slots += self.reclaim_kvduo_full_pages(remaining)
+                remaining = max(0, pages * self.page_size - reclaimed_slots)
             # Decode may continue through ordinary Hand merge. Prefill restore
             # must fit its physical reservation instead of this HOT fallback.
             if remaining > 0 and allow_hot_reclaim:
@@ -2368,9 +2370,6 @@ class HiSparseCoordinator:
             device_module.current_stream(self.device).wait_stream(
                 self.decode_producer_stream
             )
-        # Decode allocation may advance Tail after the scheduler-boundary poll.
-        # Release newly expired pages before optional HOT growth can reclaim them.
-        self._cleanup_kvduo_old_tails()
         if publish_observation:
             self.kvduo_observe.fill_(1)
         tracked_pending_minimum = getattr(self, "_kvduo_pending_hot_minimum", None)
@@ -2526,9 +2525,12 @@ class HiSparseCoordinator:
 
         shortfall = max(0, sum(applicants.values()) - (common_free - reserved_pages))
         if shortfall > 0:
-            self.reclaim_kvduo_full_pages(
-                shortfall * self.page_size, reserve_hot_minimum=True
-            )
+            if self._cleanup_kvduo_old_tails() > 0:
+                shortfall = growth_shortfall()
+            if shortfall > 0:
+                self.reclaim_kvduo_full_pages(
+                    shortfall * self.page_size, reserve_hot_minimum=True
+                )
 
             # A FULL donor can be in this replay batch. Publish every donor's
             # compulsory HOT minimum before optional growth or graph execution.
@@ -2960,9 +2962,9 @@ class HiSparseCoordinator:
                 self._kvduo_tail_retry_pages.pop(req_idx, None)
                 self._kvduo_tail_cleanup_pending.pop(req_idx, None)
 
-    def _cleanup_kvduo_old_tails(self) -> None:
+    def _cleanup_kvduo_old_tails(self, *, protected_full=None) -> int:
         if not self.enable_mixed_residency:
-            return
+            return 0
         pending = self._kvduo_tail_cleanup_pending
         for req_idx, generation in list(pending.items()):
             if (
@@ -2997,7 +2999,7 @@ class HiSparseCoordinator:
             if expired_end > cursor:
                 pending[req_idx] = generation
         if not pending:
-            return
+            return 0
         # Poll queued turnover/retry jobs; all ranks defer an unfinished backup.
         # The reclaimer orders old readers with a stream wait, rather than
         # requiring an idle producer (which overlap scheduling may never offer).
@@ -3009,10 +3011,14 @@ class HiSparseCoordinator:
             not self._kvduo_consensus((tuple(sorted(pending.items())), ready))
             or not ready
         ):
-            return
+            return 0
         owners = set(pending)
-        self.reclaim_kvduo_full_pages(
-            self.page_size, request_indices=owners, release_all=True, tail_cleanup=True
+        return self.reclaim_kvduo_full_pages(
+            self.page_size,
+            request_indices=owners,
+            release_all=True,
+            tail_cleanup=True,
+            protected_full=protected_full,
         )
 
     def begin_kvduo_schedule_boundary(self) -> None:
@@ -3021,7 +3027,6 @@ class HiSparseCoordinator:
             state_cache.poll()
         self._kvduo_next_prefill_pages = 0
         self._kvduo_next_prefill_key = None
-        self._cleanup_kvduo_old_tails()
 
     def kvduo_prefill_batch_allocated(self) -> None:
         # Allocations have completed. They now occupy physical pages rather
@@ -3347,7 +3352,25 @@ class HiSparseCoordinator:
             if minimum_required != -negative_maximum:
                 return None
         if free < required:
-            return None
+            # Only expired Tail of already HOT-resident requests is eligible.
+            # Protect the admitted restore/prefix range, never demote other FULL.
+            released = self._cleanup_kvduo_old_tails(
+                protected_full=(
+                    self.mem_pool_device.translate_loc_from_full_to_compressed(
+                        prefix_indices
+                    )
+                    if prefix_indices is not None and prefix_indices.numel()
+                    else None
+                )
+            )
+            if not released:
+                return None
+            free = (
+                self._kvduo_common_available(allocator.available_size())
+                // self.page_size
+            )
+            if free < required:
+                return None
         token = self._kvduo_prefill_next_reservation
         self._kvduo_prefill_next_reservation += 1
         if prefill_key is not None:
