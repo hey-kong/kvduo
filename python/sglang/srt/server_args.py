@@ -2695,9 +2695,9 @@ class ServerArgs:
         Optional[str],
         Arg(
             help=(
-                "A JSON object for KVDuo. host_size is the per-rank Host KV "
-                "budget in GB (0: automatic). Example: "
-                '\'{"top_k": 2048, "host_size": 0, "tail_protected_pages": 2}\''
+                "A JSON object for KVDuo. host_ratio scales Host KV "
+                "capacity relative to device pools (default: 2.0). Example: "
+                '\'{"top_k": 2048, "host_ratio": 2.0, "tail_protected_pages": 2}\''
             )
         ),
         NS("memory"),
@@ -7846,7 +7846,7 @@ class ServerArgs:
                 "top_k": kvduo.top_k,
                 # Capture-stable maximum-tier metadata; physical pages remain lazy.
                 "device_buffer_size": 16 * kvduo.top_k,
-                # Shared allocator/indexer sizing only; Host uses host_size.
+                # Shared allocator/indexer sizing only; Host uses host_ratio.
                 "host_to_device_ratio": kvduo.logical_capacity_ratio,
                 "swap_in_block_size": kvduo.swap_in_block_size,
             }

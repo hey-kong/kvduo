@@ -162,7 +162,7 @@ class HiSparseCoordinator:
         swap_in_block_size: int = 960,
         tail_protected_pages: int = 0,
         decode_emergency_reclaim: bool = False,
-        kvduo_host_size: float | None = None,
+        kvduo_host_ratio: float | None = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -188,8 +188,8 @@ class HiSparseCoordinator:
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
         host_budget = None
-        if self.enable_mixed_residency and kvduo_host_size is None:
-            kvduo_host_size = 0
+        if self.enable_mixed_residency and kvduo_host_ratio is None:
+            kvduo_host_ratio = 2.0
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
@@ -204,7 +204,7 @@ class HiSparseCoordinator:
                 )
 
                 host_budget = plan_dsv4_host_budget(
-                    token_to_kv_pool_allocator, kvduo_host_size
+                    token_to_kv_pool_allocator, kvduo_host_ratio
                 )
                 num_host_pages = host_budget.full_pages
             self.mem_pool_host = DeepSeekV4PagedHostPool(
@@ -234,7 +234,7 @@ class HiSparseCoordinator:
 
                 pool = self.mem_pool_device
                 host_budget = plan_host_budget(
-                    kvduo_host_size,
+                    kvduo_host_ratio,
                     pool.size // pool.page_size,
                     0,
                     {
@@ -258,9 +258,9 @@ class HiSparseCoordinator:
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         if host_budget is not None:
             logger.info(
-                "KVDuo Host KV payload per rank: host_size=%s GB, budget_bytes=%d, "
+                "KVDuo Host KV payload per rank: host_ratio=%s, budget_bytes=%d, "
                 "allocated_bytes=%d, full_pages=%d, swa_pages=%d, pools=%s",
-                kvduo_host_size,
+                kvduo_host_ratio,
                 host_budget.budget_bytes,
                 host_budget.allocated_bytes,
                 host_budget.full_pages,
@@ -1180,7 +1180,7 @@ class HiSparseCoordinator:
             req.set_finish_with_abort(
                 "KVDuo prompt exceeds total Host main-KV capacity "
                 f"(required={capacity}, capacity={self.mem_pool_host.size} slots); "
-                "reduce the prompt length or increase kvduo host_size"
+                "reduce the prompt length or increase kvduo host_ratio"
             )
             return False
         records = []
@@ -3079,7 +3079,7 @@ class HiSparseCoordinator:
             req.set_finish_with_abort(
                 "KVDuo prompt exceeds total Host main-KV capacity "
                 f"(required={host_slots}, capacity={self.mem_pool_host.size} slots); "
-                "reduce the prompt length or increase kvduo host_size"
+                "reduce the prompt length or increase kvduo host_ratio"
             )
             return False
         return True

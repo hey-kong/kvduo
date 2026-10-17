@@ -1,5 +1,6 @@
 """Host payload sizing independent of KVDuo's HBM and logical capacities."""
 
+import math
 from dataclasses import dataclass
 
 
@@ -15,52 +16,29 @@ class KVDuoHostBudget:
         return sum(self.pool_bytes.values())
 
 
-def plan_host_budget(host_size, full_pages, swa_pages, full_bytes, window_bytes):
-    """Scale history/window pools together; round down within a fixed GB budget."""
+def plan_host_budget(host_ratio, full_pages, swa_pages, full_bytes, window_bytes):
+    """Scale device history/window capacities by a Host/device page ratio."""
+    if (
+        not isinstance(host_ratio, (int, float))
+        or isinstance(host_ratio, bool)
+        or not math.isfinite(host_ratio)
+        or host_ratio <= 0
+    ):
+        raise ValueError("KVDuo host_ratio must be a finite positive number")
     if full_pages <= 0 or sum(full_bytes.values()) <= 0:
         raise ValueError("KVDuo requires a nonempty Host KV pool")
-    if window_bytes and swa_pages <= 0:
-        raise ValueError("KVDuo requires a nonempty Host SWA pool")
-
-    def counts(n):
-        return max(1, n * swa_pages // full_pages) if window_bytes else 0
-
-    def sizes(n):
-        return {
-            **{name: n * size for name, size in full_bytes.items()},
-            **{name: counts(n) * size for name, size in window_bytes.items()},
-        }
-
-    if host_size == 0:
-        n = 2 * full_pages
-        budget_bytes = sum(sizes(n).values())
-    else:
-        budget_bytes = int(host_size * 1e9)
-        lo, hi = 0, budget_bytes // sum(full_bytes.values())
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if sum(sizes(mid).values()) <= budget_bytes:
-                lo = mid
-            else:
-                hi = mid - 1
-        n = lo
-        if not n:
-            raise ValueError("KVDuo host_size cannot fit one page in each Host pool")
-
-    # PP stages can have different bytes per page. Use the same capacities,
-    # bounded by the smallest stage, as fixed-size HiCache does.
-    from sglang.srt.mem_cache.pool_host.base import sync_fixed_hicache_size
-
-    n = sync_fixed_hicache_size(n, host_size)
-    windows = sync_fixed_hicache_size(counts(n), host_size)
+    n = int(full_pages * host_ratio)
+    windows = int(swa_pages * host_ratio) if window_bytes else 0
+    if n <= 0 or (window_bytes and windows <= 0):
+        raise ValueError("KVDuo host_ratio cannot fit one page in each Host pool")
     pool_bytes = {
         **{name: n * size for name, size in full_bytes.items()},
         **{name: windows * size for name, size in window_bytes.items()},
     }
-    return KVDuoHostBudget(n, windows, pool_bytes, budget_bytes)
+    return KVDuoHostBudget(n, windows, pool_bytes, sum(pool_bytes.values()))
 
 
-def plan_dsv4_host_budget(allocator, host_size):
+def plan_dsv4_host_budget(allocator, host_ratio):
     kv = allocator.get_kvcache()
     if getattr(kv, "_unified_kv", False):
         raise ValueError("KVDuo Host SWA requires the paged DeepSeek-V4 layout")
@@ -91,4 +69,4 @@ def plan_dsv4_host_budget(allocator, host_size):
                 pools[layer].ring_size * pools[layer].kv_score_buffer.kv_score[0].nbytes
                 for layer in c4_layers
             )
-    return plan_host_budget(host_size, full_pages, swa_pages, full_bytes, window_bytes)
+    return plan_host_budget(host_ratio, full_pages, swa_pages, full_bytes, window_bytes)
