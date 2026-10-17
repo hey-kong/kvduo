@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import math
 from contextlib import contextmanager
 from typing import List, NamedTuple, Sequence, Union
 
@@ -3201,8 +3202,7 @@ class HiSparseCoordinator:
         key = self._kvduo_prefill_key(req)
         pages = max(
             self.kvduo_prefill_pages(len(req.prefix_indices), end),
-            (physical_tokens + self.compress_ratio * self.page_size - 1)
-            // (self.compress_ratio * self.page_size),
+            math.ceil(physical_tokens / (self.compress_ratio * self.page_size)),
         )
         self._kvduo_full_prefill_hint = (key, pages, tree_cache)
 
