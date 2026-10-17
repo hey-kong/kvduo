@@ -44,9 +44,9 @@ def make_merge_coordinator(page_counts, *, layers=1, top_k=2):
 
 def seed_payloads(coordinator, layer, req):
     buffer = coordinator.kvduo_hot_buffers[layer, req]
-    coordinator.mem_pool_device.kv_buffer[layer][buffer.locations.long()] = (
-        buffer.tokens.long()[:, None] * 10 + torch.arange(4)
-    )
+    coordinator.mem_pool_device.kv_buffer[layer][
+        buffer.locations.long()
+    ] = buffer.tokens.long()[:, None] * 10 + torch.arange(4)
 
 
 def assert_payloads_match_tokens(coordinator, layer, req):
@@ -178,7 +178,7 @@ def test_hand_batches_ineligible_tp_scan(monkeypatch, state):
     c._merge_kvduo_hot_pages.assert_not_called()
 
 
-def test_hand_batches_scan_but_retains_each_merge_consensus(monkeypatch):
+def test_hand_batches_scan_and_agrees_on_each_merge_capacity(monkeypatch):
     c, _ = make_merge_coordinator({(0, 0): 2, (0, 1): 2})
     c.tp_world_size = 4
     c.tp_group = object()
@@ -188,10 +188,13 @@ def test_hand_batches_scan_but_retains_each_merge_consensus(monkeypatch):
 
     collective = MagicMock(side_effect=gather)
     monkeypatch.setattr(torch.distributed, "all_gather_object", collective)
+    reduction = MagicMock()
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduction)
     # First rotation ages both objects without releasing pages; the second
     # releases one page from the first object and stops at the original Hand.
     assert c.reclaim_kvduo_hot_pages(2) == 2
-    assert collective.call_count == 4  # One snapshot plus three merge plans.
+    assert collective.call_count == 1  # Only the scan snapshot uses object gather.
+    assert reduction.call_count == 3
     assert c._kvduo_hand == 1
 
 
@@ -216,11 +219,14 @@ def test_hand_reclaims_same_amount_with_different_tp_free_space(
 
         collective = MagicMock(side_effect=gather)
         monkeypatch.setattr(torch.distributed, "all_gather_object", collective)
+        reduction = MagicMock()
+        monkeypatch.setattr(torch.distributed, "all_reduce", reduction)
         assert c.reclaim_kvduo_hot_pages(64) == 72
         assert physical.free_pages * c.page_size == rank_free_tokens + 72
         assert c.kvduo_req_hot_capacity.tolist() == [[8, 8]]
         assert c._kvduo_hand == 0
-        assert collective.call_count == 3  # One snapshot and two merge plans.
+        assert collective.call_count == 1
+        assert reduction.call_count == 2
         physical.available_size.assert_not_called()
         if transcript:
             assert observed == transcript
@@ -313,3 +319,50 @@ def test_growth_publishes_all_owners_once_and_reuses_reserved_arrays(monkeypatch
         assert b.pointers() == pointers[owner]
         assert c.kvduo_hot_pointers[owner].tolist() == b.pointers()
         assert c.kvduo_req_hot_capacity_gpu[owner].item() == 16
+
+
+def _different_layout_merge_worker(rank, path):
+    from datetime import timedelta
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{path}",
+        world_size=2,
+        rank=rank,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        c, physical = make_merge_coordinator({(0, 0): 4})
+        c.tp_world_size = 2
+        c.tp_group = dist.group.WORLD
+        old = c.kvduo_hot_buffers[0, 0]
+        pages = list(c._kvduo_req_layer_pages[0, 0])
+        # Rank 0 needs one page, rank 1 needs two, on different local pages.
+        freq = [3] * 4 + [0] * 12 if rank == 0 else [0] * 8 + [3] * 8
+        survivors = old.tokens[torch.tensor(freq) == 3].tolist()
+        old.frequency.copy_(pack_frequency(freq))
+        assert c.reclaim_kvduo_hot_pages(4) == 4
+        new = c.kvduo_hot_buffers[0, 0]
+        assert new.tokens.numel() == 8
+        assert sorted(new.tokens[new.tokens >= 0].tolist()) == survivors
+        expected = pages[:2] if rank == 0 else pages[2:]
+        assert c._kvduo_req_layer_pages[0, 0] == expected
+        assert_payloads_match_tokens(c, 0, 0)
+        assert physical.free_pages == 2
+        assert unpack_frequency(new.frequency, 8) == [int(t >= 0) for t in new.tokens]
+        # Both ranks decayed; next scan can reach the same minimum.
+        assert c.reclaim_kvduo_hot_pages(2) == 2
+        assert c.kvduo_hot_buffers[0, 0].tokens.numel() == 4
+    finally:
+        dist.destroy_process_group()
+
+
+def test_tp_merge_allows_different_local_pages_and_survivor_counts(tmp_path):
+    torch.multiprocessing.start_processes(
+        _different_layout_merge_worker,
+        args=(str(tmp_path / "merge-gloo"),),
+        nprocs=2,
+        join=True,
+        start_method="spawn",
+    )
