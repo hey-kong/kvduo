@@ -3320,6 +3320,18 @@ class Scheduler(
                             req.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.mamba_pool_idx = None
+                if (
+                    adder._kvduo_prefill_enabled()
+                    and getattr(adder, "kvduo_prefill_blocked", False)
+                    and not self.enable_lora
+                    and self.chunked_req is None
+                    and adder.new_chunked_req is None
+                ):
+                    self.hisparse_coordinator.record_kvduo_prefill_queue(
+                        adder,
+                        self.waiting_queue,
+                        self.get_num_allocatable_reqs(running_bs) - len(adder.can_run_list),
+                    )
                 break
 
         if mamba_allocator is not None:

@@ -2822,6 +2822,7 @@ class HiSparseCoordinator:
     def _init_kvduo_capacity_state(self, requests: int) -> None:
         self._kvduo_hot_request_order = []
         self._kvduo_full_prefill_hint = None
+        self._kvduo_prefill_queue_plan = None
         self._kvduo_next_prefill_pages = 0
         self._kvduo_next_prefill_key = None
         self._kvduo_prefill_lifecycle = {}
@@ -3008,6 +3009,7 @@ class HiSparseCoordinator:
         if state_cache is not None:
             state_cache.poll()
         self._kvduo_full_prefill_hint = None
+        self._kvduo_prefill_queue_plan = None
         self._kvduo_next_prefill_pages = 0
         self._kvduo_next_prefill_key = None
         self._cleanup_kvduo_old_tails()
@@ -3016,6 +3018,7 @@ class HiSparseCoordinator:
         # Allocations have completed. They now occupy physical pages rather
         # than requiring an additional next-plan protection.
         self._kvduo_full_prefill_hint = None
+        self._kvduo_prefill_queue_plan = None
         self._kvduo_next_prefill_pages = 0
         self._kvduo_next_prefill_key = None
 
@@ -3219,11 +3222,118 @@ class HiSparseCoordinator:
         new_host = key not in self._kvduo_prefill_host_reservations
         try:
             if self._reserve_kvduo_prefill_host(req, key):
-                return key, pages
+                return key, self._kvduo_extend_prefill_reclaim_plan(req, pages)
         finally:
             if new_host:
                 self._release_kvduo_prefill_host(key)
         return None
+
+    def record_kvduo_prefill_queue(self, adder, waiting_queue, max_requests):
+        # Keep references only. Inspect the queue when decode actually reclaims
+        # FULL, not on every scheduling step while Prefill is blocked.
+        if self._kvduo_full_prefill_hint is not None:
+            self._kvduo_prefill_queue_plan = (adder, waiting_queue, max_requests)
+
+    def _kvduo_extend_prefill_reclaim_plan(self, first, pages):
+        context = self._kvduo_prefill_queue_plan
+        if context is None:
+            return pages
+        adder, queue, max_requests = context
+        max_requests = self._kvduo_common_available(max_requests)
+        start = next((i for i, req in enumerate(queue) if req is first), None)
+        if start is None or max_requests <= 1:
+            return pages
+        logical = self.token_to_kv_pool_allocator.logical_attn_allocator
+        pool = getattr(logical, "full_attn_allocator", logical)
+        page = pool.page_size
+
+        def outstanding(req):
+            allocated = max(
+                len(req.prefix_indices),
+                getattr(getattr(req, "kv", None), "kv_allocated_len", 0),
+            )
+            return max(
+                0,
+                math.ceil(len(req.full_untruncated_fill_ids) / page)
+                - math.ceil(allocated / page),
+            )
+
+        history_left = (
+            pool.size // page * 4 // 5
+            - (
+                pool.size // page
+                - self._kvduo_common_available(pool.available_size() // page)
+            )
+            - sum(outstanding(req) for req in self._kvduo_prefill_history.values())
+        )
+        if not any(req is first for req in self._kvduo_prefill_history.values()):
+            history_left -= outstanding(first)
+        swa_left = None
+        if adder.is_hybrid_swa:
+            swa_left = self._kvduo_common_available(int(adder.rem_swa_tokens))
+            swa_left -= adder._swa_budget_for_req(
+                len(first.full_untruncated_fill_ids)
+                - len(first.prefix_indices)
+                - first.host_hit_length,
+                adder._swa_new_tokens(first),
+                swa_host_hit_length=first.swa_host_hit_length,
+            )
+        physical = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        physical_limit = (
+            physical.size // self.page_size
+            - self._kvduo_mandatory_hot_pages()
+            - self._kvduo_reserved_prefill_pages()
+        )
+        tokens_per_page = self.compress_ratio * self.page_size
+        candidates = []
+        total_pages = pages
+        host_need = 0
+        # Later requests have not been prefix-matched. Budget their complete
+        # input conservatively; never mutate their prefix state or allocate KV.
+        for index in range(start + 1, len(queue)):
+            if len(candidates) + 1 >= max_requests:
+                break
+            req = queue[index]
+            if callable(getattr(req, "finished", None)) and req.finished():
+                continue
+            if getattr(req, "hisparse_staging", False) or getattr(req, "session", None):
+                break
+            length = len(req.origin_input_ids) + len(req.output_ids)
+            history = math.ceil(length / page)
+            extra = math.ceil(
+                (length + adder._swa_new_tokens(req) + adder.page_size) / tokens_per_page
+            )
+            swa = (
+                adder._swa_budget_for_req(length, adder._swa_new_tokens(req))
+                if swa_left is not None
+                else 0
+            )
+            if history > history_left or total_pages + extra > physical_limit:
+                break
+            if swa_left is not None and swa >= swa_left:
+                break
+            host = (
+                math.ceil((length // self.compress_ratio) / self.page_size) * self.page_size
+            )
+            candidates.append((extra, host))
+            history_left -= history
+            total_pages += extra
+            host_need += host
+            if swa_left is not None:
+                swa_left -= swa
+        if not candidates:
+            return pages
+        reserved = sum(r[1] for r in self._kvduo_prefill_host_reservations.values())
+        self._evict_host_prefix_for_slots(reserved + host_need)
+        host_left = self._kvduo_common_available(
+            self.mem_pool_host.available_size() - reserved
+        )
+        for extra, host in candidates:
+            if host > host_left:
+                break
+            host_left -= host
+            pages += extra
+        return pages
 
     def reserve_kvduo_prefill(
         self,
