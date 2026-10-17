@@ -20,7 +20,7 @@ def hot_request(ratio=1):
     assert c.kvduo_residency_mode(0) is KVDuoResidencyMode.HOT_RESIDENT
     assert c._kvduo_hot_tail_starts[0][1] == 6 * c.page_size
     req.kv.kv_allocated_len = 9 * c.page_size * ratio
-    c._kvduo_tail_cleanup_pending[0] = c._kvduo_request_generation[0]
+    assert not c._kvduo_tail_cleanup_pending
     return c, p, req
 
 
@@ -79,6 +79,7 @@ def test_cleanup_defers_without_waiting_until_all_ranks_ready(pending):
 @pytest.mark.parametrize("stale", ["generation", "ended", "full"])
 def test_cleanup_never_applies_old_job_to_reused_or_full_request(stale):
     c, p, _ = hot_request()
+    c._kvduo_tail_cleanup_pending[0] = c._kvduo_request_generation[0]
     if stale == "generation":
         c._kvduo_request_generation[0] += 1
     elif stale == "ended":
@@ -130,7 +131,6 @@ def test_long_output_scans_each_expired_page_once(monkeypatch, ratio):
     monkeypatch.setattr(module, "summarize_kvduo_full_pages", summarize)
     for step in range(100):
         req.kv.kv_allocated_len = (9 + step) * c.page_size * ratio
-        c._kvduo_tail_cleanup_pending[0] = c._kvduo_request_generation[0]
         c.begin_kvduo_schedule_boundary()
     assert sum(call.args[0].size(0) for call in summarize.call_args_list) == 100
     assert c._kvduo_hot_tail_starts[0][1] == 106 * c.page_size
@@ -235,3 +235,43 @@ def test_old_job_does_not_clear_new_generation_cursor_or_retries():
     c.begin_kvduo_schedule_boundary()
     assert c._kvduo_hot_tail_starts[0] == (generation, 18)
     assert c._kvduo_tail_retry_pages[0] == {16}
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_prefill_backed_tail_turnover_does_not_require_backup_or_pressure(
+    ratio, caplog
+):
+    c, p, req = hot_request(ratio)
+    c._has_pending_backup = False
+    free = p.free_pages
+    with caplog.at_level("INFO"):
+        c.begin_kvduo_schedule_boundary()
+        assert p.free_pages == free + 1
+        req.kv.kv_allocated_len += c.page_size * ratio
+        c.begin_kvduo_schedule_boundary()
+        assert p.free_pages == free + 2
+    assert "FULL request reclaim completed" not in caplog.text
+    assert (
+        c.mem_pool_device.full_to_hisparse_device_index_mapping[12:16].tolist()
+        == [0] * 4
+    )
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_decode_turnover_cleanup_precedes_growth_processing(ratio):
+    c, p, req = hot_request(ratio)
+    c.begin_kvduo_schedule_boundary()
+    free = p.free_pages
+    req.kv.kv_allocated_len += c.page_size * ratio
+
+    # Stop after cleanup to test the real replay entry without synthetic growth.
+    class ReachedGrowth(Exception):
+        pass
+
+    def consume():
+        assert p.free_pages == free + 1
+        raise ReachedGrowth
+
+    c._consume_kvduo_hot_growth_events = consume
+    with pytest.raises(ReachedGrowth):
+        c.prepare_kvduo_graph_replay(torch.tensor([0]))
