@@ -350,6 +350,33 @@ void resolve_frequency(
       full_rows_resolved);
 }
 
+// Count before any movement: TP ranks agree on capacity, not local cache layout.
+__global__ void frequency_merge_target_kernel(
+    const int* tokens, const unsigned* frequency, int capacity, int k, int minimum, int* output) {
+  int count = 0;
+  for (int s = threadIdx.x; s < capacity; s += blockDim.x)
+    count += tokens[s] >= 0 && ((frequency[s / 16] >> (2 * (s % 16))) & 3) == 3;
+  using Reduce = cub::BlockReduce<int, 256>;
+  __shared__ typename Reduce::TempStorage storage;
+  int total = Reduce(storage).Sum(count);
+  if (!threadIdx.x) *output = max(minimum, (total + k - 1) / k);
+}
+
+void frequency_merge_target(
+    uint64_t tokens, uint64_t frequency, int capacity, int k, int minimum, uint64_t output, uint64_t stream) {
+  host::RuntimeCheck(
+      k > 0 && capacity % k == 0 && minimum > 0 && minimum <= capacity / k,
+      "Invalid frequency target geometry");
+  host::LaunchKernel(1, 256, reinterpret_cast<cudaStream_t>(stream))(
+      frequency_merge_target_kernel,
+      reinterpret_cast<int*>(tokens),
+      reinterpret_cast<unsigned*>(frequency),
+      capacity,
+      k,
+      minimum,
+      reinterpret_cast<int*>(output));
+}
+
 // Runtime-sized global workspace; merge never specializes on the page count.
 __global__ void frequency_merge_plan(
     const int* tokens,

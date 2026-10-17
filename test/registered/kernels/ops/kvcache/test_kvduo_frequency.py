@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from sglang.kernels.ops.kvcache.kvduo_frequency import merge, resolve
+from sglang.kernels.ops.kvcache.kvduo_frequency import merge, merge_target, resolve
 from sglang.srt.mem_cache.sparsity.core.kvduo_frequency import (
     FrequencyBuffer,
     pack_frequency,
@@ -179,7 +179,8 @@ def test_occupied_replacement_protects_current_hits_and_initializes_zero():
 
 @pytest.mark.parametrize("pages", [2, 9, 17])
 @pytest.mark.parametrize("k", [64, 4992])
-def test_gpu_merge_matches_frequency_reference_and_copies_payloads(pages, k):
+@pytest.mark.parametrize("minimum", [1, 2])
+def test_gpu_merge_matches_frequency_reference_and_copies_payloads(pages, k, minimum):
     capacity = pages * k
     backing = torch.arange(
         (capacity + 64) * 8, dtype=torch.int32, device="cuda"
@@ -190,9 +191,11 @@ def test_gpu_merge_matches_frequency_reference_and_copies_payloads(pages, k):
     b.tokens.copy_(torch.arange(capacity, dtype=torch.int32, device="cuda"))
     freq = [(s * 7 + s // k) % 4 for s in range(capacity)]
     b.frequency.copy_(pack_frequency(freq, device="cuda"))
-    expected = plan_frequency_merge(list(range(capacity)), freq, k, 1)
+    expected = plan_frequency_merge(list(range(capacity)), freq, k, minimum)
     before = backing.clone()
-    new, kept = merge(b, backing, k=k, minimum=1, paged=False, top_k=512, item_bytes=32)
+    new, kept = merge(
+        b, backing, k=k, minimum=minimum, paged=False, top_k=512, item_bytes=32
+    )
     assert kept == expected.kept_pages
     assert new.tokens.tolist() == list(expected.tokens)
     assert unpack_frequency(new.frequency, new.tokens.numel()) == list(
@@ -425,3 +428,19 @@ def test_parallel_merge_reuses_workspace_and_matches_stable_reference(k, pages):
             workspace[name].data_ptr() == address
             for name, address in old_addresses.items()
         )
+
+
+@pytest.mark.parametrize("count", [0, 1, 4, 5, 12])
+def test_merge_target_counts_valid_threes_before_mutation(count):
+    k, capacity = 4, 16
+    buffer = FrequencyBuffer.empty(
+        torch.arange(capacity, device="cuda", dtype=torch.int32)
+    )
+    buffer.tokens[:count] = torch.arange(count, device="cuda", dtype=torch.int32)
+    buffer.frequency.copy_(pack_frequency([3] * capacity, device="cuda"))
+    workspace = {}
+    for _ in range(2):
+        assert merge_target(
+            buffer, k=k, minimum=1, top_k=512, paged=False, workspace=workspace
+        ) == max(1, (count + k - 1) // k)
+    assert unpack_frequency(buffer.frequency, capacity) == [3] * capacity

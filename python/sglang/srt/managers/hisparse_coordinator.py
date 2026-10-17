@@ -2654,6 +2654,35 @@ class HiSparseCoordinator:
             or any(self._kvduo_hot_page_owners.get(page) != owner for page in pages)
         ):
             raise RuntimeError("KVDuo HOT merge ownership mismatch")
+        minimum = self.min_hot_pages
+        if getattr(self, "tp_world_size", 1) > 1:
+            if old.tokens.is_cuda:
+                from sglang.kernels.ops.kvcache.kvduo_frequency import merge_target
+
+                if not hasattr(self, "_kvduo_merge_workspace"):
+                    self._kvduo_merge_workspace = {}
+                target = merge_target(
+                    old,
+                    k=self.hot_page_size,
+                    minimum=minimum,
+                    top_k=self.top_k,
+                    paged=self.is_dsv4_hisparse,
+                    workspace=self._kvduo_merge_workspace,
+                )
+            else:
+                frequencies = unpack_frequency(old.frequency, capacity)
+                survivors = sum(
+                    token >= 0 and freq == 3
+                    for token, freq in zip(old.tokens.tolist(), frequencies)
+                )
+                target = max(
+                    minimum, (survivors + self.hot_page_size - 1) // self.hot_page_size
+                )
+            # MIN(-target) is MAX(target). Keep every rank's high-frequency items;
+            # local page choices and payload addresses need not agree across TP.
+            minimum = -self._kvduo_common_available(-target)
+            if not self.min_hot_pages <= minimum <= len(pages):
+                raise RuntimeError("Invalid KVDuo TP merge capacity")
         if old.tokens.is_cuda:
             from sglang.kernels.ops.kvcache.kvduo_frequency import merge
 
@@ -2664,7 +2693,7 @@ class HiSparseCoordinator:
                 self.mem_pool_device.get_flat_key_buffer(),
                 workspace=self._kvduo_merge_workspace,
                 k=self.hot_page_size,
-                minimum=self.min_hot_pages,
+                minimum=minimum,
                 paged=self.is_dsv4_hisparse,
                 top_k=self.top_k,
                 item_bytes=self.item_size_bytes,
@@ -2674,21 +2703,13 @@ class HiSparseCoordinator:
                     self.kvduo_hot_growth_events[layer_id, req_idx : req_idx + 1],
                 ),
             )
-            # Payloads may already have moved. Disagreement is fatal, never
-            # resume with the old metadata or release pages on a single rank.
-            if not self._kvduo_consensus((owner, kept)):
-                raise RuntimeError("KVDuo frequency merge differs across TP ranks")
         else:
             plan = plan_frequency_merge(
                 old.tokens.tolist(),
                 unpack_frequency(old.frequency, capacity),
                 self.hot_page_size,
-                self.min_hot_pages,
+                minimum,
             )
-            if not self._kvduo_consensus(
-                (owner, plan.kept_pages, plan.sources, plan.destinations)
-            ):
-                return 0
             kept = plan.kept_pages
             indices = torch.tensor(
                 [
@@ -2765,7 +2786,7 @@ class HiSparseCoordinator:
             self._kvduo_hand = (index + 1) % len(owners)
             if eligible[index]:
                 reclaimed += self._merge_kvduo_hot_pages(*owner)
-                # Merge retains its TP plan check; agreed capacity changes are
+                # Merge agrees on capacity before movement; capacity changes are
                 # the only eligibility changes possible during this scan.
                 eligible[index] = (
                     len(self._kvduo_req_layer_pages[owner]) > self.min_hot_pages
